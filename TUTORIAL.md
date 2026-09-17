@@ -730,4 +730,83 @@ $ psql -h 192.168.178.200 -p 5000 -U postgres -c "SELECT pg_is_in_recovery();"
 (1 row)
 ```
 
-Damit ist der komplette Stack — keepalived (VIP) → HAProxy (Routing) → Patroni (Leader-Election) → PostgreSQL — end-to-end über eine einzige stabile Adresse erreichbar, ganz ohne knotenspezifisches Wissen auf Anwendungsseite. Offener nächster Schritt: der echte Failover-Test (HAProxy auf node1 gezielt stoppen und live beobachten, wie die VIP automatisch zu node2 wandert).
+Damit ist der komplette Stack — keepalived (VIP) → HAProxy (Routing) → Patroni (Leader-Election) → PostgreSQL — end-to-end über eine einzige stabile Adresse erreichbar, ganz ohne knotenspezifisches Wissen auf Anwendungsseite.
+
+## Teil 12 — Der echte Failover-Test (und drei Bugs unterwegs)
+
+Der eigentliche Beweis, dass die Architektur trägt: HAProxy auf node1 gezielt stoppen und beobachten, ob die VIP automatisch zu einem gesunden Knoten wandert — ganz ohne manuellen Eingriff. Der erste Anlauf ist dabei **nicht** sauber durchgelaufen, und genau die drei Fehler unterwegs sind lehrreicher als ein Test, der auf Anhieb geklappt hätte.
+
+### Bug 1: Positives `weight` verhindert den Failover komplett
+
+Erste Config-Version hatte `weight 20` (positiv) im `vrrp_script`-Block. Die Logik dahinter ist additiv: Läuft der Check erfolgreich, wird die Basis-Priorität **erhöht** (150 → 170). Schlägt er fehl, wird der Bonus nur wieder **abgezogen** — zurück auf die Basis (170 → 150). Das Problem: 150 ist immer noch höher als node2s 100 und node3s 90. Node1 blieb also MASTER, obwohl HAProxy dort tot war — der Cluster war komplett offline, ohne dass keepalived das je gemerkt hätte:
+
+```
+14:18:31  Script `chk_haproxy` now returning 3
+14:18:35  VRRP_Script(chk_haproxy) failed (exited with status 3)
+14:18:35  Changing effective priority from 170 to 150   ← immer noch höchste Priorität!
+```
+
+**Fix:** `weight` komplett weglassen. Ohne `weight`-Angabe schaltet keepalived die VRRP-Instanz bei Script-Fehlschlag in den **FAULT-Zustand** — unabhängig von der Priorität wird sie zwingend aus dem Rennen genommen, statt nur an einem Arithmetik-Ergebnis herumzudrehen.
+
+### Bug 2: `enable_script_security` sucht einen User, den es nicht gibt
+
+Mit dem `weight`-Fix kam prompt die nächste Runde: `enable_script_security` in `global_defs` verlangt, dass Track-Scripts unter einem **unprivilegierten** User laufen (Root-Scripts + Config-Schreibrecht wäre ein Sicherheitsrisiko). Ohne explizite `user`-Angabe sucht keepalived automatisch nach einem System-User `keepalived_script` — den gab es auf keinem der drei Knoten:
+
+```
+Script user 'keepalived_script' does not exist
+(...) Unable to set default user for vrrp script chk_haproxy - removing
+(...) track_script chk_haproxy not found, ignoring...
+```
+
+Das Tückische daran: keepalived startet trotzdem klaglos — der Track-Script-Block wird einfach still entfernt, der Health-Check ist komplett tot, ohne dass ein offensichtlicher Fehler das zeigt.
+
+**Fix:** Den erwarteten System-User anlegen:
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin keepalived_script
+```
+
+### Bug 3: Falsche Dateiberechtigung blockiert den neuen User
+
+Nach dem User-Fix kam noch eine dritte Runde: Das Check-Script war aus einer früheren Sicherheitsrunde mit `chmod 700` (nur Owner-root darf ausführen) gesetzt. Der neue `keepalived_script`-User (uid 999) durfte es also gar nicht ausführen:
+
+```
+WARNING - script '/etc/keepalived/check_haproxy.sh' is not executable for uid:gid 999:988 - disabling.
+```
+
+**Fix:** `sudo chmod 755 /etc/keepalived/check_haproxy.sh` — root behält Schreibrecht, alle anderen dürfen lesen und ausführen.
+
+### Der Test, diesmal sauber
+
+Mit allen drei Fixes auf allen drei Knoten angewendet, Ausgangszustand verifiziert (alle drei `VRRP_Script(chk_haproxy) succeeded`, node1 MASTER mit VIP), dann:
+
+```bash
+# Auf node1:
+sudo systemctl stop haproxy
+```
+
+Status-Check über alle drei Knoten während node1s HAProxy aus ist:
+
+```
+== 192.168.178.201 ==   haproxy: inactive   VIP: nicht hier
+== 192.168.178.202 ==   haproxy: active     VIP: HIER -> MASTER
+== 192.168.178.203 ==   haproxy: active     VIP: nicht hier
+```
+
+Von außen (Mac) bestätigt, während node1 weiterhin ausgeschaltet ist:
+
+```
+$ ping -c 5 192.168.178.200
+64 bytes from 192.168.178.200: icmp_seq=0 ttl=64 time=0.862 ms
+64 bytes from 192.168.178.200: icmp_seq=1 ttl=64 time=0.747 ms
+(0% packet loss)
+
+$ psql -h 192.168.178.200 -p 5000 -U postgres -c "SELECT pg_is_in_recovery();"
+ pg_is_in_recovery
+--------------------
+ f
+(1 row)
+```
+
+Die VIP ist automatisch zu node2 gewandert, HAProxy dort hat den Traffic übernommen, `psql` antwortet weiterhin mit `f` (verbunden mit einer laufenden Primary) — komplett ohne manuellen Eingriff. Nach `sudo systemctl start haproxy` auf node1 übernimmt node1 die VIP automatisch zurück (höhere Basis-Priorität, 150 vs. 100).
+
+**Wichtige Einordnung:** Dieser Test validiert den **HAProxy/keepalived-Layer** (Traffic-Routing bei HAProxy-Ausfall) — nicht den **Patroni-Layer** (DB-Primary-Wechsel bei PostgreSQL-Ausfall), der schon in [Teil 4](#teil-4--manueller-failover-live-durchgeführt) manuell und in Teil 9 automatisiert verifiziert wurde. Beide Mechanismen arbeiten unabhängig voneinander zusammen und ergeben erst gemeinsam die vollständige HA-Kette: Stirbt PostgreSQL/Patroni auf dem Primary-Knoten, übernimmt Patroni die Leader-Wahl; stirbt HAProxy (oder der ganze Knoten), übernimmt keepalived die VIP. Ein noch härterer Test — node1 komplett herunterfahren statt nur HAProxy zu stoppen — würde beide Mechanismen gleichzeitig auslösen und ist ein möglicher nächster Schritt.

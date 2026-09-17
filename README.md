@@ -73,7 +73,9 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen: eine **Peer-URL** (Port `2380
 - [x] Patroni-Cluster konfiguriert und gestartet (ph-node1 Leader, ph-node2/ph-node3 Replicas, Lag = 0)
 - [x] HAProxy konfiguriert (Health-Check gegen Patroni REST-API, routet automatisch zur Primary)
 - [x] keepalived konfiguriert (virtuelle IP `192.168.178.200`, Unicast-VRRP, Track-Script gegen HAProxy — verifiziert: VIP korrekt auf ph-node1 gebunden, Ping + `psql` über die VIP erfolgreich)
-- [ ] Kompletter automatisierter Failover-Test durchgeführt
+- [x] Kompletter automatisierter Failover-Test durchgeführt (HAProxy auf Primary-Knoten gestoppt, VIP + Traffic sind automatisch zum nächsten Knoten gewandert, `psql` über die VIP blieb durchgehend erreichbar)
+
+**Kernziel erreicht:** vollautomatisierter 3-Knoten-Failover ohne manuellen Eingriff, End-to-End verifiziert. Details zu den drei Bugs, die auf dem Weg dorthin gefunden und gefixt wurden (VRRP-`weight`-Logik, `enable_script_security`, Dateiberechtigungen), stehen in [Teil 12 des Tutorials](./TUTORIAL.md#teil-12--der-echte-failover-test-und-drei-bugs-unterwegs).
 
 ## Dokumentation
 
