@@ -635,3 +635,99 @@ Zusätzlich zum `psql`-Test das eingebaute Stats-Dashboard unter `http://192.168
 ![HAProxy Stats-Dashboard: ph-node1 aktiv (grün), ph-node2/3 korrekt ausgeschlossen (rot)](./images/haproxy-stats-dashboard.png)
 
 Wichtig für die Interpretation: Im `postgres`-Backend steht **ph-node1 grün/UP** (`L7OK/200`), **ph-node2 und ph-node3 rot/DOWN** (`L7STS/503`). Das sieht auf den ersten Blick nach einem Fehler auf zwei von drei Knoten aus — ist aber genau das gewünschte Verhalten: Der Health-Check fragt `/primary` ab, und nur die aktuelle Primary antwortet dort mit 200. Die beiden Replicas antworten korrekt mit 503 ("ich bin nicht Primary") und werden von HAProxy deshalb bewusst aus dem Routing-Pool für Schreibverbindungen ausgeschlossen — "DOWN" heißt hier also "aktuell nicht Primary", nicht "Knoten abgestürzt". Würde man versehentlich `http-check expect status 200` gegen `/health` statt `/primary` prüfen, wären alle drei Knoten grün — und HAProxy würde Schreibzugriffe auch an Replicas weiterleiten, was in PostgreSQL zu einem Fehler führen würde (Replicas sind read-only).
+
+## Teil 11 — keepalived: virtuelle IP für automatisches Failover
+
+HAProxy allein löst nur einen Teil des Problems: Es routet korrekt zur aktuellen Primary — aber die Anwendung muss trotzdem wissen, welchen der drei Knoten sie als HAProxy-Adresse ansprechen soll. Fällt genau dieser Knoten aus, ist die App wieder tot, obwohl Cluster und HAProxy-Configs auf allen drei Knoten identisch sind. **keepalived** schließt diese letzte Lücke: Es implementiert **VRRP** (Virtual Router Redundancy Protocol) und lässt eine einzige virtuelle IP (`192.168.178.200`) zwischen den drei Knoten wandern — immer dorthin, wo gerade ein gesunder HAProxy läuft. Die Anwendung verbindet sich nur noch mit dieser einen, stabilen Adresse.
+
+### Funktionsweise
+
+Die drei Knoten handeln per **Priorität** aus, wer die VIP aktuell binden darf (ph-node1 = 150, ph-node2 = 100, ph-node3 = 90 — im Normalfall gewinnt also node1). Damit die VIP nicht stur an einem Knoten kleben bleibt, dessen HAProxy abgestürzt ist, überwacht ein **Track-Script** (`check_haproxy.sh`) den lokalen HAProxy-Dienst und lässt keepalived die eigene Priorität senken, sobald HAProxy nicht mehr läuft — der nächste Knoten mit der höchsten verbleibenden Priorität übernimmt dann automatisch.
+
+**Design-Entscheidung: Unicast statt Multicast.** VRRP kommuniziert standardmäßig per Multicast (`224.0.0.18`). In Heimnetzen/auf Proxmox-Bridges kann das an IGMP-Snooping oder Switch-Filtern scheitern — im schlimmsten Fall sehen sich die Knoten gegenseitig nicht mehr und alle drei halten sich gleichzeitig für MASTER (Split-Brain bei der VIP). Stattdessen **Unicast** verwendet: VRRP-Pakete werden gezielt an die drei bekannten IPs geschickt statt gebroadcastet — unabhängig vom Multicast-Verhalten des Netzwerks.
+
+### Installation (auf allen drei Knoten identisch)
+
+```bash
+sudo apt install -y keepalived
+
+sudo tee /etc/keepalived/check_haproxy.sh > /dev/null <<'SCRIPT'
+#!/bin/bash
+# Exit 0 = HAProxy lebt, Exit 1 = tot -> keepalived senkt Priorität
+systemctl is-active --quiet haproxy
+SCRIPT
+
+sudo chmod +x /etc/keepalived/check_haproxy.sh
+```
+
+### `/etc/keepalived/keepalived.conf` — pro Knoten unterschiedlich
+
+Gleicher Dateipfad auf allen drei Maschinen, aber jeweils eigener Inhalt (state, priority, unicast_src_ip/unicast_peer):
+
+```
+# ph-node1 (192.168.178.201) — state MASTER, priority 150
+vrrp_script chk_haproxy {
+    script "/etc/keepalived/check_haproxy.sh"
+    interval 2
+    weight 20
+    fall 3
+    rise 2
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    interface ens18
+    virtual_router_id 51
+    priority 150
+    advert_int 1
+
+    unicast_src_ip 192.168.178.201
+    unicast_peer {
+        192.168.178.202
+        192.168.178.203
+    }
+
+    authentication {
+        auth_type PASS
+        auth_pass hapg2026
+    }
+
+    virtual_ipaddress {
+        192.168.178.200/24
+    }
+
+    track_script {
+        chk_haproxy
+    }
+}
+```
+
+Auf ph-node2 (`.202`) und ph-node3 (`.203`) identisch, außer: `state BACKUP`, `priority 100` bzw. `90`, sowie `unicast_src_ip`/`unicast_peer` auf die jeweils eigene bzw. die beiden anderen IPs angepasst.
+
+```bash
+sudo systemctl enable --now keepalived
+```
+
+### Verifiziert (17.09.2026)
+
+`ip a show ens18` auf ph-node1:
+
+```
+inet 192.168.178.201/24 brd 192.168.178.255 scope global ens18
+inet 192.168.178.200/24 scope global secondary ens18
+```
+
+Die VIP ist als sekundäre Adresse sauber an node1 gebunden. Von außen (Mac) getestet:
+
+```
+$ ping 192.168.178.200
+5 packets transmitted, 5 received, 0% packet loss
+
+$ psql -h 192.168.178.200 -p 5000 -U postgres -c "SELECT pg_is_in_recovery();"
+ pg_is_in_recovery
+--------------------
+ f
+(1 row)
+```
+
+Damit ist der komplette Stack — keepalived (VIP) → HAProxy (Routing) → Patroni (Leader-Election) → PostgreSQL — end-to-end über eine einzige stabile Adresse erreichbar, ganz ohne knotenspezifisches Wissen auf Anwendungsseite. Offener nächster Schritt: der echte Failover-Test (HAProxy auf node1 gezielt stoppen und live beobachten, wie die VIP automatisch zu node2 wandert).
