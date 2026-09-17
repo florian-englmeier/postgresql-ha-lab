@@ -63,8 +63,8 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen: eine **Peer-URL** (Port `2380
 - [x] HAProxy- und keepalived-Konzept
 - [x] `ph-node1` (VMID 201) in Proxmox provisioniert, PostgreSQL 16 + Patroni + etcd installiert
 - [x] `ph-node2` / `ph-node3` per Klon erstellt und individualisiert (Hostname, IP, machine-id, SSH-Keys)
-- [ ] etcd-3-Knoten-Cluster konfiguriert
-- [ ] Patroni-Cluster konfiguriert und gestartet
+- [x] etcd-3-Knoten-Cluster konfiguriert
+- [x] Patroni-Cluster konfiguriert und gestartet (ph-node1 Leader, ph-node2/ph-node3 Replicas, Lag = 0)
 - [ ] HAProxy konfiguriert
 - [ ] keepalived konfiguriert
 - [ ] Kompletter automatisierter Failover-Test durchgeführt

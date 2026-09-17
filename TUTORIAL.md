@@ -510,3 +510,62 @@ Cluster-Gesundheit prüfen (auf einem beliebigen Knoten):
 etcdctl member list
 etcdctl endpoint health --cluster
 ```
+
+**Ergebnis (verifiziert am 16.09.2026):** Alle drei Knoten haben sich gefunden, jeder mit eigener Member-ID im Status `started`, und der Health-Check bestätigt für alle drei Endpoints ein erfolgreich committetes Proposal — das Mehrheitsprinzip funktioniert nicht nur theoretisch, sondern live:
+
+![etcd 3-Knoten-Cluster: member list und Health-Check](./images/etcd-cluster-health.png)
+
+## Teil 9 — Patroni konfigurieren und Cluster starten
+
+Datenverzeichnis (`/var/lib/postgresql/16/patroni`, `postgres:postgres`, `chmod 700`) und `patroni.yml` auf jedem Knoten angelegt (Details siehe Config-Auszug oben in der Session-Historie — `scope`, `restapi`, `etcd3` und `postgresql`-Block jeweils mit der eigenen IP, Replikations-/Superuser-Passwort auf allen drei Knoten identisch).
+
+### systemd-Unit
+
+`pip install` legt keinen systemd-Dienst an — selbst geschrieben, identisch auf allen drei Knoten unter `/etc/systemd/system/patroni.service`:
+
+```ini
+[Unit]
+Description=Patroni PostgreSQL HA
+After=network.target etcd.service
+Requires=etcd.service
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+ExecStart=/usr/local/bin/patroni /etc/patroni.yml
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=process
+TimeoutSec=30
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`User=postgres`, weil Patroni die PostgreSQL-Binaries startet und die aus Sicherheitsgründen nicht als root laufen dürfen. `Requires=etcd.service` stellt sicher, dass der lokale etcd-Dienst garantiert läuft, bevor Patroni startet.
+
+### Was beim ersten Start automatisch passiert
+
+Alle drei Patroni-Prozesse versuchen beim Start gleichzeitig, sich in etcd als Initiator einzutragen — dank Raft/Mehrheitsprinzip gewinnt genau einer. Der Gewinner führt `initdb` aus und wird automatisch **Leader**. Die anderen beiden erkennen über etcd, dass bereits ein Leader existiert, und ziehen sich automatisch per `pg_basebackup` eine Kopie davon — werden also automatisch zu **Replicas**. Das ist exakt der Automatisierungsschritt aus Teil 6, jetzt live beobachtet statt nur konzeptionell.
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable patroni
+sudo systemctl start patroni
+```
+
+### Verifiziert (17.09.2026)
+
+```
+florian@ph-node2:~$ patronictl -c /etc/patroni.yml list
++ Cluster: postgres-ha (7686474206101860353) ------+----+-------------+-----+------------+-----+
+| Member   | Host            | Role    | State     | TL | Receive LSN | Lag | Replay LSN | Lag |
++----------+-----------------+---------+-----------+----+-------------+-----+------------+-----+
+| ph-node1 | 192.168.178.201 | Leader  | running   |  1 |             |     |            |     |
+| ph-node2 | 192.168.178.202 | Replica | streaming |  1 |   0/5047D30 |   0 |  0/5047D30 |   0 |
+| ph-node3 | 192.168.178.203 | Replica | streaming |  1 |   0/5047D30 |   0 |  0/5047D30 |   0 |
++----------+-----------------+---------+-----------+----+-------------+-----+------------+-----+
+```
+
+`ph-node1` hat das Rennen gewonnen und ist Leader, `ph-node2`/`ph-node3` sind Replicas im Zustand `streaming` mit **Lag = 0** in beiden Spalten (Receive und Replay LSN) — vollständig synchron, alle auf derselben Timeline (`TL 1`).
