@@ -32,6 +32,12 @@ Entstanden als strukturiertes Lernprojekt (interaktives Tutoring), dokumentiert 
               (Mehrheitsprinzip entscheidet, wer Primary ist)
 ```
 
+## Live-Nachweis: HAProxy-Routing
+
+![HAProxy Stats-Dashboard: automatisches Routing zur aktuellen Primary](./images/haproxy-stats-dashboard.png)
+
+Das eingebaute HAProxy-Stats-Dashboard (Port `7000`) zeigt live, dass Client-Traffic ausschließlich zur aktuellen Primary (`ph-node1`, grün) geroutet wird — die beiden Replicas werden korrekt aus dem Schreib-Pool ausgeschlossen (rot, weil Patronis REST-API dort `503` statt `200` liefert). Details zur Interpretation im [Tutorial-Dokument](./TUTORIAL.md#teil-10--haproxy-automatisches-routing-zur-aktuellen-primary).
+
 ## Tech-Stack
 
 | Komponente | Rolle |

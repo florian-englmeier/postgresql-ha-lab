@@ -627,3 +627,11 @@ psql -h 192.168.178.201 -p 5000 -U postgres -c "SELECT pg_is_in_recovery();"
 ```
 
 `f` (false) bestätigt: Die Verbindung über HAProxy (Port 5000) landet tatsächlich bei der aktuellen Primary — Routing funktioniert wie gedacht.
+
+### Stats-Dashboard: visuelle Bestätigung (17.09.2026)
+
+Zusätzlich zum `psql`-Test das eingebaute Stats-Dashboard unter `http://192.168.178.201:7000/` aufgerufen:
+
+![HAProxy Stats-Dashboard: ph-node1 aktiv (grün), ph-node2/3 korrekt ausgeschlossen (rot)](./images/haproxy-stats-dashboard.png)
+
+Wichtig für die Interpretation: Im `postgres`-Backend steht **ph-node1 grün/UP** (`L7OK/200`), **ph-node2 und ph-node3 rot/DOWN** (`L7STS/503`). Das sieht auf den ersten Blick nach einem Fehler auf zwei von drei Knoten aus — ist aber genau das gewünschte Verhalten: Der Health-Check fragt `/primary` ab, und nur die aktuelle Primary antwortet dort mit 200. Die beiden Replicas antworten korrekt mit 503 ("ich bin nicht Primary") und werden von HAProxy deshalb bewusst aus dem Routing-Pool für Schreibverbindungen ausgeschlossen — "DOWN" heißt hier also "aktuell nicht Primary", nicht "Knoten abgestürzt". Würde man versehentlich `http-check expect status 200` gegen `/health` statt `/primary` prüfen, wären alle drei Knoten grün — und HAProxy würde Schreibzugriffe auch an Replicas weiterleiten, was in PostgreSQL zu einem Fehler führen würde (Replicas sind read-only).
