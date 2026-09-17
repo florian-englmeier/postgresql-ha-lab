@@ -51,7 +51,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen: eine **Peer-URL** (Port `2380
 
 - 3× Ubuntu Server 24.04 LTS VMs (2 vCPU / 4 GB RAM / 20 GB Disk)
 - Netz: `192.168.178.0/24` (Heimnetz), statische IPs `.201`–`.203`, virtuelle IP `.200`
-- Ein Template-Knoten (`ph-node1`) vollständig vorbereitet (Pakete installiert, noch keine knotenspezifische Config), dann zweimal geklont — Details siehe [Tutorial-Dokument](./PostgreSQL_und_Patroni_Tutorial.md)
+- Ein Template-Knoten (`ph-node1`) vollständig vorbereitet (Pakete installiert, noch keine knotenspezifische Config), dann zweimal geklont — Details siehe [Tutorial-Dokument](./TUTORIAL.md)
 
 ## Fortschritt
 
@@ -65,7 +65,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen: eine **Peer-URL** (Port `2380
 - [x] `ph-node2` / `ph-node3` per Klon erstellt und individualisiert (Hostname, IP, machine-id, SSH-Keys)
 - [x] etcd-3-Knoten-Cluster konfiguriert
 - [x] Patroni-Cluster konfiguriert und gestartet (ph-node1 Leader, ph-node2/ph-node3 Replicas, Lag = 0)
-- [ ] HAProxy konfiguriert
+- [x] HAProxy konfiguriert (Health-Check gegen Patroni REST-API, routet automatisch zur Primary)
 - [ ] keepalived konfiguriert
 - [ ] Kompletter automatisierter Failover-Test durchgeführt
 

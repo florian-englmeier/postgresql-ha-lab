@@ -569,3 +569,61 @@ florian@ph-node2:~$ patronictl -c /etc/patroni.yml list
 ```
 
 `ph-node1` hat das Rennen gewonnen und ist Leader, `ph-node2`/`ph-node3` sind Replicas im Zustand `streaming` mit **Lag = 0** in beiden Spalten (Receive und Replay LSN) — vollständig synchron, alle auf derselben Timeline (`TL 1`).
+
+## Teil 10 — HAProxy: automatisches Routing zur aktuellen Primary
+
+HAProxy soll nie selbst "wissen" müssen, wer gerade Primary ist — das würde die Config ständig veralten lassen. Stattdessen nutzt es Patronis REST-API (Port 8008): Der Pfad `/primary` antwortet mit HTTP **200**, wenn der jeweilige Knoten gerade Primary ist, und mit **503**, wenn er Replica ist. HAProxy fragt das laufend bei allen drei Knoten ab und leitet echten PostgreSQL-Traffic (Port 5432) ausschließlich an den einen Knoten weiter, der gerade mit 200 antwortet. Fällt der Primary aus und Patroni befördert automatisch eine Replica, schwenkt HAProxy automatisch um — ganz ohne manuellen Eingriff.
+
+Praktischer Vorteil dieser Konfiguration: Sie ist auf **allen drei Knoten identisch** (zeigt ja nur auf feste IPs, nicht auf "sich selbst") — keine Anpassung pro Knoten nötig, anders als bei etcd und Patroni.
+
+```bash
+sudo apt install -y haproxy
+
+sudo tee /etc/haproxy/haproxy.cfg > /dev/null <<'CFG'
+global
+    maxconn 100
+
+defaults
+    log global
+    mode tcp
+    retries 2
+    timeout client 30m
+    timeout connect 4s
+    timeout server 30m
+    timeout check 5s
+
+listen stats
+    mode http
+    bind *:7000
+    stats enable
+    stats uri /
+
+listen postgres
+    bind *:5000
+    option httpchk GET /primary
+    http-check expect status 200
+    default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions
+    server ph-node1 192.168.178.201:5432 maxconn 100 check port 8008
+    server ph-node2 192.168.178.202:5432 maxconn 100 check port 8008
+    server ph-node3 192.168.178.203:5432 maxconn 100 check port 8008
+CFG
+
+sudo systemctl enable haproxy
+sudo systemctl restart haproxy
+```
+
+`mode tcp` bei der `postgres`-Regel, weil PostgreSQL kein HTTP spricht — nur der Health-Check gegen Patroni läuft über HTTP, der eigentliche Datenverkehr ist rohes TCP. `listen stats` auf Port 7000 ist ein eingebautes Web-Dashboard (`http://<knoten-ip>:7000/`), auf dem live sichtbar ist, welcher Server gerade "UP" ist.
+
+### Verifiziert (17.09.2026)
+
+`psql` lokal auf dem Mac installiert (`brew install libpq`), dann über HAProxy verbunden:
+
+```
+psql -h 192.168.178.201 -p 5000 -U postgres -c "SELECT pg_is_in_recovery();"
+ pg_is_in_recovery
+--------------------
+ f
+(1 row)
+```
+
+`f` (false) bestätigt: Die Verbindung über HAProxy (Port 5000) landet tatsächlich bei der aktuellen Primary — Routing funktioniert wie gedacht.
