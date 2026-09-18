@@ -109,9 +109,10 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 ### 🔜 In Arbeit
 
-- [ ] **`dvdrental` Demo-Datenbank einspielen** — über VIP `192.168.178.200` in den HA-Cluster laden, relationale Tabellenstruktur, `LEFT JOIN` / `INNER JOIN` / `GROUP BY` / `HAVING` mit echten Daten üben
+- [ ] **Titanic Passenger Data einspielen** — Neon-Sample-Datensatz über VIP `192.168.178.200` in den HA-Cluster laden; SQL-Abfragen und Auswertungen mit realen Passagierdaten üben (`GROUP BY`, `HAVING`, Filter, Aggregationen)
+- [ ] **Logisches Backup mit `pg_dump` / `pg_restore`** — Titanic-Datenbank im Custom-Format sichern, Restore in eine neue Datenbank durchführen und Datenbestand verifizieren; dabei den Unterschied zwischen Hochverfügbarkeit/Replikation und Backup praktisch nachvollziehen
 - [ ] **Performance-Analyse mit `pgbench`** — Lasttest gegen den HA-Cluster, `EXPLAIN ANALYZE`, Index-Optimierung, `pg_stat_statements`
-- [ ] **Backup-Strategie mit `pg_basebackup`** — Backup + Restore-Test + Cronjob + PITR (Point-in-Time Recovery) mit WAL-Archivierung
+- [ ] **Physische Backup-Strategie mit `pg_basebackup`** — vollständiges physisches Backup + Restore-Test + Cronjob + PITR (Point-in-Time Recovery) mit WAL-Archivierung; Abgrenzung zum logischen Backup mit `pg_dump`
 
 ---
 
