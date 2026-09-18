@@ -120,6 +120,15 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 Dieses Lab ist ein lebendes Projekt — der Cluster steht, die Grundlagen sind dokumentiert. Geplante Erweiterungen:
 
+### Ergänzender Lernpfad: SUSE / SLES-Systemadministration
+
+Parallel zum PostgreSQL-HA-Lab wird ein separater SUSE-Lernpfad aufgebaut. Ziel ist, die Datenbankadministration in den Kontext eines professionellen Linux- und Rechenzentrumsbetriebs einzuordnen, ohne das bestehende Ubuntu-HA-Lab umzubauen.
+
+**Lernlinie:** Linux/SUSE → PostgreSQL → Backup & Recovery → Patroni → etcd → HAProxy/VIP → Monitoring → Security → Automatisierung.
+
+Geplante SUSE-Themen: **YaST** als Systemkonfigurationswerkzeug, **zypper/RPM** für Paket- und Repository-Verwaltung, `systemd`/`journalctl`, Netzwerk, Benutzer und Rechte, Storage, Dienste sowie PostgreSQL-Betrieb unter SUSE/SLES. Dabei steht nicht das Auswendiglernen einzelner Befehle im Vordergrund, sondern das Verständnis von Betrieb, Diagnose, Verifikation und Fehlerbehebung.
+
+
 | # | Thema | Beschreibung |
 |---|---|---|
 | 1 | **Monitoring** | `pg_activity`, Prometheus + `postgres_exporter` + Grafana Dashboard |
