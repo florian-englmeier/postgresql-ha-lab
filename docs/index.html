@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PostgreSQL HA-Cluster mit Patroni — Florian Englmeier</title>
+<meta name="description" content="3-Knoten-PostgreSQL-Cluster mit Patroni-Orchestrierung, etcd/Raft-Konsensus, HAProxy-Routing, automatischem Failover, WAL-Archivierung/PITR und pgbench-Lasttests.">
+<style>
+  :root{
+    --bg:#0b0f14;
+    --bg2:#111823;
+    --card:#141d29;
+    --card-border:#223047;
+    --text:#dbe4ee;
+    --text-dim:#8ea0b5;
+    --accent:#38d9c9;
+    --accent2:#5b8cff;
+    --green:#3ddc84;
+    --yellow:#f2c94c;
+    --red:#ff6b6b;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:radial-gradient(1200px 800px at 80% -10%, #16233a 0%, var(--bg) 60%);
+    color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.55;
+  }
+  a{color:var(--accent);}
+  header{
+    padding:56px 24px 36px;
+    max-width:1080px;
+    margin:0 auto;
+    border-bottom:1px solid var(--card-border);
+  }
+  .eyebrow{
+    color:var(--accent);
+    font-family:var(--mono);
+    font-size:13px;
+    letter-spacing:.08em;
+    text-transform:uppercase;
+    margin-bottom:10px;
+  }
+  h1{
+    font-size:36px;
+    margin:0 0 10px;
+    letter-spacing:-0.01em;
+  }
+  .subtitle{
+    color:var(--text-dim);
+    font-size:16.5px;
+    max-width:680px;
+  }
+  .meta-row{
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+    margin-top:24px;
+    align-items:center;
+  }
+  .pill{
+    font-family:var(--mono);
+    font-size:12.5px;
+    background:var(--card);
+    border:1px solid var(--card-border);
+    color:var(--text-dim);
+    padding:6px 12px;
+    border-radius:999px;
+  }
+  .btn{
+    font-family:var(--mono);
+    font-size:13px;
+    background:linear-gradient(135deg, var(--accent), var(--accent2));
+    color:#04141c;
+    padding:8px 16px;
+    border-radius:999px;
+    text-decoration:none;
+    font-weight:700;
+  }
+  nav{
+    position:sticky;
+    top:0;
+    z-index:10;
+    background:rgba(11,15,20,0.92);
+    backdrop-filter:blur(6px);
+    border-bottom:1px solid var(--card-border);
+  }
+  nav .inner{
+    max-width:1080px;
+    margin:0 auto;
+    padding:12px 24px;
+    display:flex;
+    gap:22px;
+    flex-wrap:wrap;
+    font-size:14px;
+  }
+  nav a{
+    color:var(--text-dim);
+    text-decoration:none;
+    font-weight:500;
+  }
+  nav a:hover{color:var(--accent);}
+  main{
+    max-width:1080px;
+    margin:0 auto;
+    padding:40px 24px 80px;
+  }
+  section{margin-bottom:56px;}
+  h2{
+    font-size:22px;
+    margin:0 0 6px;
+    display:flex;
+    align-items:center;
+    gap:10px;
+  }
+  h2 .num{
+    font-family:var(--mono);
+    color:var(--accent);
+    font-size:15px;
+  }
+  .section-sub{
+    color:var(--text-dim);
+    font-size:14.5px;
+    margin-bottom:22px;
+  }
+
+  .banner{
+    background:linear-gradient(135deg, rgba(56,217,201,0.12), rgba(91,140,255,0.08));
+    border:1px solid var(--card-border);
+    border-radius:14px;
+    padding:22px 24px;
+    display:flex;
+    gap:16px;
+    align-items:flex-start;
+  }
+  .banner .dot{
+    width:10px;height:10px;border-radius:50%;
+    background:var(--green);
+    margin-top:6px;
+    flex-shrink:0;
+    box-shadow:0 0 0 4px rgba(61,220,132,0.15);
+  }
+
+  .req-table{
+    display:grid;
+    grid-template-columns: 1fr auto;
+    gap:0;
+    border:1px solid var(--card-border);
+    border-radius:14px;
+    overflow:hidden;
+  }
+  .req-row{ display:contents; }
+  .req-row > div{
+    padding:14px 18px;
+    border-bottom:1px solid var(--card-border);
+    background:var(--card);
+    display:flex;
+    align-items:center;
+  }
+  .req-row:last-child > div{border-bottom:none;}
+  .req-name{font-size:14.5px;}
+  .req-name small{display:block;color:var(--text-dim);font-size:12.5px;margin-top:3px;}
+  .badge{
+    font-family:var(--mono);
+    font-size:12px;
+    padding:5px 11px;
+    border-radius:999px;
+    white-space:nowrap;
+    font-weight:600;
+  }
+  .badge.stark{background:rgba(61,220,132,0.15); color:var(--green);}
+  .badge.teil{background:rgba(242,201,76,0.15); color:var(--yellow);}
+  .badge.geplant{background:rgba(142,160,181,0.15); color:var(--text-dim);}
+
+  .timeline{
+    border-left:2px solid var(--card-border);
+    margin-left:8px;
+    padding-left:26px;
+    display:flex;
+    flex-direction:column;
+    gap:22px;
+  }
+  .tl-item{position:relative;}
+  .tl-item::before{
+    content:"";
+    position:absolute;
+    left:-33px;
+    top:4px;
+    width:12px;height:12px;
+    border-radius:50%;
+    background:var(--bg);
+    border:2px solid var(--card-border);
+  }
+  .tl-item.done::before{border-color:var(--green); background:var(--green);}
+  .tl-item.open::before{border-color:var(--text-dim);}
+  .tl-head{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .tl-version{font-family:var(--mono); font-weight:700; font-size:14.5px;}
+  .tl-item.done .tl-version{color:var(--green);}
+  .tl-item.open .tl-version{color:var(--text-dim);}
+  .tl-status{font-size:11.5px; font-family:var(--mono); padding:2px 9px; border-radius:999px;}
+  .tl-item.done .tl-status{background:rgba(61,220,132,0.15); color:var(--green);}
+  .tl-item.open .tl-status{background:rgba(142,160,181,0.12); color:var(--text-dim);}
+  .tl-desc{color:var(--text-dim); font-size:14px; margin-top:4px;}
+
+  .cards{display:grid; grid-template-columns:repeat(auto-fit, minmax(260px,1fr)); gap:16px;}
+  .card{
+    background:var(--card);
+    border:1px solid var(--card-border);
+    border-radius:14px;
+    padding:20px;
+  }
+  .card h3{margin:0 0 8px; font-size:15.5px;}
+  .card p{margin:0; color:var(--text-dim); font-size:13.5px;}
+
+  code{
+    font-family:var(--mono);
+    background:rgba(255,255,255,0.06);
+    padding:1px 6px;
+    border-radius:5px;
+    font-size:0.92em;
+    color:#c8f7ef;
+  }
+
+  .tut-card{
+    background:var(--card);
+    border:1px solid var(--card-border);
+    border-radius:14px;
+    padding:20px;
+    display:flex;
+    flex-direction:column;
+    gap:8px;
+  }
+  .tut-tag{
+    align-self:flex-start;
+    font-family:var(--mono);
+    font-size:11px;
+    color:var(--accent2);
+    background:rgba(91,140,255,0.12);
+    padding:3px 9px;
+    border-radius:999px;
+  }
+  .tut-card h3{margin:0; font-size:15.5px;}
+  .tut-card p{margin:0; color:var(--text-dim); font-size:13.5px;}
+  .tut-card a{font-size:13px; font-weight:600;}
+
+  .diagram-wrap{
+    background:var(--card);
+    border:1px solid var(--card-border);
+    border-radius:14px;
+    padding:24px;
+    overflow-x:auto;
+  }
+  .diagram-wrap svg{display:block; margin:0 auto; min-width:640px;}
+  .diagram-legend{
+    display:flex;
+    flex-wrap:wrap;
+    gap:14px;
+    margin-top:16px;
+    font-size:12.5px;
+    color:var(--text-dim);
+    font-family:var(--mono);
+  }
+  .diagram-legend span{display:flex; align-items:center; gap:6px;}
+  .legend-dot{width:9px;height:9px;border-radius:50%;display:inline-block;}
+
+  .quicklinks{
+    display:grid;
+    grid-template-columns:repeat(auto-fit, minmax(200px,1fr));
+    gap:12px;
+  }
+  .quicklink{
+    background:var(--card);
+    border:1px solid var(--card-border);
+    border-radius:12px;
+    padding:14px 16px;
+    text-decoration:none;
+    color:var(--text);
+    font-size:13.5px;
+    display:block;
+  }
+  .quicklink b{display:block; color:var(--accent); font-family:var(--mono); font-size:12px; margin-bottom:4px;}
+  .quicklink:hover{border-color:var(--accent);}
+
+  footer{
+    text-align:center;
+    color:var(--text-dim);
+    font-size:12.5px;
+    padding:36px 24px 56px;
+  }
+  footer a{color:var(--text-dim); text-decoration:underline;}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="eyebrow">Portfolio-Projekt · Datenbank High Availability</div>
+  <h1>PostgreSQL HA-Cluster mit Patroni</h1>
+  <div class="subtitle">Drei-Knoten-PostgreSQL-Cluster mit Patroni-Orchestrierung, etcd/Raft-Konsensus und HAProxy-Routing — von Grund auf auf Proxmox aufgebaut, mit automatischem Failover, WAL-Archivierung/PITR und pgbench-Lasttests <em>live verifiziert</em>, nicht nur behauptet.</div>
+  <div class="meta-row">
+    <a class="btn" href="https://github.com/florian-englmeier/postgresql-ha-lab">GitHub Repository →</a>
+    <span class="pill">Stand: 22.09.2026</span>
+    <span class="pill">PostgreSQL 16 · Patroni · etcd · HAProxy · keepalived</span>
+  </div>
+</header>
+
+<nav>
+  <div class="inner">
+    <a href="#ueberblick">Überblick</a>
+    <a href="#kompetenzen">Kompetenzen</a>
+    <a href="#architektur">Architektur</a>
+    <a href="#diagramm">Diagramm</a>
+    <a href="#historie">Versionshistorie</a>
+    <a href="#praxis">Engineering-Praxis</a>
+    <a href="#dokumentation">Dokumentation</a>
+  </div>
+</nav>
+
+<main>
+
+  <section id="ueberblick">
+    <div class="banner">
+      <div class="dot"></div>
+      <div>
+        <b>Vertikaler Stack, einmal komplett durchgezogen:</b> drei reale Proxmox-VMs, geklont aus einem gemeinsamen Template,
+        PostgreSQL 16 mit Streaming-Replikation, Patroni als Orchestrator, etcd als Raft-Konsensus-Store und HAProxy als
+        Health-Check-Router vor einer virtuellen IP. Automatischer Failover binnen Sekunden verifiziert, ein PITR-Restore
+        sekundengenau bewiesen, und ein pgbench-Lasttest über den kompletten HA-Stack mit 0&nbsp;% Fehlerquote gefahren.
+        Alles selbst aufgesetzt, dokumentiert und auf GitHub nachvollziehbar.
+      </div>
+    </div>
+  </section>
+
+  <section id="kompetenzen">
+    <h2><span class="num">01</span> Kompetenzen aus diesem Projekt</h2>
+    <div class="section-sub">Was dieses Projekt konkret belegt — mit verifizierten Kommandos, nicht nur als Stichwort im Lebenslauf.</div>
+    <div class="req-table">
+      <div class="req-row">
+        <div class="req-name">PostgreSQL-Administration<small>Rollen &amp; Rechte, <code>pg_hba.conf</code>, MVCC/VACUUM, Streaming-Replikation, manueller Failover live durchgeführt</small></div>
+        <div><span class="badge stark">stark</span></div>
+      </div>
+      <div class="req-row">
+        <div class="req-name">Patroni-Orchestrierung<small>Cluster-Bootstrap, automatischer Failover, zentrale Config über etcd (<code>patronictl edit-config</code>) statt lokaler Datei</small></div>
+        <div><span class="badge stark">stark</span></div>
+      </div>
+      <div class="req-row">
+        <div class="req-name">etcd / Raft-Konsensus<small>3-Knoten-Quorum, Split-Brain-Vermeidung, Peer- vs. Client-Kanal, Listen- vs. Advertise-URLs</small></div>
+        <div><span class="badge stark">stark</span></div>
+      </div>
+      <div class="req-row">
+        <div class="req-name">HAProxy Health-Check-Routing<small>REST-API-Polling gegen Patroni (Port 8008), transparentes Failover für die Anwendung</small></div>
+        <div><span class="badge stark">stark</span></div>
+      </div>
+      <div class="req-row">
+        <div class="req-name">Backup &amp; Point-in-Time-Recovery<small><code>pg_dump</code>/<code>pg_basebackup</code>, WAL-Archivierung, sekundengenauer PITR-Restore auf isolierter Testinstanz bewiesen</small></div>
+        <div><span class="badge stark">stark</span></div>
+      </div>
+      <div class="req-row">
+        <div class="req-name">Performance-Analyse mit pgbench<small>Durchsatz-Latenz-Trade-off, Sättigungsgrenze empirisch vermessen, sauberes Benchmarking (eine Variable pro Schritt)</small></div>
+        <div><span class="badge stark">stark</span></div>
+      </div>
+      <div class="req-row">
+        <div class="req-name">Infrastructure-Provisionierung<small>Proxmox-VM-Templating, Full-Clone-Strategie, netzwerkweite IP-/DHCP-Planung</small></div>
+        <div><span class="badge teil">teil</span></div>
+      </div>
+      <div class="req-row">
+        <div class="req-name">keepalived / VRRP<small>Virtuelle IP als stabiler Einstiegspunkt vor HAProxy</small></div>
+        <div><span class="badge teil">teil</span></div>
+      </div>
+      <div class="req-row">
+        <div class="req-name">SUSE/SLES-Port<small>Zielplattform des künftigen Arbeitgebers — RPM/zypper, Pacemaker/Corosync als Alternative zu Patroni</small></div>
+        <div><span class="badge geplant">Ausblick</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="architektur">
+    <h2><span class="num">02</span> Architektur</h2>
+    <div class="section-sub">Fünf Komponenten, jede mit einer klar abgegrenzten Aufgabe — keine wickelt eine andere mit ein.</div>
+    <div class="cards">
+      <div class="card">
+        <h3>PostgreSQL 16 (Cluster-Kern)</h3>
+        <p>Drei unabhängige Instanzen (ph-node1–3). MVCC, WAL und Streaming-Replikation als Fundament — PostgreSQL selbst "weiß" nichts von Patroni.</p>
+      </div>
+      <div class="card">
+        <h3>Patroni (Orchestrator)</h3>
+        <p>Python-Agent auf jedem Knoten neben PostgreSQL. Verwaltet den lokalen Prozess, führt Leader-Election über etcd durch und automatisiert den Failover.</p>
+      </div>
+      <div class="card">
+        <h3>etcd (Konsensus)</h3>
+        <p>3-Knoten-Raft-Cluster. Entscheidet per Mehrheitsprinzip (Quorum), wer Leader ist — verhindert Split-Brain zuverlässig, auch bei Netzwerkproblemen.</p>
+      </div>
+      <div class="card">
+        <h3>HAProxy (Routing)</h3>
+        <p>Fragt laufend Patronis REST-API ab und leitet PostgreSQL-Traffic (Port 5432/5000) ausschließlich an den Knoten, der gerade Primary ist.</p>
+      </div>
+      <div class="card">
+        <h3>keepalived (VIP)</h3>
+        <p>Virtuelle IP als fester Einstiegspunkt. Die Anwendung verbindet sich immer mit derselben Adresse und merkt vom Failover im Hintergrund nichts.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="diagramm">
+    <h2><span class="num">03</span> Cluster-Topologie</h2>
+    <div class="section-sub">Der Weg eines Schreibzugriffs: von der Anwendung über die virtuelle IP bis zum aktuellen Primary.</div>
+    <div class="diagram-wrap">
+      <svg viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Architekturdiagramm: Client verbindet sich über VIP und HAProxy mit dem aktuellen Primary; drei Knoten mit PostgreSQL und Patroni werden von einem etcd-Raft-Cluster koordiniert.">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#5b8cff"/>
+          </marker>
+        </defs>
+
+        <!-- Client -->
+        <rect x="380" y="16" width="140" height="42" rx="10" fill="#141d29" stroke="#223047"/>
+        <text x="450" y="42" text-anchor="middle" fill="#dbe4ee" font-family="SFMono-Regular,Consolas,monospace" font-size="13">Anwendung</text>
+
+        <!-- VIP + HAProxy -->
+        <rect x="340" y="94" width="220" height="56" rx="10" fill="#141d29" stroke="#38d9c9" stroke-width="1.5"/>
+        <text x="450" y="118" text-anchor="middle" fill="#38d9c9" font-family="SFMono-Regular,Consolas,monospace" font-size="12">192.168.178.200 (VIP)</text>
+        <text x="450" y="136" text-anchor="middle" fill="#dbe4ee" font-family="SFMono-Regular,Consolas,monospace" font-size="13">HAProxy · keepalived</text>
+
+        <line x1="450" y1="58" x2="450" y2="94" stroke="#5b8cff" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+        <!-- Nodes -->
+        <g>
+          <rect x="60" y="220" width="200" height="86" rx="10" fill="#141d29" stroke="#3ddc84" stroke-width="1.5"/>
+          <text x="160" y="244" text-anchor="middle" fill="#3ddc84" font-family="SFMono-Regular,Consolas,monospace" font-size="12">ph-node1 · .201</text>
+          <text x="160" y="264" text-anchor="middle" fill="#dbe4ee" font-family="SFMono-Regular,Consolas,monospace" font-size="12">PostgreSQL — Leader</text>
+          <text x="160" y="282" text-anchor="middle" fill="#8ea0b5" font-family="SFMono-Regular,Consolas,monospace" font-size="11">Patroni-Agent</text>
+        </g>
+        <g>
+          <rect x="350" y="220" width="200" height="86" rx="10" fill="#141d29" stroke="#223047" stroke-width="1.5"/>
+          <text x="450" y="244" text-anchor="middle" fill="#8ea0b5" font-family="SFMono-Regular,Consolas,monospace" font-size="12">ph-node2 · .202</text>
+          <text x="450" y="264" text-anchor="middle" fill="#dbe4ee" font-family="SFMono-Regular,Consolas,monospace" font-size="12">PostgreSQL — Replica</text>
+          <text x="450" y="282" text-anchor="middle" fill="#8ea0b5" font-family="SFMono-Regular,Consolas,monospace" font-size="11">Patroni-Agent</text>
+        </g>
+        <g>
+          <rect x="640" y="220" width="200" height="86" rx="10" fill="#141d29" stroke="#223047" stroke-width="1.5"/>
+          <text x="740" y="244" text-anchor="middle" fill="#8ea0b5" font-family="SFMono-Regular,Consolas,monospace" font-size="12">ph-node3 · .203</text>
+          <text x="740" y="264" text-anchor="middle" fill="#dbe4ee" font-family="SFMono-Regular,Consolas,monospace" font-size="12">PostgreSQL — Replica</text>
+          <text x="740" y="282" text-anchor="middle" fill="#8ea0b5" font-family="SFMono-Regular,Consolas,monospace" font-size="11">Patroni-Agent</text>
+        </g>
+
+        <!-- HAProxy -> nodes (health check + traffic) -->
+        <line x1="380" y1="150" x2="175" y2="220" stroke="#5b8cff" stroke-width="1.5" marker-end="url(#arrow)"/>
+        <line x1="450" y1="150" x2="450" y2="220" stroke="#223047" stroke-width="1.3" stroke-dasharray="4 4"/>
+        <line x1="520" y1="150" x2="725" y2="220" stroke="#223047" stroke-width="1.3" stroke-dasharray="4 4"/>
+
+        <!-- etcd cluster -->
+        <rect x="300" y="344" width="300" height="44" rx="22" fill="#111823" stroke="#f2c94c" stroke-width="1.3"/>
+        <text x="450" y="371" text-anchor="middle" fill="#f2c94c" font-family="SFMono-Regular,Consolas,monospace" font-size="12">etcd — Raft-Quorum (2 von 3)</text>
+
+        <line x1="160" y1="306" x2="360" y2="360" stroke="#f2c94c" stroke-width="1.2" stroke-dasharray="3 3"/>
+        <line x1="450" y1="306" x2="450" y2="344" stroke="#f2c94c" stroke-width="1.2" stroke-dasharray="3 3"/>
+        <line x1="740" y1="306" x2="540" y2="360" stroke="#f2c94c" stroke-width="1.2" stroke-dasharray="3 3"/>
+      </svg>
+      <div class="diagram-legend">
+        <span><span class="legend-dot" style="background:#5b8cff"></span>PostgreSQL-Traffic (Port 5432/5000)</span>
+        <span><span class="legend-dot" style="background:#223047"></span>Health-Check (Port 8008, HTTP)</span>
+        <span><span class="legend-dot" style="background:#f2c94c"></span>etcd-Leader-Lock (Raft)</span>
+        <span><span class="legend-dot" style="background:#3ddc84"></span>aktueller Primary</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="historie">
+    <h2><span class="num">04</span> Lern- &amp; Ausbaustufen</h2>
+    <div class="section-sub">Vom Single-VM-Konzept zum realen 3-Knoten-Cluster auf Proxmox — jede Stufe live durchgeführt und verifiziert.</div>
+    <div class="timeline">
+      <div class="tl-item done">
+        <div class="tl-head"><span class="tl-version">Teil 0–2</span><span class="tl-status">erledigt</span></div>
+        <div class="tl-desc">PostgreSQL-Grundlagen &amp; Installation — Architektur, Rollen/MVCC/VACUUM, <code>pg_hba.conf</code> im Detail, eigene Rolle + Datenbank live angelegt.</div>
+      </div>
+      <div class="tl-item done">
+        <div class="tl-head"><span class="tl-version">Teil 3–4</span><span class="tl-status">erledigt</span></div>
+        <div class="tl-desc">Streaming-Replikation &amp; manueller Failover — Ende-zu-Ende auf einer VM verifiziert, Split-Brain-Gefahr konkret erlebt.</div>
+      </div>
+      <div class="tl-item done">
+        <div class="tl-head"><span class="tl-version">Teil 5–6</span><span class="tl-status">erledigt</span></div>
+        <div class="tl-desc">Konsensus-Problem &amp; Patroni-Automatisierung — etcd/Raft-Mehrheitsprinzip, Patronis Leader-Election und Auto-Failover konzeptionell durchdrungen.</div>
+      </div>
+      <div class="tl-item done">
+        <div class="tl-head"><span class="tl-version">Teil 7–9</span><span class="tl-status">erledigt</span></div>
+        <div class="tl-desc">Realer 3-Knoten-Cluster auf Proxmox — Template geklont, etcd-Cluster konfiguriert, Patroni gebootstrapt und mit <code>patronictl list</code> verifiziert.</div>
+      </div>
+      <div class="tl-item done">
+        <div class="tl-head"><span class="tl-version">Teil 10</span><span class="tl-status">erledigt</span></div>
+        <div class="tl-desc">HAProxy-Routing verifiziert — Verbindung über HAProxy landet zuverlässig bei der aktuellen Primary, Failover funktioniert transparent.</div>
+      </div>
+      <div class="tl-item done">
+        <div class="tl-head"><span class="tl-version">Teil 11</span><span class="tl-status">erledigt</span></div>
+        <div class="tl-desc">Backup &amp; Point-in-Time-Recovery — <code>pg_dump</code>/<code>pg_basebackup</code>, WAL-Archivierung über <code>patronictl edit-config</code>, PITR-Restore sekundengenau bewiesen.</div>
+      </div>
+      <div class="tl-item done">
+        <div class="tl-head"><span class="tl-version">Teil 12</span><span class="tl-status">erledigt</span></div>
+        <div class="tl-desc">Performance-Analyse mit pgbench — Sättigungskurve (10/50/90 Clients), Durchsatz-Latenz-Trade-off, HA-Stack über die VIP mit 0&nbsp;% Fehlern unter Last.</div>
+      </div>
+      <div class="tl-item open">
+        <div class="tl-head"><span class="tl-version">Ausblick</span><span class="tl-status">geplant</span></div>
+        <div class="tl-desc">EXPLAIN ANALYZE &amp; Index-Optimierung. Parallel dazu ein SUSE/SLES-Lernpfad (Pacemaker/Corosync als Alternative zu Patroni).</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="praxis">
+    <h2><span class="num">05</span> Engineering-Praxis</h2>
+    <div class="section-sub">Prinzipien, die sich durch das ganze Projekt ziehen — nicht nur Befehle, sondern das Denken dahinter.</div>
+    <div class="cards">
+      <div class="card">
+        <h3>Split-Brain durch Quorum verhindert</h3>
+        <p>Nur eine Mehrheit (2 von 3 Knoten) darf einen neuen Leader wählen. Bei einem Netzwerk-Split bleibt der isolierte Knoten bewusst passiv, statt sich selbst zu befördern.</p>
+      </div>
+      <div class="card">
+        <h3>Replikation ≠ Backup</h3>
+        <p>Ein <code>DROP TABLE</code> repliziert sich in Millisekunden auf alle Knoten. Nur ein echtes Backup mit WAL-Archivierung schützt vor Bedienfehlern und Katastrophen.</p>
+      </div>
+      <div class="card">
+        <h3>Die Config-Wahrheit liegt in etcd</h3>
+        <p>Nach dem Bootstrap ändert man PostgreSQL-Parameter ausschließlich über <code>patronictl edit-config</code> — ein lokales Editieren der <code>patroni.yml</code> verpufft wirkungslos.</p>
+      </div>
+      <div class="card">
+        <h3>Sauberes Benchmarking</h3>
+        <p>Immer nur eine Variable pro Testlauf ändern (Client-Zahl, Thread-Zahl, Verbindungsweg) — sonst ist unklar, welche Variable den gemessenen Effekt tatsächlich verursacht hat.</p>
+      </div>
+      <div class="card">
+        <h3>Jeder Knoten kann Leader werden</h3>
+        <p>Das WAL-Archiv-Verzeichnis muss auf allen drei Knoten existieren, nicht nur auf dem aktuellen Primary — sonst schlägt die Archivierung nach dem nächsten Failover auf dem neuen Leader fehl.</p>
+      </div>
+      <div class="card">
+        <h3>Nie an Patroni vorbei</h3>
+        <p>Neustarts und Config-Änderungen laufen ausschließlich über <code>patronictl</code>, nie über <code>systemctl</code> — sonst hält Patroni den kontrollierten Eingriff für einen Ausfall und reagiert mit einem ungewollten Failover.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="dokumentation">
+    <h2><span class="num">06</span> Dokumentation</h2>
+    <div class="section-sub">Der komplette Lernweg ist als ein durchgängiges Tutorial im Repository dokumentiert — Konzepte, Kommandos und die Stolperfallen unterwegs.</div>
+    <div class="cards">
+      <div class="tut-card">
+        <span class="tut-tag">Teil 0–4</span>
+        <h3>Grundlagen &amp; Replikation</h3>
+        <p>PostgreSQL-Architektur, Rollen/MVCC, Installation, Streaming-Replikation und der erste manuelle Failover.</p>
+        <a href="https://github.com/florian-englmeier/postgresql-ha-lab/blob/main/PostgreSQL_und_Patroni_Tutorial.md#teil-0--postgresql-architektur-grundlagen">Auf GitHub lesen →</a>
+      </div>
+      <div class="tut-card">
+        <span class="tut-tag">Teil 5–9</span>
+        <h3>Konsensus &amp; Patroni-Cluster</h3>
+        <p>etcd/Raft-Mehrheitsprinzip, was Patroni automatisiert, und der reale 3-Knoten-Aufbau auf Proxmox.</p>
+        <a href="https://github.com/florian-englmeier/postgresql-ha-lab/blob/main/PostgreSQL_und_Patroni_Tutorial.md#teil-5--konsensus-problem--etcdraft">Auf GitHub lesen →</a>
+      </div>
+      <div class="tut-card">
+        <span class="tut-tag">Teil 10–11</span>
+        <h3>HAProxy, Backup &amp; PITR</h3>
+        <p>Automatisches Routing zur Primary, logische/physische Backups und ein sekundengenauer Point-in-Time-Restore.</p>
+        <a href="https://github.com/florian-englmeier/postgresql-ha-lab/blob/main/PostgreSQL_und_Patroni_Tutorial.md#teil-11--backup--recovery">Auf GitHub lesen →</a>
+      </div>
+      <div class="tut-card">
+        <span class="tut-tag">Teil 12</span>
+        <h3>Performance-Analyse mit pgbench</h3>
+        <p>Durchsatz-Latenz-Trade-off, Sättigungskurve und der Beweis, dass der HA-Stack unter Last transparent zum Leader routet.</p>
+        <a href="https://github.com/florian-englmeier/postgresql-ha-lab/blob/main/PostgreSQL_und_Patroni_Tutorial.md#teil-12--performance-analyse-mit-pgbench">Auf GitHub lesen →</a>
+      </div>
+    </div>
+    <div class="quicklinks" style="margin-top:16px;">
+      <a class="quicklink" href="https://github.com/florian-englmeier/postgresql-ha-lab"><b>Repository</b>florian-englmeier/postgresql-ha-lab</a>
+      <a class="quicklink" href="https://technotim.live/posts/postgresql-high-availability/"><b>Referenz-Architektur</b>technotim.live — 3-Knoten PostgreSQL-HA</a>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  PostgreSQL HA-Cluster mit Patroni · Florian Englmeier · M.Eng. Electronic &amp; Mechatronic Systems, Dipl.-Ing. Physical Engineering<br>
+  <a href="https://github.com/florian-englmeier/postgresql-ha-lab">github.com/florian-englmeier/postgresql-ha-lab</a>
+</footer>
+
+</body>
+</html>
