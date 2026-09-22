@@ -338,27 +338,27 @@
     <div class="req-table">
       <div class="req-row">
         <div class="req-name">PostgreSQL-Administration<small>Rollen &amp; Rechte, <code>pg_hba.conf</code>, MVCC/VACUUM, Streaming-Replikation, manueller Failover live durchgeführt</small></div>
-        <div><span class="badge stark">stark</span></div>
+        <div><span class="badge stark">fertig</span></div>
       </div>
       <div class="req-row">
         <div class="req-name">Patroni-Orchestrierung<small>Cluster-Bootstrap, automatischer Failover, zentrale Config über etcd (<code>patronictl edit-config</code>) statt lokaler Datei</small></div>
-        <div><span class="badge stark">stark</span></div>
+        <div><span class="badge stark">fertig</span></div>
       </div>
       <div class="req-row">
         <div class="req-name">etcd / Raft-Konsensus<small>3-Knoten-Quorum, Split-Brain-Vermeidung, Peer- vs. Client-Kanal, Listen- vs. Advertise-URLs</small></div>
-        <div><span class="badge stark">stark</span></div>
+        <div><span class="badge stark">fertig</span></div>
       </div>
       <div class="req-row">
         <div class="req-name">HAProxy Health-Check-Routing<small>REST-API-Polling gegen Patroni (Port 8008), transparentes Failover für die Anwendung</small></div>
-        <div><span class="badge stark">stark</span></div>
+        <div><span class="badge stark">fertig</span></div>
       </div>
       <div class="req-row">
         <div class="req-name">Backup &amp; Point-in-Time-Recovery<small><code>pg_dump</code>/<code>pg_basebackup</code>, WAL-Archivierung, sekundengenauer PITR-Restore auf isolierter Testinstanz bewiesen</small></div>
-        <div><span class="badge stark">stark</span></div>
+        <div><span class="badge stark">fertig</span></div>
       </div>
       <div class="req-row">
         <div class="req-name">Performance-Analyse mit pgbench<small>Durchsatz-Latenz-Trade-off, Sättigungsgrenze empirisch vermessen, sauberes Benchmarking (eine Variable pro Schritt)</small></div>
-        <div><span class="badge stark">stark</span></div>
+        <div><span class="badge stark">fertig</span></div>
       </div>
       <div class="req-row">
         <div class="req-name">Infrastructure-Provisionierung<small>Proxmox-VM-Templating, Full-Clone-Strategie, netzwerkweite IP-/DHCP-Planung</small></div>
@@ -366,7 +366,7 @@
       </div>
       <div class="req-row">
         <div class="req-name">keepalived / VRRP<small>Virtuelle IP, automatisierter Failover-Test End-to-End verifiziert (inkl. drei gefundener und gefixter Bugs)</small></div>
-        <div><span class="badge stark">stark</span></div>
+        <div><span class="badge stark">fertig</span></div>
       </div>
       <div class="req-row">
         <div class="req-name">SUSE/SLES-Port<small>Zielplattform des künftigen Arbeitgebers — RPM/zypper, Pacemaker/Corosync als Alternative zu Patroni</small></div>
