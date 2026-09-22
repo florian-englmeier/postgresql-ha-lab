@@ -1101,3 +1101,219 @@ Zustand nachher (Test, 5433):      Zeile 1 ✅   (Zeile 3 ❌)
 
 **Verifiziert 21.09.2026.**
 
+
+---
+
+## Teil 12 — Performance-Analyse mit pgbench
+
+`pgbench` ist PostgreSQLs eingebautes **Benchmark-Werkzeug** (Teil von `postgresql-contrib`). Es simuliert viele parallele Clients, die gleichzeitig Transaktionen auf die Datenbank feuern, und misst, wie viele Transaktionen pro Sekunde (**TPS**) durchgehen. Ideal, um die Frage "hält der Cluster X gleichzeitige Verbindungen aus?" nicht zu *behaupten*, sondern zu *beweisen*.
+
+pgbench arbeitet in zwei Phasen und bekommt dafür eine **eigene Test-DB** (nicht die produktiven Daten):
+
+```bash
+# Test-DB anlegen — MUSS auf dem Leader passieren (Replicas sind read-only!)
+sudo -u postgres createdb pgbench_test
+```
+
+> **Praxis-Stolperstein (live erlebt):** `createdb` auf einer Replica scheitert mit `cannot execute CREATE DATABASE in a read-only transaction`. Eine Replica nimmt keine Schreibbefehle an. Vor Schreibaktionen also immer `patronictl list` prüfen, wer aktuell Leader ist — der Leader kann durch Failover gewechselt haben. (Genau dieses Problem löst später HAProxy/VIP automatisch.)
+
+### 12.1 Phase 1 — Initialisieren
+
+```bash
+sudo -u postgres pgbench -i -s 10 pgbench_test
+```
+
+| Parameter | Bedeutung |
+|---|---|
+| `-i` | initialisieren: Testtabellen anlegen + mit Daten füllen |
+| `-s 10` | scale factor 10 → ~1.000.000 Konten (Faustregel: `-s` × 100.000) |
+| `pgbench_test` | die Test-DB |
+
+pgbench legt eine simulierte Banken-DB an (`pgbench_accounts`, `pgbench_branches`, `pgbench_tellers`, `pgbench_history`), füllt sie, macht `VACUUM` und legt Primary Keys an:
+
+```
+dropping old tables...
+creating tables...
+generating data (client-side)...
+1000000 of 1000000 tuples (100%) done
+vacuuming...
+creating primary keys...
+done in 0.96 s
+```
+
+### 12.2 Phase 2 — Benchmark (10 Clients)
+
+```bash
+sudo -u postgres pgbench -c 10 -j 2 -T 30 pgbench_test
+```
+
+| Parameter | Bedeutung |
+|---|---|
+| `-c 10` | 10 gleichzeitige Clients (parallele Verbindungen) |
+| `-j 2` | 2 Worker-Threads (verteilt die Clients auf 2 CPU-Kerne) |
+| `-T 30` | 30 Sekunden lang Last erzeugen |
+
+**Ergebnis (verifiziert 22.09.2026, Leader ph-node2, 2 vCPU / 4 GB):**
+
+```
+number of transactions actually processed: 16575
+number of failed transactions: 0 (0.000%)
+latency average = 18.114 ms
+tps = 552.066205 (without initial connection time)
+```
+
+**Interpretation — worauf es ankommt:**
+
+| Kennzahl | Wert | Bedeutung |
+|---|---|---|
+| **TPS** | 552 | vollwertige Schreib-Transaktionen pro Sekunde (je mehrere Reads + Writes) |
+| **failed** | 0 (0 %) | kein einziger Fehler unter Last — das ist der wichtigste Stabilitäts-Indikator |
+| **Latenz** | 18 ms | ⌀ Antwortzeit pro Transaktion |
+
+Für 2 vCPU / 4 GB ist das ein solider Wert — und die **0 % Fehlerquote** ist genau das, was "hält gleichzeitige Verbindungen stabil aus" konkret bedeutet.
+
+
+### 12.3 Lasttest steigern (50 Clients) — der Durchsatz-Latenz-Trade-off
+
+Derselbe Benchmark mit 50 statt 10 Clients:
+
+```bash
+sudo -u postgres pgbench -c 50 -j 4 -T 30 pgbench_test
+```
+
+**Ergebnis (verifiziert 22.09.2026):**
+
+```
+number of transactions actually processed: 28148
+number of failed transactions: 0 (0.000%)
+latency average = 53.329 ms
+tps = 937.577485 (without initial connection time)
+```
+
+**Vergleich 10 vs. 50 Clients:**
+
+| Kennzahl | 10 Clients | 50 Clients | Richtung |
+|---|---|---|---|
+| TPS (Durchsatz) | 552 | 937 | ⬆️ höher |
+| Latenz (⌀ pro Transaktion) | 18 ms | 53 ms | ⬆️ höher |
+| Fehlerquote | 0 % | 0 % | ✅ stabil |
+
+**Warum das so ist:**
+
+- **TPS steigt**, weil bei 10 Clients die 2 CPUs noch Leerlauf hatten. Mehr parallele Clients lasten sie besser aus → mehr Gesamtdurchsatz.
+- **Latenz steigt**, weil sich 50 Clients um nur 2 CPU-Kerne drängeln. Jeder Einzelne wartet öfter, bis er dran ist → seine Transaktion dauert länger.
+
+> **Kernprinzip — Durchsatz und Latenz ziehen gegeneinander:** Mehr parallele Last → der Server schafft insgesamt mehr (höhere TPS), aber der Einzelne wartet länger (höhere Latenz). Es gibt einen *Sweet Spot*, ab dem mehr Clients die TPS nicht weiter steigern, sondern nur noch die Latenz explodieren lassen.
+
+**Den Kipppunkt empirisch gefunden — Test mit 90 Clients:**
+
+```bash
+sudo -u postgres pgbench -c 90 -j 4 -T 30 pgbench_test
+```
+
+```
+number of transactions actually processed: 25034
+number of failed transactions: 0 (0.000%)
+latency average = 108.153 ms
+tps = 832.154830 (without initial connection time)
+```
+
+Die vollständige Kurve über alle drei Laststufen (alle mit `-j 4` — zur Rolle von `-j` siehe 12.4):
+
+| Clients | TPS | Latenz | Beobachtung |
+|---|---|---|---|
+| 10 | 719 | 13,9 ms | Leerlauf — CPUs nicht ausgelastet |
+| 50 | 937 | 53 ms | nahe Optimum — bester Durchsatz |
+| 90 | **832** | 108 ms | **über den Sweet Spot** — TPS sinkt wieder, Latenz explodiert |
+
+Bei 90 Clients ist die TPS gegenüber 50 Clients **gesunken** (937 → 832), während die Latenz sich verdoppelt hat. Der Sweet Spot dieser 2-CPU-Maschine liegt also irgendwo zwischen 50 und 90 Clients. Darüber kostet der Verwaltungsaufwand (Context-Switching, Warteschlangen, Lock-Konkurrenz) mehr, als zusätzliche Parallelität bringt. Wichtig: Über alle Stufen hinweg **0 % Fehler** — der Cluster bleibt stabil, er wird nur langsamer.
+
+**Das vollständige Modell — Leerlauf → Auslastung → Sättigung:**
+
+Treibt man die Client-Zahl immer weiter hoch (z. B. 200 auf 2 CPUs), tritt **Sättigung** ein: Die CPUs sind voll ausgelastet, die TPS läuft gegen eine Hardware-Decke und steigt nicht mehr — aber die Latenz steigt jetzt *steil*, weil immer mehr Clients in der Warteschlange stehen.
+
+Analogie Supermarktkasse: 2 Kassen (= 2 CPUs) können nicht schneller scannen. Bei 200 Kunden wird nur die Schlange länger, der Durchsatz bleibt am Limit. Mehr Kunden = nicht mehr Durchsatz, nur längere Wartezeit.
+
+> **Admin-Lehre:** Den Sweet Spot suchen — die Client-Zahl mit maximaler TPS, *bevor* die Latenz unzumutbar wird. Wer darüber hinaus skalieren will, muss die **Hardware** aufstocken (mehr Kerne), nicht die Client-Zahl.
+
+
+### 12.4 Methodik-Check: die Rolle von `-j` und sauberes Messen
+
+Beim ersten Vergleich (10 → 50 Clients) wurden versehentlich **zwei** Variablen gleichzeitig geändert: die Client-Zahl (`-c`) *und* die Thread-Zahl (`-j 2` → `-j 4`). Sauberes Experimentieren heißt aber: **nur eine Variable pro Schritt ändern**, sonst ist unklar, welche den Effekt verursacht hat.
+
+**Was `-j` (threads) macht:** `-j` wirkt auf der **Client-Seite** — im pgbench-Programm, nicht im PostgreSQL-Server. pgbench verteilt seine simulierten Clients (`-c`) auf `-j` Betriebssystem-Threads. Ist `-j` zu niedrig, wird **pgbench selbst zum Flaschenhals**, und man misst die Schwäche des Lastgenerators statt die Leistung des Servers. Faustregel: `-j` etwa gleich der Kernzahl setzen.
+
+**Der Beweis — 10 Clients, nur `-j` variiert:**
+
+| | `-j 2` | `-j 4` |
+|---|---|---|
+| TPS | 552 | 719 |
+| Latenz | 18 ms | 13,9 ms |
+
+Gleiche Client-Zahl, doppelte Threads → **31 % mehr Durchsatz und weniger Latenz.** Das beweist: Bei `-j 2` limitierte der Lastgenerator, nicht der Server. Erst mit `-j 4` misst man die echte Serverleistung. Deshalb wurde die Kurve in 12.3 durchgehend mit `-j 4` erhoben.
+
+**Zusätzliche Einschränkung — Lastgenerator auf demselben Host:** In diesem Lab lief pgbench *auf node2 selbst*, also auf demselben Server, den es belastet. pgbench und PostgreSQL konkurrieren damit um dieselben 2 CPUs. Für einen produktionsnahen Benchmark würde man pgbench von einer **separaten Maschine** aus laufen lassen, damit der Lastgenerator die Messung nicht verfälscht.
+
+> **Lerneffekt:** Ein Benchmark ist nur so gut wie seine Methodik. Nur eine Variable pro Schritt ändern, den Lastgenerator nicht selbst zum Engpass werden lassen, und ihn möglichst getrennt vom Messobjekt betreiben.
+
+
+### 12.5 Krönung: Benchmark über die VIP — und eine überraschende Zahl
+
+Der eigentliche HA-Test: pgbench nicht gegen einen einzelnen Knoten, sondern gegen die **VIP + HAProxy** laufen lassen. Die Anwendung spricht nur *eine* feste Adresse an — der Cluster entscheidet selbst, wo geschrieben wird.
+
+```bash
+sudo -u postgres pgbench -c 20 -j 4 -T 30 -h 192.168.178.200 -p 5000 -U postgres pgbench_test
+```
+
+- `-h 192.168.178.200` → die **VIP** (nicht ein einzelner Knoten)
+- `-p 5000` → **HAProxy** routet automatisch zum aktuellen Leader
+
+**Ergebnis (verifiziert 22.09.2026):**
+
+```
+number of transactions actually processed: 43469
+number of failed transactions: 0 (0.000%)
+latency average = 13.781 ms
+tps = 1451.283883 (without initial connection time)
+```
+
+**0 % Fehler über den kompletten HA-Stack** — der Kern-Beweis: Die Anwendung verbindet sich blind mit der VIP, HAProxy findet den Leader, es geht kein einziger Schreibvorgang verloren. Das ist High Availability in der Praxis.
+
+#### Die überraschende Zahl — und wie man sie sauber auflöst
+
+Auffällig: **1451 TPS** — deutlich mehr als die 937 TPS, die node2 direkt bei 50 Clients schaffte. Ein *Netzwerk-Umweg* (VIP → HAProxy → Leader) sollte eigentlich langsamer sein, nicht schneller. Diese Zahl darf man nicht einfach ins Portfolio schreiben, ohne sie zu verstehen.
+
+Zwei Hypothesen:
+
+1. **Cache-Warmup:** Der VIP-Lauf war der letzte — vielleicht lagen die Testdaten inzwischen komplett im RAM.
+2. **Failover-Timing:** Vielleicht war zum VIP-Zeitpunkt ein *anderer* Knoten Leader, sodass pgbench (auf node2) und die DB-Arbeit auf getrennten CPUs liefen.
+
+**Kontrolltest — nur eine Variable ändern (der Verbindungsweg), node2 ist jetzt verifiziert Leader:**
+
+```bash
+sudo -u postgres pgbench -c 20 -j 4 -T 30 pgbench_test   # direkt, lokal auf dem Leader
+```
+
+```
+tps = 698.519852
+latency average = 28.632 ms
+```
+
+**Vergleich bei identischen Parametern (20 Clients, `-j 4`):**
+
+| Verbindungsweg | TPS | Latenz |
+|---|---|---|
+| direkt auf node2 (= Leader) | 698 | 28,6 ms |
+| über VIP (vorher) | 1451 | 13,8 ms |
+
+**Die Auflösung — Beweiskette:**
+
+- **Cache-Warmup ausgeschlossen:** Der direkte Lauf hatte ebenfalls warmen Cache. Wäre Cache die Ursache, müsste er auch ~1400 TPS liefern — tut er nicht (698).
+- **Failover-Timing bewiesen:** Wäre node2 beim VIP-Test Leader gewesen, hätte HAProxy lokal auf node2 geroutet → gleiche Situation wie der direkte Lauf → ~700 TPS. Es waren aber 1451 → HAProxy routete zu einem *anderen* Knoten → node2 war zu dem Zeitpunkt **nicht** Leader. pgbench auf node2 hatte die CPUs für sich, die DB-Arbeit lief getrennt auf dem anderen Leader-Knoten. Danach wanderte der Leader zurück auf node2 (sichtbar an **Timeline 3** im `patronictl list`).
+
+> **HA-Benchmark-Lehre:** In einem Cluster mit wanderndem Leader beeinflusst die **Position des Lastgenerators relativ zum Leader** die Messung massiv. Läuft der Generator auf demselben Knoten wie der Leader, konkurrieren beide um dieselben CPUs (langsamer). Läuft er auf einem anderen Knoten, sind die Ressourcen getrennt (schneller). Wer im HA-Umfeld benchmarkt, muss den Leader-Zustand kennen und protokollieren — sonst misst er Zufall statt Leistung.
+
+#### Fazit Teil 12
+
+pgbench hat nicht nur Zahlen geliefert, sondern echtes Systemverständnis: den Durchsatz-Latenz-Trade-off, die Sättigungsgrenze der Hardware, die Bedeutung sauberer Messmethodik (`-j`, eine Variable pro Schritt, Generator-Platzierung) und — über die VIP — den Beweis, dass der HA-Stack unter Last stabil und transparent zum Leader routet.
+
