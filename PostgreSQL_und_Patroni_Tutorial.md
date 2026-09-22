@@ -997,6 +997,25 @@ sudo mkdir -p /var/lib/postgresql/wal_archive
 sudo chown postgres:postgres /var/lib/postgresql/wal_archive
 ```
 
+**Live bestätigt nach einem echten Failover (22.09.2026):** Nachdem der Leader auf node2 gewandert war (node2 hatte das Verzeichnis nie bekommen), zeigte `pg_stat_archiver` das Problem schwarz auf weiß:
+
+```sql
+SELECT archived_count, last_archived_wal, failed_count, last_failed_wal FROM pg_stat_archiver;
+-- archived_count | last_archived_wal | failed_count | last_failed_wal
+--        0        |                   |     567      | 00000003.history
+```
+
+`archived_count = 0` bei **567 Fehlversuchen** — der aktuelle Leader konnte kein einziges WAL-Segment archivieren, die PITR-Fähigkeit war faktisch kaputt. Nach dem Anlegen des Verzeichnisses und einem `pg_switch_wal()`:
+
+```sql
+-- archived_count | last_archived_wal            | failed_count
+--       51        | 00000003000000000000003C     |     570
+```
+
+`archived_count` springt von 0 auf 51 (PostgreSQL holt die aufgestauten Segmente sofort nach), `failed_count` friert ein und steigt nicht weiter. `pg_stat_archiver` ist damit das zentrale Werkzeug, um zu prüfen, ob die WAL-Archivierung wirklich läuft — nicht nur, ob sie konfiguriert ist.
+
+> **Merke:** `failed_count` ist ein historischer Zähler (wird nicht zurückgesetzt). Entscheidend ist nicht, dass er mal > 0 war, sondern dass er **nicht weiter steigt**, während `archived_count` klettert.
+
 ---
 
 ### 11.6 PITR-Restore live durchgespielt
