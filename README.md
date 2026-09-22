@@ -47,7 +47,7 @@ Entstanden als strukturiertes Lernprojekt, vollständig dokumentiert als Portfol
 
 ![HAProxy Stats-Dashboard: automatisches Routing zur aktuellen Primary](./images/haproxy-stats-dashboard.png)
 
-Das eingebaute HAProxy-Stats-Dashboard (Port `7000`) zeigt live, dass Client-Traffic ausschließlich zur aktuellen Primary (`ph-node1`, grün) geroutet wird — die beiden Replicas werden korrekt aus dem Schreib-Pool ausgeschlossen (rot, weil Patronis REST-API dort `503` statt `200` liefert). Details zur Interpretation im [Tutorial-Dokument](./PostgreSQL_und_Patroni_Tutorial.md#teil-10--haproxy-automatisches-routing-zur-aktuellen-primary).
+Das eingebaute HAProxy-Stats-Dashboard (Port `7000`) zeigt live, dass Client-Traffic ausschließlich zur aktuellen Primary (`ph-node1`, grün) geroutet wird — die beiden Replicas werden korrekt aus dem Schreib-Pool ausgeschlossen (rot, weil Patronis REST-API dort `503` statt `200` liefert). Details zur Interpretation im [Tutorial-Dokument](./TUTORIAL.md#teil-10--haproxy-automatisches-routing-zur-aktuellen-primary).
 
 ---
 
@@ -67,7 +67,7 @@ Das eingebaute HAProxy-Stats-Dashboard (Port `7000`) zeigt live, dass Client-Tra
 
 ## Setup & Reproduzierbarkeit
 
-Wer dieses Lab selbst nachbauen möchte, findet den vollständigen Lernweg — alle Konzepte, Befehle, Konfigurationsdateien und Entscheidungen — im [Tutorial-Dokument](./PostgreSQL_und_Patroni_Tutorial.md). Das Setup ist Schritt für Schritt reproduzierbar.
+Wer dieses Lab selbst nachbauen möchte, findet den vollständigen Lernweg — alle Konzepte, Befehle, Konfigurationsdateien und Entscheidungen — im [Tutorial-Dokument](./TUTORIAL.md). Das Setup ist Schritt für Schritt reproduzierbar.
 
 ### Infrastruktur
 
@@ -81,7 +81,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 - **Peer-URL** (Port `2380`): Kommunikation der drei Knoten untereinander (Raft-Konsensus — Leader-Wahl, Log-Replikation)
 - **Client-URL** (Port `2379`): Schnittstelle für Patroni ("wer ist aktuell Primary?")
 
-**Listen**-Adressen legen fest, wo ein Knoten selbst lauscht; **Advertise**-Adressen sind die erreichbare Netz-IP, die den anderen Knoten mitgeteilt wird. Die `initial-cluster`-Liste (Name + Peer-URL je Knoten) muss auf allen drei Knoten identisch sein — sie ist das gemeinsame Adressbuch beim Cluster-Start. Volle Erklärung mit Beispiel-Configs im [Tutorial-Dokument](./PostgreSQL_und_Patroni_Tutorial.md).
+**Listen**-Adressen legen fest, wo ein Knoten selbst lauscht; **Advertise**-Adressen sind die erreichbare Netz-IP, die den anderen Knoten mitgeteilt wird. Die `initial-cluster`-Liste (Name + Peer-URL je Knoten) muss auf allen drei Knoten identisch sein — sie ist das gemeinsame Adressbuch beim Cluster-Start. Volle Erklärung mit Beispiel-Configs im [Tutorial-Dokument](./TUTORIAL.md).
 
 ---
 
@@ -102,34 +102,22 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 - [x] HAProxy konfiguriert (Health-Check gegen Patroni REST-API, routet automatisch zur Primary)
 - [x] keepalived konfiguriert (virtuelle IP `192.168.178.200`, Unicast-VRRP, Track-Script gegen HAProxy — verifiziert: VIP korrekt auf ph-node1 gebunden, Ping + `psql` über die VIP erfolgreich)
 - [x] Kompletter automatisierter Failover-Test durchgeführt (HAProxy auf Primary-Knoten gestoppt, VIP + Traffic sind automatisch zum nächsten Knoten gewandert, `psql` über die VIP blieb durchgehend erreichbar)
-- [x] Titanic Passenger Data eingespielt, SQL-Abfragen und Auswertungen mit realen Passagierdaten geübt (`GROUP BY`, `FILTER`, Aggregationen)
-- [x] Logisches Backup mit `pg_dump` / `pg_restore` (inkl. Restore-Test auf neue Datenbank) verifiziert
-- [x] Physisches Backup mit `pg_basebackup` + WAL-Archivierung + Point-in-Time-Recovery (PITR) — sekundengenauer Restore auf isolierter Testinstanz bewiesen
-- [x] Performance-Analyse mit `pgbench` — Sättigungskurve (10/50/90 Clients), Durchsatz-Latenz-Trade-off, Lasttest über VIP/HAProxy mit 0 % Fehlerquote
 
-**Kernziel erreicht:** vollautomatisierter 3-Knoten-Failover ohne manuellen Eingriff, End-to-End verifiziert — inklusive Backup/PITR und Performance-Nachweis.
+**Kernziel erreicht:** vollautomatisierter 3-Knoten-Failover ohne manuellen Eingriff, End-to-End verifiziert.
 
-> Details zu den drei Bugs, die beim Failover-Test gefunden und gefixt wurden (VRRP-`weight`-Logik, `enable_script_security`, Dateiberechtigungen), stehen in [Teil 12 der früheren Tutorial-Fassung](./TUTORIAL.md#teil-12--der-echte-failover-test-und-drei-bugs-unterwegs).
+> Details zu den drei Bugs, die auf dem Weg dorthin gefunden und gefixt wurden (VRRP-`weight`-Logik, `enable_script_security`, Dateiberechtigungen), stehen in [Teil 12 des Tutorials](./TUTORIAL.md#teil-12--der-echte-failover-test-und-drei-bugs-unterwegs).
 
-### 🔜 Als Nächstes
+### 🔜 In Arbeit
 
-- [ ] `EXPLAIN ANALYZE` & Index-Optimierung
-- [ ] SUSE/SLES-Lernpfad (Details siehe Roadmap unten)
+- [ ] **`dvdrental` Demo-Datenbank einspielen** — über VIP `192.168.178.200` in den HA-Cluster laden, relationale Tabellenstruktur, `LEFT JOIN` / `INNER JOIN` / `GROUP BY` / `HAVING` mit echten Daten üben
+- [ ] **Performance-Analyse mit `pgbench`** — Lasttest gegen den HA-Cluster, `EXPLAIN ANALYZE`, Index-Optimierung, `pg_stat_statements`
+- [ ] **Backup-Strategie mit `pg_basebackup`** — Backup + Restore-Test + Cronjob + PITR (Point-in-Time Recovery) mit WAL-Archivierung
 
 ---
 
 ## Roadmap
 
 Dieses Lab ist ein lebendes Projekt — der Cluster steht, die Grundlagen sind dokumentiert. Geplante Erweiterungen:
-
-### Ergänzender Lernpfad: SUSE / SLES-Systemadministration
-
-Parallel zum PostgreSQL-HA-Lab wird ein separater SUSE-Lernpfad aufgebaut. Ziel ist, die Datenbankadministration in den Kontext eines professionellen Linux- und Rechenzentrumsbetriebs einzuordnen, ohne das bestehende Ubuntu-HA-Lab umzubauen.
-
-**Lernlinie:** Linux/SUSE → PostgreSQL → Backup & Recovery → Patroni → etcd → HAProxy/VIP → Monitoring → Security → Automatisierung.
-
-Geplante SUSE-Themen: **YaST** als Systemkonfigurationswerkzeug, **zypper/RPM** für Paket- und Repository-Verwaltung, `systemd`/`journalctl`, Netzwerk, Benutzer und Rechte, Storage, Dienste sowie PostgreSQL-Betrieb unter SUSE/SLES. Dabei steht nicht das Auswendiglernen einzelner Befehle im Vordergrund, sondern das Verständnis von Betrieb, Diagnose, Verifikation und Fehlerbehebung.
-
 
 | # | Thema | Beschreibung |
 |---|---|---|
@@ -145,7 +133,7 @@ Geplante SUSE-Themen: **YaST** als Systemkonfigurationswerkzeug, **zypper/RPM** 
 
 ## Dokumentation
 
-Der vollständige Lernweg inkl. aller Konzepte, Befehle und Entscheidungen steht im [Tutorial-Dokument](./PostgreSQL_und_Patroni_Tutorial.md).
+Der vollständige Lernweg inkl. aller Konzepte, Befehle und Entscheidungen steht im [Tutorial-Dokument](./TUTORIAL.md).
 
 Architektur inspiriert von [technotim.live — PostgreSQL High Availability](https://technotim.live/posts/postgresql-high-availability/), eigenständig auf Proxmox umgesetzt und dokumentiert.
 
