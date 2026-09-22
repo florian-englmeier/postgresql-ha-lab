@@ -1514,3 +1514,47 @@ latency average = 28.632 ms
 
 pgbench hat nicht nur Zahlen geliefert, sondern echtes Systemverständnis: den Durchsatz-Latenz-Trade-off, die Sättigungsgrenze der Hardware, die Bedeutung sauberer Messmethodik (`-j`, eine Variable pro Schritt, Generator-Platzierung) und — über die VIP — den Beweis, dass der HA-Stack unter Last stabil und transparent zum Leader routet.
 
+---
+
+## Teil 15 — Query-Analyse mit EXPLAIN und EXPLAIN ANALYZE
+
+Bis hierher stand der Cluster im Zentrum: Replikation, Failover, Routing, Backup, Last. Jetzt der Wechsel auf die **Query-Ebene** — warum eine einzelne Abfrage schnell oder langsam ist, wie PostgreSQL das entscheidet und wie man das nachvollziehbar messen kann. Grundwerkzeug dafür: `EXPLAIN` und `EXPLAIN ANALYZE`.
+
+### Der Query Planner in einem Satz
+
+Jede SQL-Query läuft nicht direkt los, sondern geht erst durch den **Query Planner**. Der überlegt sich: Sequential Scan (ganze Tabelle durchlesen) oder Index Scan? In welcher Reihenfolge Tabellen joinen? Welche Strategie ist am günstigsten? Das Ergebnis dieser Überlegung heißt **Ausführungsplan** — und genau den zeigen `EXPLAIN` und `EXPLAIN ANALYZE`.
+
+### EXPLAIN vs. EXPLAIN ANALYZE — der entscheidende Unterschied
+
+| | `EXPLAIN <query>` | `EXPLAIN ANALYZE <query>` |
+|---|---|---|
+| Was passiert mit der Query | **Nicht ausgeführt** — nur der Plan wird berechnet | **Wird ausgeführt** — Plan + echte Messwerte |
+| Ausgabe | Geschätzte Kosten und Zeilen | Zusätzlich: tatsächliche Zeit, tatsächliche Zeilenzahl |
+| Nutzen | Schneller Blick auf die Strategie | Vergleich Schätzung vs. Realität — deckt Fehleinschätzungen des Planners auf |
+
+Das klingt harmlos, hat aber eine handfeste Konsequenz:
+
+### ⚠️ Die Falle: `EXPLAIN ANALYZE` gegen schreibende Queries
+
+Das entscheidende Wort ist **ANALYZE**, nicht EXPLAIN. Wer glaubt, `EXPLAIN` heiße "nur erklären", tappt hier prompt in eine Falle:
+
+```sql
+EXPLAIN ANALYZE DELETE FROM notizen WHERE id > 100;
+```
+
+Diese Zeile **löscht wirklich**. Bei `INSERT` sind die Zeilen wirklich drin, bei `UPDATE` wirklich geändert. Der Planner braucht ja echte Messwerte, um sie anzuzeigen — also wird die Query auch tatsächlich ausgeführt.
+
+Gerade bei Behörden-Datenbanken (Kataster, Vermessung) ist das der Super-GAU: Man wollte "nur analysieren" und stellt hinterher fest, dass eine Million Zeilen weg sind.
+
+**Der Rettungsweg — Transaktion drumherum wickeln:**
+
+```sql
+BEGIN;
+EXPLAIN ANALYZE DELETE FROM notizen WHERE id > 100;
+ROLLBACK;
+```
+
+Damit wird die Query ausgeführt (man bekommt echte Messwerte), aber das `ROLLBACK` macht sie am Ende rückgängig. Der Standard-Trick, um `EXPLAIN ANALYZE` gefahrlos gegen schreibende Queries zu fahren.
+
+> **Merke:** Bei `SELECT` ist `EXPLAIN ANALYZE` harmlos. Bei `INSERT` / `UPDATE` / `DELETE` gehört es in einen `BEGIN … ROLLBACK`-Block. **Immer.**
+
