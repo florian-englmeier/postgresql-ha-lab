@@ -109,7 +109,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 **Kernziel erreicht:** vollautomatisierter 3-Knoten-Failover ohne manuellen Eingriff, End-to-End verifiziert — inklusive Backup/PITR und Performance-Nachweis.
 
-> Details zu den drei Bugs, die beim Failover-Test gefunden und gefixt wurden (VRRP-`weight`-Logik, `enable_script_security`, Dateiberechtigungen), stehen in [Teil 12 der früheren Tutorial-Fassung](./TUTORIAL.md#teil-12--der-echte-failover-test-und-drei-bugs-unterwegs).
+> Details zu den drei Bugs, die beim Aufsetzen von keepalived gefunden und gefixt wurden (VRRP-`weight`-Logik, `enable_script_security`, Dateiberechtigungen), stehen in [Teil 12 des Tutorials](./PostgreSQL_und_Patroni_Tutorial.md#teil-12--der-echte-failover-test-und-drei-bugs-unterwegs).
 
 ### 🔜 Als Nächstes
 

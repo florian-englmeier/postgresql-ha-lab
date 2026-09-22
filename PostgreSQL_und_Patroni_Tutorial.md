@@ -630,7 +630,185 @@ psql -h 192.168.178.201 -p 5000 -U postgres -c "SELECT pg_is_in_recovery();"
 
 ---
 
-## Teil 11 — Backup & Recovery
+## Teil 11 — keepalived: virtuelle IP für automatisches Failover
+
+HAProxy allein löst nur einen Teil des Problems: Es routet korrekt zur aktuellen Primary — aber die Anwendung muss trotzdem wissen, welchen der drei Knoten sie als HAProxy-Adresse ansprechen soll. Fällt genau dieser Knoten aus, ist die App wieder tot, obwohl Cluster und HAProxy-Configs auf allen drei Knoten identisch sind. **keepalived** schließt diese letzte Lücke: Es implementiert **VRRP** (Virtual Router Redundancy Protocol) und lässt eine einzige virtuelle IP (`192.168.178.200`) zwischen den drei Knoten wandern — immer dorthin, wo gerade ein gesunder HAProxy läuft. Die Anwendung verbindet sich nur noch mit dieser einen, stabilen Adresse.
+
+### Funktionsweise
+
+Die drei Knoten handeln per **Priorität** aus, wer die VIP aktuell binden darf (ph-node1 = 150, ph-node2 = 100, ph-node3 = 90 — im Normalfall gewinnt also node1). Damit die VIP nicht stur an einem Knoten kleben bleibt, dessen HAProxy abgestürzt ist, überwacht ein **Track-Script** (`check_haproxy.sh`) den lokalen HAProxy-Dienst und lässt keepalived die eigene Priorität senken, sobald HAProxy nicht mehr läuft — der nächste Knoten mit der höchsten verbleibenden Priorität übernimmt dann automatisch.
+
+**Design-Entscheidung: Unicast statt Multicast.** VRRP kommuniziert standardmäßig per Multicast (`224.0.0.18`). In Heimnetzen/auf Proxmox-Bridges kann das an IGMP-Snooping oder Switch-Filtern scheitern — im schlimmsten Fall sehen sich die Knoten gegenseitig nicht mehr und alle drei halten sich gleichzeitig für MASTER (Split-Brain bei der VIP). Stattdessen **Unicast** verwendet: VRRP-Pakete werden gezielt an die drei bekannten IPs geschickt statt gebroadcastet — unabhängig vom Multicast-Verhalten des Netzwerks.
+
+### Installation (auf allen drei Knoten identisch)
+
+```bash
+sudo apt install -y keepalived
+
+sudo tee /etc/keepalived/check_haproxy.sh > /dev/null <<'SCRIPT'
+#!/bin/bash
+# Exit 0 = HAProxy lebt, Exit 1 = tot -> keepalived senkt Priorität
+systemctl is-active --quiet haproxy
+SCRIPT
+
+sudo chmod +x /etc/keepalived/check_haproxy.sh
+```
+
+### `/etc/keepalived/keepalived.conf` — pro Knoten unterschiedlich
+
+Gleicher Dateipfad auf allen drei Maschinen, aber jeweils eigener Inhalt (state, priority, unicast_src_ip/unicast_peer):
+
+```
+# ph-node1 (192.168.178.201) — state MASTER, priority 150
+vrrp_script chk_haproxy {
+    script "/etc/keepalived/check_haproxy.sh"
+    interval 2
+    weight 20
+    fall 3
+    rise 2
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    interface ens18
+    virtual_router_id 51
+    priority 150
+    advert_int 1
+
+    unicast_src_ip 192.168.178.201
+    unicast_peer {
+        192.168.178.202
+        192.168.178.203
+    }
+
+    authentication {
+        auth_type PASS
+        auth_pass hapg2026
+    }
+
+    virtual_ipaddress {
+        192.168.178.200/24
+    }
+
+    track_script {
+        chk_haproxy
+    }
+}
+```
+
+Auf ph-node2 (`.202`) und ph-node3 (`.203`) identisch, außer: `state BACKUP`, `priority 100` bzw. `90`, sowie `unicast_src_ip`/`unicast_peer` auf die jeweils eigene bzw. die beiden anderen IPs angepasst.
+
+```bash
+sudo systemctl enable --now keepalived
+```
+
+### Verifiziert (17.09.2026)
+
+`ip a show ens18` auf ph-node1:
+
+```
+inet 192.168.178.201/24 brd 192.168.178.255 scope global ens18
+inet 192.168.178.200/24 scope global secondary ens18
+```
+
+Die VIP ist als sekundäre Adresse sauber an node1 gebunden. Von außen (Mac) getestet:
+
+```
+$ ping 192.168.178.200
+5 packets transmitted, 5 received, 0% packet loss
+
+$ psql -h 192.168.178.200 -p 5000 -U postgres -c "SELECT pg_is_in_recovery();"
+ pg_is_in_recovery
+--------------------
+ f
+(1 row)
+```
+
+Damit ist der komplette Stack — keepalived (VIP) → HAProxy (Routing) → Patroni (Leader-Election) → PostgreSQL — end-to-end über eine einzige stabile Adresse erreichbar, ganz ohne knotenspezifisches Wissen auf Anwendungsseite.
+
+---
+
+## Teil 12 — Der echte Failover-Test (und drei Bugs unterwegs)
+
+Der eigentliche Beweis, dass die Architektur trägt: HAProxy auf node1 gezielt stoppen und beobachten, ob die VIP automatisch zu einem gesunden Knoten wandert — ganz ohne manuellen Eingriff. Der erste Anlauf ist dabei **nicht** sauber durchgelaufen, und genau die drei Fehler unterwegs sind lehrreicher als ein Test, der auf Anhieb geklappt hätte.
+
+### Bug 1: Positives `weight` verhindert den Failover komplett
+
+Erste Config-Version hatte `weight 20` (positiv) im `vrrp_script`-Block. Die Logik dahinter ist additiv: Läuft der Check erfolgreich, wird die Basis-Priorität **erhöht** (150 → 170). Schlägt er fehl, wird der Bonus nur wieder **abgezogen** — zurück auf die Basis (170 → 150). Das Problem: 150 ist immer noch höher als node2s 100 und node3s 90. Node1 blieb also MASTER, obwohl HAProxy dort tot war — der Cluster war komplett offline, ohne dass keepalived das je gemerkt hätte:
+
+```
+14:18:31  Script `chk_haproxy` now returning 3
+14:18:35  VRRP_Script(chk_haproxy) failed (exited with status 3)
+14:18:35  Changing effective priority from 170 to 150   ← immer noch höchste Priorität!
+```
+
+**Fix:** `weight` komplett weglassen. Ohne `weight`-Angabe schaltet keepalived die VRRP-Instanz bei Script-Fehlschlag in den **FAULT-Zustand** — unabhängig von der Priorität wird sie zwingend aus dem Rennen genommen, statt nur an einem Arithmetik-Ergebnis herumzudrehen.
+
+### Bug 2: `enable_script_security` sucht einen User, den es nicht gibt
+
+Mit dem `weight`-Fix kam prompt die nächste Runde: `enable_script_security` in `global_defs` verlangt, dass Track-Scripts unter einem **unprivilegierten** User laufen (Root-Scripts + Config-Schreibrecht wäre ein Sicherheitsrisiko). Ohne explizite `user`-Angabe sucht keepalived automatisch nach einem System-User `keepalived_script` — den gab es auf keinem der drei Knoten:
+
+```
+Script user 'keepalived_script' does not exist
+(...) Unable to set default user for vrrp script chk_haproxy - removing
+(...) track_script chk_haproxy not found, ignoring...
+```
+
+Das Tückische daran: keepalived startet trotzdem klaglos — der Track-Script-Block wird einfach still entfernt, der Health-Check ist komplett tot, ohne dass ein offensichtlicher Fehler das zeigt.
+
+**Fix:** Den erwarteten System-User anlegen:
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin keepalived_script
+```
+
+### Bug 3: Falsche Dateiberechtigung blockiert den neuen User
+
+Nach dem User-Fix kam noch eine dritte Runde: Das Check-Script war aus einer früheren Sicherheitsrunde mit `chmod 700` (nur Owner-root darf ausführen) gesetzt. Der neue `keepalived_script`-User (uid 999) durfte es also gar nicht ausführen:
+
+```
+WARNING - script '/etc/keepalived/check_haproxy.sh' is not executable for uid:gid 999:988 - disabling.
+```
+
+**Fix:** `sudo chmod 755 /etc/keepalived/check_haproxy.sh` — root behält Schreibrecht, alle anderen dürfen lesen und ausführen.
+
+### Der Test, diesmal sauber
+
+Mit allen drei Fixes auf allen drei Knoten angewendet, Ausgangszustand verifiziert (alle drei `VRRP_Script(chk_haproxy) succeeded`, node1 MASTER mit VIP), dann:
+
+```bash
+# Auf node1:
+sudo systemctl stop haproxy
+```
+
+Status-Check über alle drei Knoten während node1s HAProxy aus ist:
+
+```
+== 192.168.178.201 ==   haproxy: inactive   VIP: nicht hier
+== 192.168.178.202 ==   haproxy: active     VIP: HIER -> MASTER
+== 192.168.178.203 ==   haproxy: active     VIP: nicht hier
+```
+
+Von außen (Mac) bestätigt, während node1 weiterhin ausgeschaltet ist:
+
+```
+$ ping -c 5 192.168.178.200
+64 bytes from 192.168.178.200: icmp_seq=0 ttl=64 time=0.862 ms
+64 bytes from 192.168.178.200: icmp_seq=1 ttl=64 time=0.747 ms
+(0% packet loss)
+
+$ psql -h 192.168.178.200 -p 5000 -U postgres -c "SELECT pg_is_in_recovery();"
+ pg_is_in_recovery
+--------------------
+ f
+(1 row)
+```
+
+Die VIP ist automatisch zu node2 gewandert, HAProxy dort hat den Traffic übernommen, `psql` antwortet weiterhin mit `f` (verbunden mit einer laufenden Primary) — komplett ohne manuellen Eingriff. Nach `sudo systemctl start haproxy` auf node1 übernimmt node1 die VIP automatisch zurück (höhere Basis-Priorität, 150 vs. 100).
+
+**Wichtige Einordnung:** Dieser Test validiert den **HAProxy/keepalived-Layer** (Traffic-Routing bei HAProxy-Ausfall) — nicht den **Patroni-Layer** (DB-Primary-Wechsel bei PostgreSQL-Ausfall), der schon in [Teil 4](#teil-4--manueller-failover-live-durchgeführt) manuell und in Teil 9 automatisiert verifiziert wurde. Beide Mechanismen arbeiten unabhängig voneinander zusammen und ergeben erst gemeinsam die vollständige HA-Kette: Stirbt PostgreSQL/Patroni auf dem Primary-Knoten, übernimmt Patroni die Leader-Wahl; stirbt HAProxy (oder der ganze Knoten), übernimmt keepalived die VIP. Ein noch härterer Test — node1 komplett herunterfahren statt nur HAProxy zu stoppen — würde beide Mechanismen gleichzeitig auslösen und ist ein möglicher nächster Schritt.
+
+---
+## Teil 13 — Backup & Recovery
 
 Bevor es an die Befehle geht, das Fundament: **warum** Backups überhaupt nötig sind, **welche zwei Arten** es gibt und **wie** aus einem Backup eine Zeitmaschine wird. Diese Einleitung fasst die Konzepte zusammen — die praktischen Schritte folgen ab 11.1.
 
@@ -695,7 +873,7 @@ Das **WAL** (Write-Ahead Log) ist dasselbe Protokoll, das auch die Replikation n
 
 ---
 
-### 11.1 Logisches Backup mit `pg_dump`
+### 13.1 Logisches Backup mit `pg_dump`
 
 `pg_dump` exportiert eine Datenbank als SQL-Befehle (`CREATE TABLE`, `INSERT INTO` usw.). Das Ergebnis ist eine lesbare, portable Datei — kein binäres Format.
 
@@ -739,7 +917,7 @@ sudo -u postgres psql -d titanic_restore -c "SELECT COUNT(*) FROM passengers;"
 
 ---
 
-### 11.2 Logisch vs. Physisch — der entscheidende Unterschied
+### 13.2 Logisch vs. Physisch — der entscheidende Unterschied
 
 | | Logisches Backup (`pg_dump`) | Physisches Backup (`pg_basebackup`) |
 |---|---|---|
@@ -762,7 +940,7 @@ sudo -u postgres psql -d titanic_restore -c "SELECT COUNT(*) FROM passengers;"
 
 ---
 
-### 11.3 Physisches Backup mit `pg_basebackup`
+### 13.3 Physisches Backup mit `pg_basebackup`
 
 `pg_basebackup` kopiert die rohen Datenbankdateien 1:1 — so wie sie auf der Festplatte liegen. Ergebnis: ein kompletter Snapshot der gesamten PostgreSQL-Instanz.
 
@@ -823,7 +1001,7 @@ sudo ls -lh /var/lib/postgresql/16/backup_test/
 
 ---
 
-### 11.4 Point-in-Time-Recovery (PITR)
+### 13.4 Point-in-Time-Recovery (PITR)
 
 PITR ermöglicht es, die Datenbank auf einen **exakten Zeitpunkt** zurückzusetzen — nicht nur auf den Backup-Zeitpunkt, sondern auf jede beliebige Sekunde danach.
 
@@ -851,7 +1029,7 @@ Mit WAL-Archiv: Restore auf **jede beliebige Sekunde** im Zeitraum danach.
 
 ---
 
-### 11.5 WAL-Archivierung einrichten
+### 13.5 WAL-Archivierung einrichten
 
 #### Warum WAL-Archivierung?
 
@@ -1018,7 +1196,7 @@ SELECT archived_count, last_archived_wal, failed_count, last_failed_wal FROM pg_
 
 ---
 
-### 11.6 PITR-Restore live durchgespielt
+### 13.6 PITR-Restore live durchgespielt
 
 Ziel: Beweisen, dass sich die Datenbank auf einen **exakten Zeitpunkt** zurücksetzen lässt. Wichtig — der Restore läuft auf einer **isolierten Test-Instanz** (eigener Port 5433, eigenes Datenverzeichnis, manuell per `pg_ctl` gestartet), damit der laufende Patroni-Cluster völlig unberührt bleibt. Patroni verwaltet seine Instanzen aktiv und würde eine manuell veränderte Cluster-Instanz sofort "korrigieren" — deshalb niemals eine von Patroni verwaltete Instanz für PITR anfassen.
 
@@ -1123,7 +1301,7 @@ Zustand nachher (Test, 5433):      Zeile 1 ✅   (Zeile 3 ❌)
 
 ---
 
-## Teil 12 — Performance-Analyse mit pgbench
+## Teil 14 — Performance-Analyse mit pgbench
 
 `pgbench` ist PostgreSQLs eingebautes **Benchmark-Werkzeug** (Teil von `postgresql-contrib`). Es simuliert viele parallele Clients, die gleichzeitig Transaktionen auf die Datenbank feuern, und misst, wie viele Transaktionen pro Sekunde (**TPS**) durchgehen. Ideal, um die Frage "hält der Cluster X gleichzeitige Verbindungen aus?" nicht zu *behaupten*, sondern zu *beweisen*.
 
@@ -1136,7 +1314,7 @@ sudo -u postgres createdb pgbench_test
 
 > **Praxis-Stolperstein (live erlebt):** `createdb` auf einer Replica scheitert mit `cannot execute CREATE DATABASE in a read-only transaction`. Eine Replica nimmt keine Schreibbefehle an. Vor Schreibaktionen also immer `patronictl list` prüfen, wer aktuell Leader ist — der Leader kann durch Failover gewechselt haben. (Genau dieses Problem löst später HAProxy/VIP automatisch.)
 
-### 12.1 Phase 1 — Initialisieren
+### 14.1 Phase 1 — Initialisieren
 
 ```bash
 sudo -u postgres pgbench -i -s 10 pgbench_test
@@ -1160,7 +1338,7 @@ creating primary keys...
 done in 0.96 s
 ```
 
-### 12.2 Phase 2 — Benchmark (10 Clients)
+### 14.2 Phase 2 — Benchmark (10 Clients)
 
 ```bash
 sudo -u postgres pgbench -c 10 -j 2 -T 30 pgbench_test
@@ -1192,7 +1370,7 @@ tps = 552.066205 (without initial connection time)
 Für 2 vCPU / 4 GB ist das ein solider Wert — und die **0 % Fehlerquote** ist genau das, was "hält gleichzeitige Verbindungen stabil aus" konkret bedeutet.
 
 
-### 12.3 Lasttest steigern (50 Clients) — der Durchsatz-Latenz-Trade-off
+### 14.3 Lasttest steigern (50 Clients) — der Durchsatz-Latenz-Trade-off
 
 Derselbe Benchmark mit 50 statt 10 Clients:
 
@@ -1256,7 +1434,7 @@ Analogie Supermarktkasse: 2 Kassen (= 2 CPUs) können nicht schneller scannen. B
 > **Admin-Lehre:** Den Sweet Spot suchen — die Client-Zahl mit maximaler TPS, *bevor* die Latenz unzumutbar wird. Wer darüber hinaus skalieren will, muss die **Hardware** aufstocken (mehr Kerne), nicht die Client-Zahl.
 
 
-### 12.4 Methodik-Check: die Rolle von `-j` und sauberes Messen
+### 14.4 Methodik-Check: die Rolle von `-j` und sauberes Messen
 
 Beim ersten Vergleich (10 → 50 Clients) wurden versehentlich **zwei** Variablen gleichzeitig geändert: die Client-Zahl (`-c`) *und* die Thread-Zahl (`-j 2` → `-j 4`). Sauberes Experimentieren heißt aber: **nur eine Variable pro Schritt ändern**, sonst ist unklar, welche den Effekt verursacht hat.
 
@@ -1276,7 +1454,7 @@ Gleiche Client-Zahl, doppelte Threads → **31 % mehr Durchsatz und weniger Late
 > **Lerneffekt:** Ein Benchmark ist nur so gut wie seine Methodik. Nur eine Variable pro Schritt ändern, den Lastgenerator nicht selbst zum Engpass werden lassen, und ihn möglichst getrennt vom Messobjekt betreiben.
 
 
-### 12.5 Krönung: Benchmark über die VIP — und eine überraschende Zahl
+### 14.5 Krönung: Benchmark über die VIP — und eine überraschende Zahl
 
 Der eigentliche HA-Test: pgbench nicht gegen einen einzelnen Knoten, sondern gegen die **VIP + HAProxy** laufen lassen. Die Anwendung spricht nur *eine* feste Adresse an — der Cluster entscheidet selbst, wo geschrieben wird.
 
@@ -1332,7 +1510,7 @@ latency average = 28.632 ms
 
 > **HA-Benchmark-Lehre:** In einem Cluster mit wanderndem Leader beeinflusst die **Position des Lastgenerators relativ zum Leader** die Messung massiv. Läuft der Generator auf demselben Knoten wie der Leader, konkurrieren beide um dieselben CPUs (langsamer). Läuft er auf einem anderen Knoten, sind die Ressourcen getrennt (schneller). Wer im HA-Umfeld benchmarkt, muss den Leader-Zustand kennen und protokollieren — sonst misst er Zufall statt Leistung.
 
-#### Fazit Teil 12
+#### Fazit Teil 14
 
 pgbench hat nicht nur Zahlen geliefert, sondern echtes Systemverständnis: den Durchsatz-Latenz-Trade-off, die Sättigungsgrenze der Hardware, die Bedeutung sauberer Messmethodik (`-j`, eine Variable pro Schritt, Generator-Platzierung) und — über die VIP — den Beweis, dass der HA-Stack unter Last stabil und transparent zum Leader routet.
 
