@@ -1558,3 +1558,67 @@ Damit wird die Query ausgeführt (man bekommt echte Messwerte), aber das `ROLLBA
 
 > **Merke:** Bei `SELECT` ist `EXPLAIN ANALYZE` harmlos. Bei `INSERT` / `UPDATE` / `DELETE` gehört es in einen `BEGIN … ROLLBACK`-Block. **Immer.**
 
+### Der Ausführungsplan — wie man ihn liest
+
+Ein einfaches Beispiel:
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM passengers WHERE age > 30;
+```
+
+```
+Seq Scan on passengers  (cost=0.00..20.14 rows=456 width=64)
+                        (actual time=0.012..0.234 rows=452 loops=1)
+  Filter: (age > 30)
+  Rows Removed by Filter: 439
+Planning Time: 0.087 ms
+Execution Time: 0.298 ms
+```
+
+Wirkt überladen, ist aber systematisch. Zwei Regeln, die alles einfacher machen:
+
+**Regel 1 — Von innen nach außen lesen.** Bei komplexen Plänen mit Joins und Sortierungen ist der Plan ein Baum. Das **am tiefsten eingerückte** Element läuft zuerst, sein Ergebnis wird nach oben durchgereicht — wie ein Aufrufbaum in Python: die inneren Funktionen werden zuerst ausgewertet.
+
+**Regel 2 — Zwei Zahlenpaare pro Knoten.**
+
+- `cost=0.00..20.14` und `rows=456` → **Schätzung** des Planners *vor* der Ausführung
+- `actual time=0.012..0.234` und `rows=452` → **Realität** *nach* der Ausführung (nur bei `ANALYZE`)
+
+Genau der Vergleich zwischen beiden ist das eigentliche Werkzeug: **klaffen Schätzung und Realität stark auseinander, hat der Planner sich verkalkuliert** — meist wegen veralteter Statistiken. Fix: `ANALYZE tabelle;` sammelt frische Statistiken ein.
+
+### Die wichtigsten Node-Typen
+
+Der erste Begriff einer Zeile (`Seq Scan`, `Index Scan`, `Hash Join` …) verrät die Strategie:
+
+| Node-Typ | Was macht er | Wann sinnvoll |
+|---|---|---|
+| **Seq Scan** | Liest die komplette Tabelle Zeile für Zeile | Kleine Tabellen ODER wenn ein Großteil der Zeilen sowieso gebraucht wird |
+| **Index Scan** | Nutzt einen Index, um gezielt zu Zeilen zu springen | Wenn nur wenige Zeilen gesucht sind (z. B. `WHERE id = 42`) |
+| **Bitmap Heap Scan** | Zwischenform: erst Index, dann Tabellenzugriff in einem Rutsch | Mittlere Ergebnismengen, mehrere Indizes kombinierbar |
+| **Nested Loop / Hash Join / Merge Join** | Drei verschiedene Join-Strategien | Planner wählt je nach Tabellengröße und Indizes |
+
+### Der klassische Anfänger-Reflex — und die Wahrheit
+
+**Reflex:** "Seq Scan ist schlecht, Index Scan ist gut."
+
+**Wahrheit:** Nicht immer. Bei vielen Treffern ist ein Seq Scan sogar **schneller** als ein Index Scan.
+
+**Die Rechnung dahinter, am Beispiel:** Tabelle mit 1000 Zeilen, Query trifft ~500 (die Hälfte).
+
+- **Seq Scan:** liest alle 1000 Zeilen einmal linear durch — sehr schnelles sequenzielles Lesen
+- **Index Scan bei 500 Treffern:** 500 Index-Zugriffe + 500 wahlfreie Sprünge in die Tabelle = **1000 Zugriffe insgesamt**, und die Sprünge sind viel langsamer als sequenzielles Lesen
+
+Ergebnis: Der Index-Umweg kostet mehr, als er spart. Der Planner wählt hier **Seq Scan**, obwohl ein Index existiert.
+
+> **Faustregel:** Ab etwa **5–10 % der Tabelle** wird ein Seq Scan günstiger als ein Index Scan. Bei 50 % ist das keine Diskussion mehr.
+
+**Wo Index Scan gewinnt:** `WHERE id = 42` — eine Zeile aus 1000. Direkt zum Ziel springen statt 999 Zeilen überfliegen.
+
+> **Merke:** Indizes lohnen sich nur für **selektive** Bedingungen. Viele Treffer → Seq Scan. Wenige Treffer → Index Scan.
+
+### Warum "mehr Indizes = schneller" ein Trugschluss ist
+
+Jeder zusätzliche Index verlangsamt **jedes** `INSERT` / `UPDATE` / `DELETE` auf der Tabelle, weil er mitgepflegt werden muss. Ein Index, den der Planner nie nutzt, ist reine Schreiblast ohne Lesenutzen — und im HA-Cluster wandert diese Schreiblast über WAL auch noch auf alle Replicas.
+
+Genau deshalb ist Index-Tuning kein "Streu-Sortiment", sondern eine gezielte Entscheidung pro Query, die man mit `EXPLAIN ANALYZE` **belegt**, statt sie zu vermuten.
+
