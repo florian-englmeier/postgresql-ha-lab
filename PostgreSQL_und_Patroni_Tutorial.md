@@ -1616,9 +1616,110 @@ Ergebnis: Der Index-Umweg kostet mehr, als er spart. Der Planner wählt hier **S
 
 > **Merke:** Indizes lohnen sich nur für **selektive** Bedingungen. Viele Treffer → Seq Scan. Wenige Treffer → Index Scan.
 
+### Warum ist sequenzielles Lesen schneller als Springen? — die Straßen-Analogie
+
+Stell dir die Tabelle als eine Reihe von Häusern in einer Straße vor, jedes Haus = eine Zeile.
+
+- **Sequenzielles Lesen (Seq Scan):** Du gehst die Straße einfach entlang, Haus für Haus. Kein Anhalten, keine Umwege — dein Fuß bewegt sich die ganze Zeit in eine Richtung.
+- **Index Scan:** Das Inhaltsverzeichnis (der Index) sagt dir: "Die Häuser, die du brauchst, sind Nummer 4, 891, 23, 560, 12, 743 …" — verstreut über die ganze Straße, in zufälliger Reihenfolge. Du musst bei **jedem einzelnen Treffer** erst zur Hausnummer hinlaufen, reinschauen, wieder raus, zur nächsten (völlig anderen) Hausnummer laufen.
+
+**Bei wenigen Treffern** (z. B. 1 Haus von 891) ist das kein Problem — ein kurzer, gezielter Weg schlägt das Abgehen der ganzen Straße haushoch.
+
+**Bei vielen Treffern** (z. B. 305 von 891) kehrt sich das um: Du machst 305 einzelne Stopp-und-Los-Bewegungen quer durch die ganze Straße — das summiert sich zu mehr Laufweg, als wenn du einfach einmal komplett durchgelaufen wärst und dabei nebenbei alle Treffer mitgenommen hättest.
+
+**Auf der Festplatte/im RAM gilt dasselbe Prinzip:** Sequenzielles Lesen (ein Block nach dem anderen, direkt nebeneinander gespeichert) ist für Hardware extrem günstig. Wahlfreies Springen (Random Access) — jedes Mal an eine andere Speicheradresse hüpfen — kostet bei jedem Sprung einen kleinen Overhead, selbst wenn die Daten selbst winzig sind.
+
+**Die Formel dahinter, ganz grob:**
+- Seq Scan kostet ungefähr: *1× die ganze Tabelle lesen*
+- Index Scan kostet ungefähr: *Anzahl Treffer × (ein Sprung + ein Lesen)*
+
+Bei 34 % Treffern ist "34 % der Tabelle mal Sprung-Kosten" teurer als "100 % der Tabelle einmal glatt durchlesen". Bei 0,1 % Treffern ist's umgekehrt — das ist exakt das, was der Query Planner bei jeder Query neu durchrechnet.
+
 ### Warum "mehr Indizes = schneller" ein Trugschluss ist
 
 Jeder zusätzliche Index verlangsamt **jedes** `INSERT` / `UPDATE` / `DELETE` auf der Tabelle, weil er mitgepflegt werden muss. Ein Index, den der Planner nie nutzt, ist reine Schreiblast ohne Lesenutzen — und im HA-Cluster wandert diese Schreiblast über WAL auch noch auf alle Replicas.
 
 Genau deshalb ist Index-Tuning kein "Streu-Sortiment", sondern eine gezielte Entscheidung pro Query, die man mit `EXPLAIN ANALYZE` **belegt**, statt sie zu vermuten.
+
+### Praxis: Seq Scan vs. Index Scan live bewiesen (Titanic-DB)
+
+Theorie ist eine Sache — aber der Planner trifft seine Entscheidung pro Query, nicht pro Tabelle. Das lässt sich mit drei `EXPLAIN ANALYZE`-Läufen gegen die echte Titanic-Datenbank sauber nachweisen.
+
+**Ausgangslage:** `passengers`-Tabelle, 891 Zeilen, verbunden über die VIP (`psql -h 192.168.178.200 -p 5000 -U postgres -d titanic`).
+
+#### Schritt 1 — Ohne Index: viele Treffer
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM passengers WHERE age > 30;
+```
+
+```
+Seq Scan on passengers  (cost=0.00..23.14 rows=305 width=68) (actual time=0.010..0.155 rows=305 loops=1)
+  Filter: (age > '30'::numeric)
+  Rows Removed by Filter: 586
+Planning Time: 0.435 ms
+Execution Time: 0.172 ms
+```
+
+305 von 891 Treffern (34 %). Kein Index vorhanden — Planner wählt erwartungsgemäß Seq Scan. Schätzung (`rows=305`) und Realität (`rows=305`) stimmen exakt überein: aktuelle Statistiken, keine Fehleinschätzung.
+
+#### Schritt 2 — Selektive Query auf dem Primary Key: automatisch Index Scan
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM passengers WHERE passengerid = 42;
+```
+
+```
+Index Scan using passengers_pkey on passengers  (cost=0.28..8.29 rows=1 width=68) (actual time=0.012..0.012 rows=1 loops=1)
+  Index Cond: (passengerid = 42)
+Planning Time: 0.139 ms
+Execution Time: 0.026 ms
+```
+
+Ohne dass irgendjemand einen Index angelegt hat: `passengers_pkey` existiert automatisch, weil `passengerid` als `PRIMARY KEY` definiert ist — `CREATE TABLE ... PRIMARY KEY` legt immer automatisch einen Index an. Bei nur einem Treffer (0,1 %) zieht der Planner ihn sofort.
+
+#### Schritt 3 — Der eigentliche Test: Index auf `age`, aber gleiche Query wie Schritt 1
+
+```sql
+CREATE INDEX idx_passengers_age ON passengers(age);
+EXPLAIN ANALYZE SELECT * FROM passengers WHERE age > 30;
+```
+
+```
+Seq Scan on passengers  (cost=0.00..23.14 rows=305 width=68) (actual time=0.005..0.144 rows=305 loops=1)
+  Filter: (age > '30'::numeric)
+  Rows Removed by Filter: 586
+Planning Time: 0.167 ms
+Execution Time: 0.161 ms
+```
+
+**Der Index existiert jetzt — und wird trotzdem ignoriert.** Weiterhin Seq Scan, weil 34 % Treffer weit über der 5-10-%-Schwelle liegen. Der Planner hat den Index geprüft und verworfen, weil der Umweg über den Index hier teurer wäre als das direkte Durchlesen.
+
+#### Schritt 4 — Derselbe Index, aber selektive Query: jetzt greift er
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM passengers WHERE age = 80;
+```
+
+```
+Index Scan using idx_passengers_age on passengers  (cost=0.28..8.29 rows=1 width=68) (actual time=0.015..0.016 rows=1 loops=1)
+  Index Cond: (age = '80'::numeric)
+Planning Time: 0.103 ms
+Execution Time: 0.025 ms
+```
+
+Derselbe Index (`idx_passengers_age`), aber jetzt nur 1 Treffer (0,1 %) — sofort Index Scan.
+
+#### Die Beweiskette im Überblick
+
+| Query | Treffer | Index vorhanden? | Strategie | Execution Time |
+|---|---|---|---|---|
+| `age > 30` | 305 (34 %) | nein | Seq Scan | 0,172 ms |
+| `passengerid = 42` | 1 (0,1 %) | ja (automatisch, PK) | Index Scan | 0,026 ms |
+| `age > 30` | 305 (34 %) | **ja** | **Seq Scan** | 0,161 ms |
+| `age = 80` | 1 (0,1 %) | ja | Index Scan | 0,025 ms |
+
+**Der entscheidende Vergleich ist Zeile 3 gegen Zeile 4:** identischer Index, identische Tabelle — aber die Strategie wechselt allein durch die Selektivität der Query. Das beweist live, was in der Theorie behauptet wurde:
+
+> **Ein Index existiert nicht heißt "wird benutzt".** Der Planner entscheidet pro Query neu, ob sich der Umweg über den Index lohnt. Ein Index für unselektive Bedingungen ist reine Schreiblast (er muss bei jedem `INSERT`/`UPDATE`/`DELETE` mitgepflegt werden) ohne jeden Lesevorteil — genau deshalb ist "einfach überall Indizes drauf" kein Tuning, sondern das Gegenteil davon.
 
