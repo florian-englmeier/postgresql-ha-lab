@@ -1721,12 +1721,12 @@ Derselbe Index (`idx_passengers_age`), aber jetzt nur 1 Treffer (0,1 %) — sofo
 
 **Der entscheidende Vergleich ist Zeile 3 gegen Zeile 4:** identischer Index, identische Tabelle — aber die Strategie wechselt allein durch die Selektivität der Query. Das beweist live, was in der Theorie behauptet wurde:
 
-> **Ein Index existiert nicht heißt "wird benutzt".** Der Planner entscheidet pro Query neu, ob sich der Umweg über den Index lohnt. Ein Index für unselektive Bedingungen ist reine Schreiblast (er muss bei jedem `INSERT`/`UPDATE`/`DELETE` mitgepflegt werden) ohne jeden Lesevorteil — genau deshalb ist "einfach überall Indizes drauf" kein Tuning, sondern das Gegenteil davon.
+> **Dass ein Index existiert, heißt nicht, dass er benutzt wird.** Der Planner entscheidet pro Query neu, ob sich der Umweg über den Index lohnt. Ein Index für unselektive Bedingungen ist reine Schreiblast (er muss bei jedem `INSERT`/`UPDATE`/`DELETE` mitgepflegt werden) ohne jeden Lesevorteil — genau deshalb ist "einfach überall Indizes drauf" kein Tuning, sondern das Gegenteil davon.
 
 
-### 15.x Praxisteil: EXPLAIN ANALYZE live an der Titanic-DB
+### Praxis II: Textsuche mit LIKE, Collation und `text_pattern_ops` (Titanic-DB)
 
-Die Theorie zu Ausführungsplänen steht oben. Hier folgt der Praxistest gegen die Titanic-Datenbank, verbunden über VIP und HAProxy (die Leader-Position ist dabei egal, HAProxy routet automatisch):
+Der erste Praxisteil hat gezeigt, wie Selektivität die Wahl zwischen Seq Scan und Index Scan steuert. Dieser zweite Teil geht eine Ebene tiefer: Was passiert bei Textsuchen mit `LIKE`, und warum kann ein vorhandener Index für eine Abfrage komplett unbrauchbar sein? Verbunden wird wieder über VIP und HAProxy (die Leader-Position ist dabei egal, HAProxy routet automatisch):
 
 ```bash
 psql -h 192.168.178.200 -p 5000 -U postgres -d titanic
@@ -1875,9 +1875,9 @@ Der Planer vergleicht einfach die geschätzten Gesamtkosten:
 | Seq Scan | 23,14 |
 | Bitmap Index Scan | **16,44** |
 
-Ausschlaggebend ist die **Selektivität**, also der Anteil der Zeilen, die zurückkommen. Erwartet werden 9 von 891 Zeilen, rund 1 %. Dafür reichen 3 Blöcke, und das ist selbst bei einer kleinen Tabelle günstiger als alles zu lesen. Bei einer Abfrage wie `WHERE sex = 'male'` (rund 65 % der Zeilen) sieht das anders aus: Dort muss ohnehin fast jeder Block angefasst werden, und der Umweg über den Index wäre reine Mehrarbeit.
+Ausschlaggebend ist die **Selektivität**, genau wie im ersten Praxisteil bei `age = 80`: Erwartet werden 9 von 891 Zeilen, rund 1 %. Dafür reichen 3 Blöcke, und das ist selbst bei einer kleinen Tabelle günstiger als alles zu lesen. Die Tabellengröße allein sagt also wenig; entscheidend ist, wie viele Zeilen zurückkommen.
 
-> **Merksatz:** Der Planer entscheidet über geschätzte Kosten. Die hängen weniger von der Tabellengröße ab als davon, wie viele Zeilen zurückkommen.
+> **Merksatz:** Ob ein Index benutzt wird, hängt an zwei Bedingungen. Er muss für die Abfrage *technisch nutzbar* sein (Collation, führendes `%`), und er muss sich *lohnen* (Selektivität).
 
 ---
 

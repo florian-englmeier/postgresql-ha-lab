@@ -106,15 +106,15 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 - [x] Logisches Backup mit `pg_dump` / `pg_restore` (inkl. Restore-Test auf neue Datenbank) verifiziert
 - [x] Physisches Backup mit `pg_basebackup` + WAL-Archivierung + Point-in-Time-Recovery (PITR) — sekundengenauer Restore auf isolierter Testinstanz bewiesen
 - [x] Performance-Analyse mit `pgbench` — Sättigungskurve (10/50/90 Clients), Durchsatz-Latenz-Trade-off, Lasttest über VIP/HAProxy mit 0 % Fehlerquote
+- [x] Query-Analyse mit `EXPLAIN ANALYZE` — Ausführungspläne lesen, Seq Scan vs. Index Scan, Selektivität live nachgewiesen, Collation-Falle (`de_DE.UTF-8`) bei `LIKE` mit `text_pattern_ops` gelöst
 
-**Kernziel erreicht:** vollautomatisierter 3-Knoten-Failover ohne manuellen Eingriff, End-to-End verifiziert — inklusive Backup/PITR und Performance-Nachweis.
+**Kernziel erreicht:** vollautomatisierter 3-Knoten-Failover ohne manuellen Eingriff, End-to-End verifiziert — inklusive Backup/PITR, Performance-Nachweis und Query-Analyse.
 
 > Details zu den drei Bugs, die beim Aufsetzen von keepalived gefunden und gefixt wurden (VRRP-`weight`-Logik, `enable_script_security`, Dateiberechtigungen), stehen in [Teil 12 des Tutorials](./PostgreSQL_und_Patroni_Tutorial.md#teil-12--der-echte-failover-test-und-drei-bugs-unterwegs).
 
 ### 🔜 Als Nächstes
 
-- [ ] `EXPLAIN ANALYZE` & Index-Optimierung
-- [ ] SUSE/SLES-Lernpfad (Details siehe Roadmap unten)
+- [ ] Monitoring: Prometheus + `postgres_exporter` + Grafana Dashboard (Leader-Status, Replikations-Lag, Cache-Hit-Ratio, Connections)
 
 ---
 
