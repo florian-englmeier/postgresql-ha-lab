@@ -118,7 +118,7 @@ SELECT version();
 Statt dauerhaft als Superuser `postgres` zu arbeiten, wurde eine eigene Login-Rolle plus Datenbank angelegt:
 
 ```sql
-CREATE ROLE flo WITH LOGIN PASSWORD 'ein_test_passwort';
+CREATE ROLE flo WITH LOGIN PASSWORD '<FLO_PASSWORD>';
 CREATE DATABASE testdb OWNER flo;
 ```
 
@@ -190,7 +190,7 @@ Für den ersten praktischen Replikations-Versuch wurde **auf derselben VM** ein 
 ### 1. Replikations-Rolle auf dem Primary
 
 ```sql
-CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'replica_pass_123';
+CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '<REPLICATION_PASSWORD>';
 ```
 
 Das `REPLICATION`-Attribut ist unabhängig von normalen Tabellenrechten — nur Rollen damit (oder Superuser) dürfen den WAL-Stream abonnieren.
@@ -683,7 +683,7 @@ vrrp_instance VI_1 {
 
     authentication {
         auth_type PASS
-        auth_pass hapg2026
+        auth_pass <VRRP_PASSWORD>
     }
 
     virtual_ipaddress {

@@ -1,0 +1,19 @@
+# --- Secrets: bleiben nur lokal ---
+*.env
+!*.env.example
+configs/**/patroni.yml
+!configs/**/patroni.yml.example
+secrets/
+*.pem
+*.key
+.pgpass
+
+# --- Claude Code: persönlich / lokal ---
+CLAUDE.local.md
+.claude/settings.local.json
+.claude/worktrees/
+
+# --- Sonstiges ---
+.DS_Store
+*.dump
+*.tar.gz
