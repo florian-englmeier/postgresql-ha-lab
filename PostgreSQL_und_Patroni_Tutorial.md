@@ -1723,3 +1723,181 @@ Derselbe Index (`idx_passengers_age`), aber jetzt nur 1 Treffer (0,1 %) — sofo
 
 > **Ein Index existiert nicht heißt "wird benutzt".** Der Planner entscheidet pro Query neu, ob sich der Umweg über den Index lohnt. Ein Index für unselektive Bedingungen ist reine Schreiblast (er muss bei jedem `INSERT`/`UPDATE`/`DELETE` mitgepflegt werden) ohne jeden Lesevorteil — genau deshalb ist "einfach überall Indizes drauf" kein Tuning, sondern das Gegenteil davon.
 
+
+### 15.x Praxisteil: EXPLAIN ANALYZE live an der Titanic-DB
+
+Die Theorie zu Ausführungsplänen steht oben. Hier folgt der Praxistest gegen die Titanic-Datenbank, verbunden über VIP und HAProxy (die Leader-Position ist dabei egal, HAProxy routet automatisch):
+
+```bash
+psql -h 192.168.178.200 -p 5000 -U postgres -d titanic
+```
+
+#### Kurzer Einschub: Was die VIP wirklich ist
+
+Die `.200` ist keine vierte Maschine, sondern nur eine Adresse. keepalived weist sie per VRRP immer genau einem der drei Knoten zu; fällt dieser aus, übernimmt ein anderer Knoten die Adresse. Die Verbindung läuft in zwei Stufen: keepalived bestimmt, auf welchem Knoten die `.200` gerade liegt, und der HAProxy dieses Knotens leitet an den aktuellen Postgres-Leader weiter. VIP-Halter und Leader müssen dabei nicht derselbe Knoten sein.
+
+| Schicht | Beantwortet die Frage |
+|---|---|
+| Patroni + etcd | *Wer ist* Primary? (entscheidet) |
+| HAProxy | *Wo ist* der Primary gerade? (findet ihn, leitet weiter) |
+| keepalived/VIP | *Welche Adresse* ruft die Anwendung an, auch wenn ein Knoten stirbt? |
+
+> **Merksatz:** keepalived macht den Eingang hochverfügbar, Patroni macht die Datenbank hochverfügbar.
+
+---
+
+#### Schritt 1: Suche mit führendem Platzhalter
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM passengers WHERE name LIKE '%Smith%';
+```
+
+```
+Seq Scan on passengers  (cost=0.00..23.14 rows=9 width=68) (actual time=0.043..0.142 rows=4 loops=1)
+  Filter: (name ~~ '%Smith%'::text)
+  Rows Removed by Filter: 887
+Planning Time: 0.063 ms
+Execution Time: 0.151 ms
+```
+
+**Die Ausgabe Zeile für Zeile:**
+
+| Element | Bedeutung |
+|---|---|
+| `Seq Scan` | Tabelle wird komplett von vorne bis hinten gelesen |
+| `cost=0.00..23.14` | *Schätzung* des Planers: Kosten bis zur ersten bzw. letzten Zeile, in abstrakten Einheiten (keine Millisekunden) |
+| `rows=9` (geschätzt) | Der Planer erwartet 9 Treffer |
+| `width=68` | Durchschnittliche Breite einer Ergebniszeile in Bytes |
+| `actual time=0.043..0.142` | *Echte* Millisekunden bis zur ersten bzw. letzten Zeile (nur dank `ANALYZE`) |
+| `rows=4` (actual) | Tatsächlich waren es 4 Treffer |
+| `~~` | PostgreSQLs interne Schreibweise für `LIKE` |
+| `Rows Removed by Filter: 887` | 887 + 4 = 891, also jede Zeile der Tabelle angefasst |
+
+Warum hier nur ein Seq Scan möglich ist, zeigt das Telefonbuch: Alle Namen, die mit „Smith“ *beginnen*, findet man dank Sortierung sofort. Alle Namen, in denen „smith“ *irgendwo* vorkommt („Goldsmith“ steht unter G, „Arrowsmith“ unter A), findet man nur durch Blättern jeder Seite.
+
+> **Merksatz:** Ein führendes `%` macht jeden B-Tree-Index unbrauchbar. `LIKE 'Smith%'` kann einen Index nutzen, `LIKE '%Smith%'` nicht.
+
+Zwei Lehren aus diesem ersten Plan: Schätzung und Realität vergleichen (`rows=9` gegen `rows=4`) ist eine der wichtigsten EXPLAIN-Techniken; liegt der Planer um Größenordnungen daneben, sind oft veraltete Statistiken schuld (`ANALYZE passengers;` hilft). Und ein Seq Scan ist nicht automatisch schlecht: Bei 891 Zeilen dauert er 0,15 ms.
+
+---
+
+#### Schritt 2: Normaler Index für die Präfix-Suche
+
+```sql
+CREATE INDEX idx_passengers_name ON passengers (name);
+SET enable_seqscan = off;
+EXPLAIN ANALYZE SELECT * FROM passengers WHERE name LIKE 'Smith%';
+```
+
+`enable_seqscan = off` verbietet den Seq Scan nicht, macht ihn für den Planer aber künstlich extrem teuer. Das ist ein reines **Diagnose-Werkzeug** für die aktuelle Session. Es beantwortet die Frage: Will der Planer den Index nicht, oder *kann* er ihn gar nicht benutzen?
+
+```
+Seq Scan on passengers  (cost=10000000000.00..10000000023.14 rows=9 width=68) (actual time=16.182..16.223 rows=4 loops=1)
+  Filter: (name ~~ 'Smith%'::text)
+  Rows Removed by Filter: 887
+JIT:
+  Timing: ... Total 16.345 ms
+Execution Time: 16.444 ms
+```
+
+Trotz Strafkosten (`cost=10000000000`) bleibt es beim Seq Scan. Der Planer *kann* den Index also nicht nutzen.
+
+**Stolperstein unterwegs (live erlebt):** Beim ersten Versuch war der `CREATE INDEX` gar nicht gelaufen, und der Seq Scan hatte eine viel banalere Ursache: Es gab schlicht keinen Index. Aufgefallen ist das erst über
+
+```sql
+\di idx_passengers*
+```
+
+> **Merke:** Vor der Suche nach komplizierten Ursachen die Voraussetzungen prüfen. `\di` (Indizes) und `\d tabelle` sind dafür die schnellsten Werkzeuge.
+
+**Bonus-Fund JIT:** Die künstlichen Kosten lagen über `jit_above_cost` (Standard 100.000), also warf PostgreSQL seinen Just-in-Time-Compiler an. Die eigentliche Arbeit dauerte weiter unter 0,1 ms, das Kompilieren allein aber rund 16 ms (im ersten Lauf sogar 71 ms). JIT lohnt sich erst bei großen, rechenintensiven Abfragen.
+
+---
+
+#### Schritt 3: Die Ursache ist die Collation
+
+```sql
+SELECT datcollate FROM pg_database WHERE datname = 'titanic';
+-- → de_DE.UTF-8
+```
+
+Die Collation ist die Sortierregel für Text. `de_DE.UTF-8` sortiert „menschlich“, nach deutschen Sprachregeln für Groß-/Kleinschreibung, Umlaute und Sonderzeichen. Ein normaler B-Tree-Index ist nach genau diesen Regeln sortiert, und dann kann PostgreSQL aus `LIKE 'Smith%'` keinen sicheren Bereich ableiten. Also verzichtet er ganz auf den Index.
+
+Die Lösung ist ein Index mit dem Operator-Klassen-Zusatz `text_pattern_ops`, der stur Zeichen für Zeichen (byteweise) sortiert:
+
+```sql
+CREATE INDEX idx_passengers_name_pattern ON passengers (name text_pattern_ops);
+EXPLAIN ANALYZE SELECT * FROM passengers WHERE name LIKE 'Smith%';
+```
+
+```
+Bitmap Heap Scan on passengers  (cost=4.37..16.44 rows=9 width=68) (actual time=0.017..0.020 rows=4 loops=1)
+  Filter: (name ~~ 'Smith%'::text)
+  Heap Blocks: exact=3
+  ->  Bitmap Index Scan on idx_passengers_name_pattern  (cost=0.00..4.37 rows=9 width=0) (actual time=0.013..0.013 rows=4 loops=1)
+        Index Cond: ((name ~>=~ 'Smith'::text) AND (name ~<~ 'Smiti'::text))
+Planning Time: 0.202 ms
+Execution Time: 0.030 ms
+```
+
+**Den Plan liest man von innen nach außen:**
+
+1. **`Bitmap Index Scan`** (eingerückt, mit `->`): geht in den Index und sammelt eine Merkliste („Bitmap“) der Tabellenblöcke, in denen Treffer liegen.
+2. **`Bitmap Heap Scan`** (außen): holt gezielt nur diese Blöcke. `Heap Blocks: exact=3` heißt: 3 Blöcke gelesen statt der ganzen Tabelle.
+
+Das Schönste steht in `Index Cond`: PostgreSQL hat aus `LIKE 'Smith%'` den **Bereich** „ab *Smith* bis vor *Smiti*“ gemacht, der letzte Buchstabe wurde einfach hochgezählt. Das ist wörtlich das Telefonbuch-Prinzip. `~>=~` und `~<~` sind die byteweisen Vergleichsoperatoren von `text_pattern_ops`.
+
+| | normaler Index | `text_pattern_ops` |
+|---|---|---|
+| Plan | Seq Scan (trotz Strafkosten) | Bitmap Index Scan |
+| gelesene Zeilen | alle 891 | 4 |
+| Execution Time | 16,4 ms (fast nur JIT) | 0,03 ms |
+
+> **Merke:** Bei einer sprachabhängigen Collation wie `de_DE.UTF-8` braucht eine Präfix-Suche mit `LIKE 'abc%'` einen Index mit `text_pattern_ops`. Gleiche Abfrage, gleiche Daten: Allein die Art des Index entscheidet, ob er nutzbar ist.
+
+---
+
+#### Schritt 4: Nimmt der Planer den Index auch freiwillig?
+
+Meine Vorhersage war: Bei nur 891 Zeilen wählt der Planer ohne Zwang lieber den Seq Scan. Der Test:
+
+```sql
+RESET enable_seqscan;
+EXPLAIN ANALYZE SELECT * FROM passengers WHERE name LIKE 'Smith%';
+```
+
+Ergebnis: derselbe `Bitmap Index Scan`, Execution Time 0,038 ms. **Die Vorhersage war falsch**, und genau daraus lernt man am meisten.
+
+Der Planer vergleicht einfach die geschätzten Gesamtkosten:
+
+| Plan | geschätzte Kosten |
+|---|---|
+| Seq Scan | 23,14 |
+| Bitmap Index Scan | **16,44** |
+
+Ausschlaggebend ist die **Selektivität**, also der Anteil der Zeilen, die zurückkommen. Erwartet werden 9 von 891 Zeilen, rund 1 %. Dafür reichen 3 Blöcke, und das ist selbst bei einer kleinen Tabelle günstiger als alles zu lesen. Bei einer Abfrage wie `WHERE sex = 'male'` (rund 65 % der Zeilen) sieht das anders aus: Dort muss ohnehin fast jeder Block angefasst werden, und der Umweg über den Index wäre reine Mehrarbeit.
+
+> **Merksatz:** Der Planer entscheidet über geschätzte Kosten. Die hängen weniger von der Tabellengröße ab als davon, wie viele Zeilen zurückkommen.
+
+---
+
+#### Aufräumen
+
+Der normale Index ist für `LIKE` nachweislich nutzlos und wird wieder entfernt. Ein `DROP INDEX` ändert keine Daten; ein Index ist eine separate Hilfsstruktur, vergleichbar mit dem Stichwortverzeichnis eines Buchs.
+
+```sql
+DROP INDEX idx_passengers_name;
+```
+
+**Verifiziert 30.09.2026.**
+
+---
+
+#### Schnell-Referenz (zum Abfragen)
+
+- **In welcher Richtung liest man einen Plan?** → Von innen nach außen, die am tiefsten eingerückte Zeile (`->`) läuft zuerst.
+- **`cost` vs. `actual time`?** → `cost` ist die Schätzung in abstrakten Einheiten, `actual time` die gemessene Zeit in ms (nur mit `ANALYZE`).
+- **Warum nutzt `LIKE '%abc%'` keinen Index?** → Das führende `%` macht die Sortierung wertlos.
+- **Warum nutzt `LIKE 'abc%'` bei `de_DE.UTF-8` keinen normalen Index?** → Die sprachabhängige Sortierung erlaubt keine sichere Bereichsbildung; Lösung: `text_pattern_ops`.
+- **Wofür ist `enable_seqscan = off`?** → Diagnose: Unterscheidet „Planer will den Index nicht“ von „Planer kann ihn nicht nutzen“. Nie dauerhaft setzen.
+- **Wann gewinnt ein Index gegen den Seq Scan?** → Bei hoher Selektivität (wenige Treffer), unabhängig von der Tabellengröße.
