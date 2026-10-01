@@ -5,9 +5,11 @@
 ![Ubuntu](https://img.shields.io/badge/Ubuntu-24.04_LTS-E95420?logo=ubuntu&logoColor=white)
 ![Proxmox](https://img.shields.io/badge/Proxmox-VE-E57000?logo=proxmox&logoColor=white)
 ![etcd](https://img.shields.io/badge/etcd-Raft_Konsensus-419EDA)
+![Prometheus](https://img.shields.io/badge/Prometheus-Monitoring-E6522C?logo=prometheus&logoColor=white)
+![Grafana](https://img.shields.io/badge/Grafana-Dashboards-F46800?logo=grafana&logoColor=white)
 ![License](https://img.shields.io/badge/Lizenz-MIT-green)
 
-Ein selbst gebautes, hochverfügbares PostgreSQL-Cluster-Lab auf Proxmox — von den Grundlagen (Architektur, Replikation, manueller Failover) bis zum vollautomatisierten 3-Knoten-Failover mit Patroni, etcd, HAProxy und keepalived.
+Ein selbst gebautes, hochverfügbares PostgreSQL-Cluster-Lab auf Proxmox — von den Grundlagen (Architektur, Replikation, manueller Failover) bis zum vollautomatisierten 3-Knoten-Failover mit Patroni, etcd, HAProxy und keepalived — inklusive Backup/PITR, Performance-Analyse und Monitoring mit Prometheus.
 
 Entstanden als strukturiertes Lernprojekt, vollständig dokumentiert als Portfolio-Nachweis.
 
@@ -17,6 +19,7 @@ Entstanden als strukturiertes Lernprojekt, vollständig dokumentiert als Portfol
 
 ```
                     ┌─────────────────────┐
+                    │  pg-vip.home.arpa    │  ← DNS-Name (Pi-hole)
                     │   Virtuelle IP       │
                     │  192.168.178.200     │  ← keepalived (VRRP)
                     └──────────┬───────────┘
@@ -39,6 +42,12 @@ Entstanden als strukturiertes Lernprojekt, vollständig dokumentiert als Portfol
 └─────────────────┘   └──────────────────┘   └──────────────────┘
         └──────────────────── etcd/Raft-Konsensus ─────────────────┘
               (Mehrheitsprinzip entscheidet, wer Primary ist)
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ ph-monitor 192.168.178.204 — Prometheus (9090) + Grafana (3000)      │
+│ sammelt per Pull: node_exporter :9100 · postgres_exporter :9187 ·    │
+│                   Patroni-Metriken :8008 — von allen drei Knoten     │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -60,6 +69,10 @@ Das eingebaute HAProxy-Stats-Dashboard (Port `7000`) zeigt live, dass Client-Tra
 | **etcd** | Verteilter Konsensus-Store (Raft), verhindert Split-Brain |
 | **HAProxy** | Routet Client-Traffic ausschließlich zum aktuellen Primary |
 | **keepalived** | Virtuelle IP (VRRP) als stabiler Einstiegspunkt |
+| **Prometheus** | Sammelt Metriken von 11 Zielen (Pull-Prinzip, 15-s-Intervall) |
+| **node_exporter / postgres_exporter** | Betriebssystem- und Datenbank-Metriken je Knoten; Exporter mit eigener `pg_monitor`-Rolle |
+| **Grafana** | Dashboards (in Arbeit) |
+| **Pi-hole** | Lokaler DNS: `pg-vip.home.arpa` → VIP |
 | **Proxmox VE** | Virtualisierungsplattform für die 3 Cluster-Knoten |
 | **Ubuntu Server** | 24.04 LTS, je Knoten |
 
@@ -72,6 +85,7 @@ Wer dieses Lab selbst nachbauen möchte, findet den vollständigen Lernweg — a
 ### Infrastruktur
 
 - 3× Ubuntu Server 24.04 LTS VMs (2 vCPU / 4 GB RAM / 20 GB Disk)
+- 1× Monitoring-VM `ph-monitor` (VMID 204, `192.168.178.204`, 2 vCPU / 2 GB / 20 GB) — bewusst getrennt vom Cluster, damit das Monitoring Knotenausfälle überlebt
 - Netz: `192.168.178.0/24` (Heimnetz), statische IPs `.201`–`.203`, virtuelle IP `.200`
 - Strategie: Template-Knoten (`ph-node1`) vollständig vorbereitet (Pakete installiert, noch keine knotenspezifische Config), dann zweimal geklont — knotenspezifisches Konfigurieren (IP, Hostname, machine-id, SSH-Keys) erst nach dem Klonen
 
@@ -107,14 +121,22 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 - [x] Physisches Backup mit `pg_basebackup` + WAL-Archivierung + Point-in-Time-Recovery (PITR) — sekundengenauer Restore auf isolierter Testinstanz bewiesen
 - [x] Performance-Analyse mit `pgbench` — Sättigungskurve (10/50/90 Clients), Durchsatz-Latenz-Trade-off, Lasttest über VIP/HAProxy mit 0 % Fehlerquote
 - [x] Query-Analyse mit `EXPLAIN ANALYZE` — Ausführungspläne lesen, Seq Scan vs. Index Scan, Selektivität live nachgewiesen, Collation-Falle (`de_DE.UTF-8`) bei `LIKE` mit `text_pattern_ops` gelöst
+- [x] DNS-Name für die VIP über Pi-hole (`pg-vip.home.arpa`), Kette Name → VIP → HAProxy → Leader Ende-zu-Ende verifiziert
+- [x] Ausfalltest des VIP-Halters gemessen: VIP-Umzug in ~3 s, Anwendung ~5 s verzögert ohne Fehlermeldung, kein Patroni-Failover (Timeline unverändert)
+- [x] Fund dabei: Patroni-Autostart war auf allen drei Knoten deaktiviert — behoben und per Neustart-Test bestätigt
+- [x] Härtung: `/etc/patroni.yml` (enthält Passwörter) von weltlesbar auf `root:postgres 640`
+- [x] Monitoring-Unterbau: eigene VM `ph-monitor`, node_exporter, Patroni-Metriken, postgres_exporter mit `pg_monitor`-Rolle (inkl. Passwort-Rotation), Prometheus mit 11/11 Zielen `UP`, Grafana installiert
 
-**Kernziel erreicht:** vollautomatisierter 3-Knoten-Failover ohne manuellen Eingriff, End-to-End verifiziert — inklusive Backup/PITR, Performance-Nachweis und Query-Analyse.
+**Kernziel erreicht:** vollautomatisierter 3-Knoten-Failover ohne manuellen Eingriff, End-to-End verifiziert — inklusive Backup/PITR, Performance-Nachweis, Query-Analyse und Monitoring-Unterbau.
 
 > Details zu den drei Bugs, die beim Aufsetzen von keepalived gefunden und gefixt wurden (VRRP-`weight`-Logik, `enable_script_security`, Dateiberechtigungen), stehen in [Teil 12 des Tutorials](./PostgreSQL_und_Patroni_Tutorial.md#teil-12--der-echte-failover-test-und-drei-bugs-unterwegs).
 
 ### 🔜 Als Nächstes
 
-- [ ] Monitoring: Prometheus + `postgres_exporter` + Grafana Dashboard (Leader-Status, Replikations-Lag, Cache-Hit-Ratio, Connections)
+- [ ] Grafana: Prometheus als Datenquelle, Dashboards (Leader-Status, Replikations-Lag, Cache-Hit-Ratio, Connections, Server-Last)
+- [ ] Platten der Knoten per `lvextend` auf volle Größe erweitern (Vorbereitung Lasttest, WAL-Archiv wächst)
+- [ ] Lasttest mit `pgbench` von `ph-monitor` aus (getrennter Lastgenerator) — live im Dashboard
+- [ ] Failover unter Last, im Dashboard sichtbar gemacht
 
 ---
 
@@ -133,9 +155,9 @@ Geplante SUSE-Themen: **YaST** als Systemkonfigurationswerkzeug, **zypper/RPM** 
 
 | # | Thema | Beschreibung |
 |---|---|---|
-| 1 | **Monitoring** | `pg_activity`, Prometheus + `postgres_exporter` + Grafana Dashboard |
+| 1 | **Monitoring** | 🔧 in Arbeit — Prometheus + Exporter laufen, Grafana-Dashboards folgen; ergänzend `pg_activity` |
 | 2 | **Connection Pooling** | PgBouncer vor HAProxy schalten — reduziert Verbindungs-Overhead bei vielen Clients |
-| 3 | **Sicherheitshärtung** | SSL/TLS für PostgreSQL-Verbindungen, `pg_hba.conf` Restriktionen, BSI IT-Grundschutz |
+| 3 | **Sicherheitshärtung** | 🔧 begonnen (Dateirechte `patroni.yml`, Exporter-Config) — offen: `keepalived.conf`, SSL/TLS, `pg_hba.conf` Restriktionen, BSI IT-Grundschutz |
 | 4 | **Parametrisiertes Setup-Skript** | `setup_patroni_node.sh --node-id 1 --ip 192.168.178.201` — Cluster reproduzierbar per Skript aufsetzen |
 | 5 | **Read-only Load Balancing** | Replicas über separaten HAProxy-Port (z.B. `5433`) für Leseabfragen nutzen |
 | 6 | **Switchover vs. Failover** | `patronictl switchover` (kontrolliert) vs. automatischer Failover — Unterschied live demonstrieren |
@@ -146,6 +168,8 @@ Geplante SUSE-Themen: **YaST** als Systemkonfigurationswerkzeug, **zypper/RPM** 
 ## Dokumentation
 
 Der vollständige Lernweg inkl. aller Konzepte, Befehle und Entscheidungen steht im [Tutorial-Dokument](./PostgreSQL_und_Patroni_Tutorial.md).
+
+Zum Wiederholen: [Kontrollfragen](./Kontrollfragen.md) — über 120 Fragen mit Antworten, nach Themen sortiert.
 
 Architektur inspiriert von [technotim.live — PostgreSQL High Availability](https://technotim.live/posts/postgresql-high-availability/), eigenständig auf Proxmox umgesetzt und dokumentiert.
 

@@ -2,7 +2,7 @@
 
 Persönliches Tutorial/Lernprotokoll, entstanden aus einem interaktiven Tutoring-Track. Ziel: PostgreSQL und Patroni (High Availability) strukturiert verstehen — erst PostgreSQL als eigenständiges System, danach HA/Patroni als zusätzliche Schicht.
 
-Stand: 22.09.2026
+Stand: 01.10.2026
 
 ---
 
@@ -1901,3 +1901,554 @@ DROP INDEX idx_passengers_name;
 - **Warum nutzt `LIKE 'abc%'` bei `de_DE.UTF-8` keinen normalen Index?** → Die sprachabhängige Sortierung erlaubt keine sichere Bereichsbildung; Lösung: `text_pattern_ops`.
 - **Wofür ist `enable_seqscan = off`?** → Diagnose: Unterscheidet „Planer will den Index nicht“ von „Planer kann ihn nicht nutzen“. Nie dauerhaft setzen.
 - **Wann gewinnt ein Index gegen den Seq Scan?** → Bei hoher Selektivität (wenige Treffer), unabhängig von der Tabellengröße.
+
+---
+
+## Teil 16 — VIP, DNS und der Ausfalltest des VIP-Halters
+
+Nach dem Aufbau des kompletten HA-Stacks blieb eine scheinbar einfache Frage offen: *Welcher Rechner ist eigentlich die `192.168.178.200`?* Die Antwort führt direkt zum Kern von keepalived — und zu einem Ausfalltest, der einen echten Konfigurationsfehler ans Licht brachte.
+
+### 16.1 Die VIP ist keine Maschine
+
+In der Fritzbox-Geräteliste taucht die `.200` unter dem Namen **ph-node1** auf, und ein `ssh florian@192.168.178.200` landet auf einem vollwertigen Linux mit Prompt `florian@ph-node1`. Trotzdem gibt es keine eigene VM für die VIP — in Proxmox existieren nur 201, 202 und 203.
+
+Die Erklärung: keepalived hängt die VIP als **zusätzliche Adresse** an die Netzwerkkarte des Knotens, der gerade VRRP-MASTER ist. Das Login-Banner zeigt es direkt:
+
+```
+IPv4 address for ens18: 192.168.178.201
+IPv4 address for ens18: 192.168.178.200
+```
+
+Eine Netzwerkkarte, zwei Adressen. `ip addr` markiert die geliehene Adresse ausdrücklich:
+
+```bash
+ip -4 addr show | grep 192.168.178.200
+#    inet 192.168.178.200/24 scope global secondary ens18
+```
+
+Daraus folgt alles Weitere:
+
+| Beobachtung | Ursache |
+|---|---|
+| Fritzbox zeigt „ph-node1" für die `.200` | gleiche MAC-Adresse wie node1 → für den Router ein Gerät mit zwei IPs |
+| SSH auf `.200` landet auf einem Linux | `sshd` lauscht auf allen Adressen (`0.0.0.0:22`), also auch auf der geliehenen |
+| Nach einem VIP-Wechsel: `REMOTE HOST IDENTIFICATION HAS CHANGED` | unter derselben IP antwortet ein anderer Rechner mit anderem Host-Key — kein Angriff |
+
+> **Praxis-Regel:** Zum Administrieren immer die festen Adressen `.201`–`.203` nutzen. Die `.200` ist für Anwendungen gedacht (Port `5000` → HAProxy).
+
+> **Merksatz:** Drei echte Rechner, vier Adressen. Die vierte wandert.
+
+### 16.2 Ein Name für die VIP: Pi-hole als lokaler DNS
+
+Anwendungen tragen in der Praxis keine IP-Adressen in ihre Connection-Strings ein, sondern Namen. Im Homelab läuft bereits ein Pi-hole (Container 100), der als lokaler DNS-Server dient.
+
+Eintrag in der Pi-hole-Weboberfläche (v6) unter **Settings → Local DNS Records** — nicht unter *Settings → DNS*, dort stehen nur die Upstream-Server:
+
+| Domain | IP |
+|---|---|
+| `pg-vip.home.arpa` | `192.168.178.200` |
+
+Die Endung `home.arpa` ist per RFC 8375 für Heimnetze reserviert und kollidiert nie mit echten Domains. Einteilige Namen wie `pg-vip` bekommen dagegen oft automatisch eine Suchdomain angehängt (z. B. `.fritz.box`) und landen dann bei der Fritzbox statt beim Pi-hole.
+
+Test in zwei Stufen:
+
+```bash
+dig +short pg-vip.home.arpa @192.168.178.5   # direkt beim Pi-hole
+dig +short pg-vip.home.arpa                  # so, wie der Mac im Alltag auflöst
+```
+
+*(Stolperfalle beim ersten Versuch: Platzhalter wie `@<pihole-ip>` müssen inklusive der spitzen Klammern ersetzt werden — die Shell liest `<` und `>` sonst als Umleitungszeichen und meldet `parse error`.)*
+
+Ende-zu-Ende-Test der kompletten Kette:
+
+```bash
+psql -h pg-vip.home.arpa -p 5000 -U postgres -c "SELECT inet_server_addr(), pg_is_in_recovery();"
+#  inet_server_addr | pg_is_in_recovery
+# ------------------+-------------------
+#  192.168.178.203  | f
+```
+
+`inet_server_addr()` verrät, welcher Knoten die Verbindung tatsächlich bedient hat. Zusammen mit dem Wissen, dass die VIP gerade auf node1 lag, ergibt sich:
+
+```
+pg-vip.home.arpa  →  Pi-hole              →  192.168.178.200
+192.168.178.200   →  VIP liegt auf        →  ph-node1
+ph-node1:5000     →  HAProxy fragt Patroni →  Leader ist ph-node3
+ph-node3:5432     →  PostgreSQL, pg_is_in_recovery = f
+```
+
+**VIP-Halter und Leader sind zwei verschiedene Dinge.** keepalived entscheidet, welcher Knoten die Adresse hält; Patroni entscheidet über etcd, wer Leader ist. HAProxy verbindet beide Welten.
+
+#### Die Kehrseite: DNS als Single Point of Failure
+
+Mit dem Namen kommt eine neue Abhängigkeit. Fällt der Pi-hole aus, bleibt der Cluster per IP zwar voll erreichbar — aber eine Anwendung mit `pg-vip.home.arpa` in der Konfiguration bekommt bei neuen Verbindungen `could not translate host name`. Bestehende Verbindungen und DNS-Caches mildern das nur kurzfristig.
+
+In Produktion baut man DNS deshalb genauso redundant wie die Datenbank: mindestens zwei DNS-Server auf unterschiedlicher Hardware, Einträge synchron halten (bei Pi-hole z. B. mit nebula-sync), für kritische Systeme notfalls `/etc/hosts` als Fallback.
+
+> **Merksatz:** Hochverfügbarkeit ist nur so stark wie das schwächste Glied der Kette — und DNS übersieht man leicht.
+
+### 16.3 Ausfalltest: Der VIP-Halter fällt aus
+
+**Frage:** Was passiert, wenn der Knoten ausfällt, der die VIP hält, aber *nicht* Leader ist?
+
+**Vorhersage:** keepalived verschiebt die VIP, HAProxy auf dem neuen VIP-Halter nimmt Verbindungen an und leitet weiter zum bisherigen Leader. Patroni ändert nichts.
+
+#### Versuchsaufbau
+
+Drei Beobachtungsposten, jeweils auf Knoten, die den Ausfall überleben:
+
+```bash
+# Terminal A (auf ph-node3): Cluster-Zustand
+sudo patronictl -c /etc/patroni.yml list
+
+# Terminal B (auf ph-node2): Dauer-Ping auf die VIP
+ping pg-vip.home.arpa
+
+# Terminal C (auf ph-node3): simulierte Anwendung, jede Sekunde eine Abfrage über die VIP
+export PGPASSWORD='…'     # nur für diese Sitzung, abtippen statt kopieren
+while true; do
+  psql -h pg-vip.home.arpa -p 5000 -U postgres -tAc \
+    "SELECT now()::time(0), inet_server_addr();"
+  sleep 1
+done
+```
+
+*(Zwei Stolperfallen beim Aufbau: Die Variable heißt exakt `PGPASSWORD` — englisch, mit D am Ende. Und beim Kopieren aus Chat oder Browser werden gerade Anführungszeichen gern durch typografische ersetzt, die die Shell nicht erkennt. Bei Passwörtern und Variablennamen im Zweifel abtippen.)*
+
+Ausgangszustand: Leader ph-node3, Replicas node1 und node2 `streaming`, Lag 0, **Timeline 7**, VIP auf ph-node1.
+
+#### Ausfall
+
+ph-node1 in Proxmox **hart gestoppt** (*Stop*, nicht *Shutdown* — simuliert einen Stromausfall).
+
+#### Beobachtungen
+
+**Patroni:** ph-node1 verschwindet aus `patronictl list`, ph-node3 bleibt Leader, **Timeline bleibt 7** — kein Failover.
+
+**Ping (Terminal B):** Die Sequenznummern springen von 127 auf 131:
+
+```
+icmp_seq=127 ttl=64 time=0.384 ms
+icmp_seq=131 ttl=64 time=0.035 ms
+```
+
+Drei Pings verloren (128–130), also **rund 3 Sekunden** ohne VIP. Ein Ping ohne Antwort erzeugt keine eigene Zeile — die Lücke erkennt man nur an der fehlenden Nummer. Die Ping-Statistik bestätigt es: `639 packets transmitted, 636 received`.
+
+Auffällig sind auch die Antwortzeiten: vorher ~0,3 ms, danach ~0,03 ms. Der Ping lief auf node2 — und node2 hat die VIP übernommen. Er pingt jetzt sich selbst, das Paket verlässt die Maschine nicht mehr. Gegenprobe auf node2:
+
+```
+inet 192.168.178.200/24 scope global secondary ens18
+```
+
+**Warum 3 Sekunden?** Der VRRP-MASTER schickt standardmäßig jede Sekunde ein Lebenszeichen (`advert_int 1`). Ein BACKUP erklärt ihn erst nach rund drei ausbleibenden Lebenszeichen für tot, übernimmt dann die VIP und verkündet per **Gratuitous ARP** im Netz die neue Zuordnung von IP zu MAC. Die Wartezeit ist bewusst eingebaut — ein kurzer Netzwerk-Schluckauf soll keinen VIP-Wechsel auslösen. Dasselbe Abwägen kennt man von Patronis TTL.
+
+**Anwendung (Terminal C):**
+
+```
+07:59:08|192.168.178.203
+07:59:13|192.168.178.203
+```
+
+Rund **5 Sekunden Verzögerung — aber keine einzige Fehlermeldung.** Der Grund liegt in TCP: `psql` schickt beim Verbindungsaufbau ein SYN-Paket. Solange die VIP nirgends hängt, kommt weder Antwort noch Ablehnung, und das Betriebssystem wiederholt das SYN automatisch mit wachsenden Abständen. Sobald node2 die VIP hält, klappt die nächste Wiederholung. Für die Anwendung sieht der Ausfall aus wie eine langsame Abfrage.
+
+Dass die Lücke länger ist als beim Ping, liegt an genau diesen wachsenden Abständen: Ping fragt stur jede Sekunde, TCP „verpasst" die Rückkehr der VIP um ein bis zwei Sekunden.
+
+*(Wichtige Einschränkung: Die Schleife baut für jede Abfrage eine neue Verbindung auf. Eine dauerhaft offene Sitzung, die über HAProxy auf node1 lief, wäre abgebrochen und hätte sich neu verbinden müssen.)*
+
+| Schicht | Reaktion |
+|---|---|
+| keepalived | VIP von node1 auf node2 verschoben ✅ |
+| HAProxy | HAProxy auf node2 nimmt die Verbindungen an ✅ |
+| Patroni | nichts zu tun, node3 bleibt Leader, Timeline 7 ✅ |
+| etcd | 2 von 3 Mitgliedern — Quorum erhalten ✅ |
+| Datenverlust | keiner |
+
+### 16.4 Der eigentliche Fund: Patroni startet nach dem Neustart nicht
+
+Nach dem Wiedereinschalten von node1 antwortete die VM auf Ping — tauchte aber nicht in `patronictl list` auf. Ein Ping beweist nur, dass Betriebssystem und Netzwerkkarte laufen; ob die Dienste darauf gestartet sind, ist eine andere Schicht.
+
+```bash
+systemctl status etcd patroni --no-pager
+```
+
+- **etcd:** `active (running)`, sofort wieder mit den beiden anderen Mitgliedern verbunden.
+- **Patroni:** `disabled`, `inactive (dead)` — beim Booten gar nicht gestartet.
+
+Die Prüfung auf allen Knoten zeigte: **Patroni war auf allen drei Knoten nicht für den Autostart aktiviert.** Im Normalbetrieb fällt das nicht auf, weil der Dienst ja läuft. Bei einem Stromausfall im Homelab wäre der komplette Cluster nach dem Hochfahren tot geblieben, obwohl alle VMs laufen.
+
+Reparatur:
+
+```bash
+sudo systemctl enable --now patroni   # node1: aktivieren und gleich starten
+sudo systemctl enable patroni         # node2, node3: laufen schon, nur aktivieren
+
+# Gegenprobe auf allen Knoten — überall viermal "enabled":
+systemctl is-enabled etcd patroni haproxy keepalived
+```
+
+Hier ist `systemctl` richtig: Gestartet wird Patroni selbst, also der Dirigent. Die Regel „PostgreSQL nie per `systemctl` anfassen" gilt für die von Patroni verwaltete Datenbank.
+
+Danach meldet sich node1 sofort zurück:
+
+```
+LOG:  started streaming WAL from primary at 0/41000000 on timeline 7
+INFO: Lock owner: ph-node3; I am ph-node1
+INFO: no action. I am (ph-node1), a secondary, and following a leader (ph-node3)
+```
+
+Die letzte Zeile wiederholt sich alle 10 Sekunden — Patronis Herzschlag (`loop_wait`). In der Prozessliste erkennt man die Replica an `startup recovering` und `walreceiver`; ein Leader hätte stattdessen `walsender`-Prozesse.
+
+Endzustand: drei Knoten, Lag 0, Timeline 7, LSN identisch mit dem Ausgangszustand (die Schleife hat nur gelesen).
+
+**Offen geblieben: Wo liegt die VIP nach der Rückkehr von node1?** Der Dauer-Ping war bereits beendet, bevor node1 wieder hochfuhr — seine letzten Werte sagen darüber also nichts aus. Laut keepalived-Konfiguration aus Teil 12 hat node1 die höchste Basis-Priorität (150 gegenüber 100 und 90) und holt sich die VIP nach seiner Rückkehr automatisch zurück (Preemption). Das kostet dann erneut einige Sekunden Unterbrechung — ein Grund, warum manche Setups mit `nopreempt` arbeiten. Prüfpunkt für den nächsten Test: `ip -4 addr show | grep 192.168.178.200` auf node1 und node2.
+
+*(Einordnung: Teil 12 hatte als „noch härteren Test" vorgeschlagen, node1 komplett auszuschalten statt nur HAProxy zu stoppen. Genau das ist hier passiert — allerdings war node1 diesmal nicht Leader, sodass nur keepalived reagieren musste. Ein Komplettausfall des Leaders, der keepalived **und** Patroni gleichzeitig auslöst, steht noch aus.)*
+
+> **Merksatz:** Ein laufender Dienst sagt nichts über seinen Autostart. Ein HA-Cluster ist erst getestet, wenn jeder Knoten einen Neustart überlebt hat.
+
+**Verifiziert 01.10.2026.**
+
+### 16.5 Nebenfund: `patroni.yml` war für alle lesbar
+
+Während des Tests lief `patronictl` versehentlich ohne `sudo` — und funktionierte. Das heißt: Jeder Benutzer konnte `/etc/patroni.yml` lesen, inklusive der Passwörter für `postgres` und `replicator`.
+
+```bash
+ls -l /etc/patroni.yml
+# -rw-r--r-- 1 root root 1209 Sep 21 07:42 /etc/patroni.yml
+```
+
+Härtung auf allen drei Knoten — Patroni läuft als `postgres` und muss die Datei lesen können, sonst niemand außer root:
+
+```bash
+sudo chown root:postgres /etc/patroni.yml
+sudo chmod 640 /etc/patroni.yml
+sudo -u postgres test -r /etc/patroni.yml && echo "Patroni kann lesen"
+```
+
+Gegenprobe: Ohne `sudo` lehnt `patronictl` jetzt ab (`not existing or no read rights`) — dass etwas fehlschlägt, das vorher ging, ist hier der Beweis, dass die Härtung wirkt. Patroni liest die Datei nur beim Start oder Reload, der Cluster läuft dabei ungestört weiter.
+
+*(Beobachtung am Rande: node1s Datei ist 1209 Byte groß, die von node2/node3 1114 Byte. Der Unterschied stammt aus Teil 13, als `archive_mode` zuerst in die lokale Datei geschrieben wurde. Harmlos, weil die gültige Konfiguration in etcd liegt — aber ein Beispiel für „Config Drift", den eine spätere Ansible-Rolle beseitigen würde.)*
+
+Für die spätere Härtungsrunde vorgemerkt: `/etc/keepalived/keepalived.conf` enthält das VRRP-Passwort `auth_pass` und verdient dasselbe Muster.
+
+#### Schnell-Referenz (zum Abfragen)
+
+- **Welchen Hostnamen hat die VIP?** → Keinen. Sie hängt als `secondary`-Adresse am Interface des aktuellen VRRP-MASTERs.
+- **Warum zeigt der Router den Namen eines Knotens für die VIP?** → Gleiche MAC-Adresse wie der VIP-Halter.
+- **Wo trägt man im Pi-hole v6 einen Namen ein?** → *Settings → Local DNS Records*.
+- **Warum `home.arpa`?** → Für Heimnetze reserviert (RFC 8375), keine Kollision, keine angehängte Suchdomain.
+- **Was passiert, wenn der VIP-Halter (nicht der Leader) ausfällt?** → VIP wandert in ~3 s, Patroni macht nichts, Timeline bleibt gleich.
+- **Springt die VIP zurück, wenn der Knoten wiederkommt?** → Bei Preemption und höherer Priorität ja (node1: 150), mit `nopreempt` nicht.
+- **Warum sah die Anwendung keine Fehlermeldung?** → TCP wiederholt das SYN automatisch, bis die VIP wieder antwortet.
+- **Woran erkennt man im Ping eine Lücke?** → An fehlenden `icmp_seq`-Nummern.
+- **Ping geht, Knoten fehlt trotzdem im Cluster — warum?** → Betriebssystem läuft, Dienst nicht (hier: Autostart deaktiviert).
+- **Welche Rechte für `/etc/patroni.yml`?** → `root:postgres`, `640`.
+
+---
+
+## Teil 17 — Monitoring mit Prometheus und Grafana
+
+Bisher wurde der Cluster mit Einzelbefehlen geprüft (`patronictl list`, `pg_stat_replication`, `pg_stat_archiver`). Monitoring macht daraus eine dauerhafte, historische Sicht: Wer war wann Leader, wie hoch war der Lag, wie ausgelastet waren die Knoten?
+
+### 17.1 Architektur
+
+Prometheus arbeitet nach dem **Pull-Prinzip**: Es fragt in festen Abständen bei kleinen Programmen auf den Knoten nach — den **Exportern** —, die Messwerte als Text auf einer HTTP-Seite `/metrics` bereitstellen. Grafana stellt die gesammelten Werte als Dashboard dar.
+
+| Endpunkt | Port | liefert | auf |
+|---|---|---|---|
+| node_exporter | 9100 | Betriebssystem: CPU, RAM, Disk, Netzwerk | node1–3 + ph-monitor |
+| Patroni | 8008 | Cluster-Rolle (`/metrics` ist eingebaut) | node1–3 |
+| postgres_exporter | 9187 | Datenbank: Verbindungen, Transaktionen, Cache | node1–3 |
+| Prometheus | 9090 | Sammeln, Speichern, Abfragen | ph-monitor |
+| Grafana | 3000 | Dashboards | ph-monitor |
+
+### 17.2 Eigene Monitoring-VM statt auf einem Cluster-Knoten
+
+Monitoring läuft auf einer eigenen VM **ph-monitor** (VMID 204, `192.168.178.204`, 2 vCPU / 2 GB / 20 GB, Ubuntu 24.04 frisch installiert — kein Klon, um nicht PostgreSQL/etcd/Patroni mitzuerben). Zwei Gründe:
+
+1. **Monitoring muss einen Knotenausfall überleben.** Läge es auf ph-node1, wäre es genau dann weg, wenn man es am dringendsten braucht.
+2. **Messwerkzeug neben Messobjekt verfälscht die Messung** — die Lehre aus Teil 14, als pgbench auf demselben Knoten mit PostgreSQL um die CPU konkurrierte.
+
+### 17.3 node_exporter
+
+```bash
+sudo apt install -y prometheus-node-exporter
+systemctl is-enabled prometheus-node-exporter
+```
+
+Test von ph-monitor aus — beim ersten Versuch auf node2/node3:
+
+```
+curl: (7) Failed to connect to 192.168.178.202 port 9100 after 0 ms: Couldn't connect to server
+```
+
+Das **`after 0 ms`** ist die entscheidende Information:
+
+| Fehlerbild | Bedeutung |
+|---|---|
+| `Couldn't connect … after 0 ms` | Rechner erreichbar, auf dem Port lauscht kein Dienst (sofortige Ablehnung) |
+| `Connection timed out` nach Sekunden | Rechner nicht erreichbar oder Firewall verwirft Pakete |
+
+Ursache: Das Paket fehlte auf zwei Knoten. Nach der Installation:
+
+```bash
+for ip in 201 202 203; do
+  echo -n "192.168.178.$ip: "
+  curl -s http://192.168.178.$ip:9100/metrics | grep -c '^node_'
+done
+# 192.168.178.201: 1573
+# 192.168.178.202: 1588
+# 192.168.178.203: 1593
+```
+
+*(Harmlose Meldung beim Testen mit `| head -5`: `curl: (23) Failure writing output to destination` — `head` schließt die Leitung nach fünf Zeilen, curl will aber weiterschreiben.)*
+
+### 17.4 Patroni-Metriken
+
+Patroni liefert Prometheus-Metriken direkt über seine REST-API:
+
+```bash
+for ip in 201 202 203; do
+  echo -n "192.168.178.$ip: "
+  curl -s http://192.168.178.$ip:8008/metrics | grep -E '^patroni_primary[{ ]'
+done
+# 192.168.178.201: patroni_primary{scope="postgres-ha",name="ph-node1"} 0
+# 192.168.178.202: patroni_primary{scope="postgres-ha",name="ph-node2"} 0
+# 192.168.178.203: patroni_primary{scope="postgres-ha",name="ph-node3"} 1
+```
+
+Das Suchmuster `[{ ]` ist nötig, weil Prometheus-Metriken **Labels** in geschweiften Klammern tragen. Ein Muster mit festem Leerzeichen nach dem Namen findet nichts. Die Labels `scope` und `name` sind später im Dashboard wertvoll: Eine Abfrage `patroni_primary == 1` liefert automatisch den Namen des aktuellen Leaders — auch nach einem Failover.
+
+### 17.5 postgres_exporter mit eigener Monitoring-Rolle
+
+Der postgres_exporter muss sich bei PostgreSQL anmelden. Dafür bekommt er eine eigene Rolle mit der eingebauten Gruppen-Rolle **`pg_monitor`** — sie darf alle Statistik-Sichten lesen, aber keine Tabellendaten und nichts schreiben. Das Rollen-Muster aus Teil 0 in der Praxis.
+
+#### Installation (alle drei Knoten)
+
+```bash
+sudo apt install -y prometheus-postgres-exporter
+sudo systemctl enable --now prometheus-postgres-exporter
+```
+
+Direkt danach: Exporter erreichbar, aber überall `pg_up 0`. Genau der Unterschied, der fürs Dashboard wichtig ist:
+
+| Metrik | Bedeutung |
+|---|---|
+| `up` | Prometheus erreicht den Exporter |
+| `pg_up` | der Exporter erreicht die Datenbank |
+
+Wird PostgreSQL gestoppt, bleibt `up = 1`, aber `pg_up = 0`. Ein Dashboard, das nur `up` anzeigt, würde einen Datenbankausfall übersehen.
+
+#### Rolle anlegen — einmal, auf dem Leader
+
+```bash
+psql -h pg-vip.home.arpa -p 5000 -U postgres
+```
+
+```sql
+CREATE ROLE postgres_exporter WITH LOGIN;
+\password postgres_exporter
+GRANT pg_monitor TO postgres_exporter;
+```
+
+Nur auf dem Leader — Replicas sind read-only. Rollen gehören zum ganzen PostgreSQL-Cluster, ihre Änderung läuft durchs WAL, und die Streaming-Replikation verteilt sie auf alle Knoten. Über die VIP landet man automatisch beim Leader. Gegenprobe direkt auf einer Replica:
+
+```bash
+sudo -u postgres psql -c "\drg postgres_exporter"
+#  Role name         | Member of  |   Options    | Grantor
+# -------------------+------------+--------------+----------
+#  postgres_exporter | pg_monitor | INHERIT, SET | postgres
+```
+
+*(Seit PostgreSQL 16 zeigt `\du` keine Spalte „Member of" mehr; Mitgliedschaften stehen bei `\drg`. Neu in 16 sind auch die Optionen pro Mitgliedschaft: `INHERIT` = Rechte gelten automatisch, `SET` = `SET ROLE pg_monitor` erlaubt.)*
+
+> **Merkregel:** Was in der **Datenbank** steht (Rollen, Passwörter, Tabellen), macht man einmal auf dem Leader. Was in einer **Datei auf dem Knoten** steht, macht man auf jedem Knoten selbst.
+
+#### Anmeldung von Hand testen, bevor der Exporter sie nutzt
+
+```bash
+psql "host=192.168.178.201 port=5432 user=postgres_exporter dbname=postgres" \
+  -c "SELECT current_user, pg_is_in_recovery();"
+#  postgres_exporter | t
+```
+
+#### Exporter konfigurieren (jeder Knoten mit seiner eigenen IP)
+
+In `/etc/default/prometheus-postgres-exporter`:
+
+```
+DATA_SOURCE_NAME='host=192.168.178.201 port=5432 user=postgres_exporter password=<PASSWORT> dbname=postgres sslmode=disable'
+```
+
+Jeder Exporter muss **seine lokale** Instanz überwachen. Über die VIP würden alle drei nur den Leader messen.
+
+```bash
+sudo chmod 600 /etc/default/prometheus-postgres-exporter
+sudo systemctl restart prometheus-postgres-exporter
+```
+
+`600` ohne Gruppe reicht, weil systemd die Datei als root einliest, bevor es den Dienst unter dem User `prometheus` startet.
+
+#### Fehlersuche: `pg_up 0` trotz Konfiguration
+
+Das Journal des Exporters zeigte die tatsächlich verwendeten Verbindungsdaten:
+
+```
+Error opening connection to database (192.168.178port=5432 user=postgres_eporter … sslmode=disable'):
+dial tcp 127.0.0.1:5432: connect: connection refused
+```
+
+Drei Fehler in einer Zeile: fehlendes `host=` mit abgeschnittener IP, Tippfehler im Rollennamen, ein Anführungszeichen nur am Ende. Mit der unlesbaren Zeichenkette fiel der Exporter auf seinen Standard `localhost:5432` zurück — dort lauscht PostgreSQL in diesem Cluster aber nicht (Patroni bindet nur an die Knoten-IP, siehe Teil 13.3).
+
+Weitere typische Ursachen:
+
+- `DATA_SOURCE_NAME` steht zweimal in der Datei → die **letzte** Zeile gewinnt
+- Zeile auskommentiert
+- Sonderzeichen im Passwort (`$`, `\`, `!`, `'`)
+- Restart vergessen
+
+Bewährter Weg: Zeile auf node1 sorgfältig schreiben und mit `curl -s http://localhost:9187/metrics | grep '^pg_up'` prüfen, dann als Vorlage für node2/node3 verwenden und nur die IP ändern.
+
+#### Passwort-Rotation
+
+Das Exporter-Passwort war in der Fehlermeldung im Klartext sichtbar (Screenshot, System-Journal). Statt alle Spuren zu löschen, wurde es rotiert — danach ist das alte wertlos.
+
+```sql
+\password postgres_exporter
+```
+
+`\password` fragt das Passwort verdeckt und doppelt ab und schickt es nur verschlüsselt zum Server — es landet weder in der `psql`-History noch im Klartext im Server-Log (anders als `ALTER ROLE … PASSWORD '…'`). Danach die Datei auf allen drei Knoten anpassen und die Exporter neu starten.
+
+Interessante Zwischenbeobachtung: Nach der Rotation meldeten nur die Knoten `pg_up 0`, deren Exporter bereits mit falscher Datei neu gestartet worden war. Ein Exporter ohne Restart hätte weiter `1` gemeldet — PostgreSQL prüft Passwörter nur beim Verbindungsaufbau, bestehende Verbindungen laufen weiter. Genau diese Falle macht Passwort-Rotation tückisch: Der Fehler zeigt sich erst beim nächsten Neustart.
+
+*(Tipp: Passwörter nur aus Buchstaben und Ziffern, dafür lang — Sonderzeichen machen in Shell und Konfigurationsdateien Ärger.)*
+
+```
+192.168.178.201: pg_up 1
+192.168.178.202: pg_up 1
+192.168.178.203: pg_up 1
+```
+
+### 17.6 Prometheus
+
+```bash
+sudo apt install -y prometheus
+```
+
+*(Die Meldungen von `needrestart` nach der Installation — `Service restarts being deferred` für `dbus`, `systemd-logind`, `unattended-upgrades` — sind harmlos: Diese Dienste startet Ubuntu bewusst nicht im laufenden Betrieb neu, sie werden beim nächsten Reboot aktualisiert.)*
+
+Konfiguration `/etc/prometheus/prometheus.yml` (Original vorher als `.orig` gesichert):
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node'
+    static_configs:
+      - targets:
+          - 'localhost:9100'
+          - '192.168.178.201:9100'
+          - '192.168.178.202:9100'
+          - '192.168.178.203:9100'
+
+  - job_name: 'postgres'
+    static_configs:
+      - targets:
+          - '192.168.178.201:9187'
+          - '192.168.178.202:9187'
+          - '192.168.178.203:9187'
+
+  - job_name: 'patroni'
+    static_configs:
+      - targets:
+          - '192.168.178.201:8008'
+          - '192.168.178.202:8008'
+          - '192.168.178.203:8008'
+```
+
+Vor dem Neuladen die Syntax prüfen, dann laden:
+
+```bash
+promtool check config /etc/prometheus/prometheus.yml   # SUCCESS
+sudo systemctl reload prometheus
+```
+
+`promtool` prüft nur die Syntax — ob die Ziele erreichbar sind, zeigt erst *Status → Targets* in der Weboberfläche (`http://192.168.178.204:9090`):
+
+| Job | Ziele |
+|---|---|
+| node | 4/4 up |
+| patroni | 3/3 up |
+| postgres | 3/3 up |
+| prometheus | 1/1 up |
+
+**11 von 11 Zielen `UP`.** Die Scrape-Dauer spiegelt die Menge der Metriken: node_exporter ~35 ms, postgres_exporter ~15 ms, Patroni ~1,7 ms.
+
+Erste PromQL-Abfrage:
+
+```
+patroni_primary == 1
+```
+
+`== 1` wirkt als **Filter**: Es bleiben nur Zeitreihen übrig, deren Wert die Bedingung erfüllt — hier genau eine, ph-node3. Die Labels setzen sich zusammen aus `name`/`scope` (von Patroni) und `instance`/`job` (von Prometheus beim Abholen).
+
+*(Parallele: Auch Prometheus' Zeitreihen-Datenbank hat ein Write-Ahead Log — im Startlog `Replaying WAL … WAL replay completed`. Dasselbe Prinzip wie bei PostgreSQL.)*
+
+### 17.7 Grafana
+
+Grafana kommt aus dem offiziellen Hersteller-Repository:
+
+```bash
+sudo mkdir -p /etc/apt/keyrings
+wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/grafana.gpg > /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" | sudo tee /etc/apt/sources.list.d/grafana.list
+sudo apt update
+sudo apt install -y grafana
+```
+
+Die Installation endet mit:
+
+```
+### NOT starting on installation, please execute the following statements to configure grafana to start automatically using systemd
+```
+
+Anders als die Ubuntu-Pakete wird Grafana aus dem Hersteller-Repository **bewusst weder aktiviert noch gestartet** — ein Admin soll erst konfigurieren können, bevor ein Webserver im Netz erreichbar ist.
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now grafana-server
+systemctl is-enabled grafana-server   # enabled
+```
+
+`enable` legt technisch nur einen Symlink an (`multi-user.target.wants/grafana-server.service`) — genau der Verweis, der bei Patroni in Teil 16 gefehlt hatte.
+
+| | Prometheus | Grafana |
+|---|---|---|
+| Aufgabe | sammelt und speichert Messwerte | zeigt sie als Dashboard an |
+| Port | 9090 | 3000 |
+| eigene Daten | Zeitreihen-Datenbank (TSDB) | SQLite für Benutzer, Dashboards, Datenquellen |
+| RAM im Lab | ~24 MB | ~256 MB |
+
+Erstanmeldung unter `http://192.168.178.204:3000` mit `admin`/`admin`, danach erzwingt Grafana ein neues Passwort.
+
+**Stand 01.10.2026:** Unterbau komplett, Grafana läuft. Als Nächstes: Prometheus als Datenquelle, Dashboards, Lasttest von ph-monitor aus und ein Failover unter Last.
+
+#### Schnell-Referenz (zum Abfragen)
+
+- **Pull oder Push bei Prometheus?** → Pull: Prometheus holt die Werte selbst ab.
+- **Warum eine eigene Monitoring-VM?** → Muss Knotenausfälle überleben; Messwerkzeug nicht neben Messobjekt.
+- **`Couldn't connect … after 0 ms` bedeutet?** → Rechner da, Dienst fehlt.
+- **`up` vs. `pg_up`?** → Exporter erreichbar vs. Datenbank erreichbar.
+- **Wo legt man die Monitoring-Rolle an?** → Einmal auf dem Leader; die Replikation verteilt sie.
+- **Welches Recht braucht der Exporter?** → Mitgliedschaft in `pg_monitor`.
+- **Warum `\password` statt `ALTER ROLE … PASSWORD`?** → Kein Klartext in History und Server-Log.
+- **Warum zeigt sich ein falsches Passwort oft erst später?** → PostgreSQL prüft nur beim Verbindungsaufbau.
+- **Was prüft `promtool check config`?** → Nur die Syntax, nicht die Erreichbarkeit.
+- **Was macht `== 1` in PromQL?** → Filtert auf Zeitreihen mit Wert 1.
+- **Startet Grafana nach der Installation automatisch?** → Nein, bei Paketen aus dem Grafana-Repository nicht.
