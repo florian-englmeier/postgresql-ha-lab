@@ -373,6 +373,34 @@ Filter: Nur Zeitreihen mit Wert 1 bleiben übrig — `patroni_primary == 1` lief
 **F: Startet Grafana nach `apt install` automatisch?**
 Nein, Pakete aus dem Grafana-Repository werden bewusst weder aktiviert noch gestartet: `daemon-reload` + `enable --now grafana-server`.
 
+**F: Warum verbindet sich der Exporter mit der Knoten-IP und nicht mit der VIP?**
+Über die VIP würden alle drei Exporter nur den Leader messen, die Replicas wären unsichtbar. Faustregel: Anwendungen über die VIP, Monitoring direkt auf jeden Knoten.
+
+**F: Grafana läuft auf ph-monitor, du öffnest es vom Mac. Warum ist `http://localhost:9090` als Datenquelle richtig?**
+Die PromQL-Abfrage stellt der Grafana-Server, nicht der Browser. Aus seiner Sicht ist Prometheus `localhost`. Adressen immer aus der Perspektive dessen lesen, der die Verbindung aufbaut.
+
+**F: gauge oder counter — was ist der Unterschied?**
+gauge = aktueller Stand, steigt und fällt (freier RAM, Connections). counter = zählt nur hoch (`node_cpu_seconds_total`); aussagekräftig ist erst die Steigung über `rate()` bzw. `increase()`.
+
+**F: Warum heißen Metriken z. B. `node_memory_MemAvailable_bytes`?**
+Prometheus-Konvention: immer Basiseinheiten (Bytes, Sekunden), die Einheit steht im Namen. Umgerechnet wird erst in Grafana.
+
+**F: Prometheus fragt alle 15 s ab. Was bedeutet das für einen Failover?**
+Monitoring zeigt Stichproben, keinen Film. Ein Failover erscheint als Sprung; durch gestaffelte Scrapes kann kurz „zwei Leader“ oder „kein Leader“ erscheinen — Messartefakt, kein Split-Brain. Für kurze Ereignisse sind Logs und `patronictl history` die Wahrheit; Alarme bekommen deshalb eine Wartezeit (`for: 1m`).
+
+**F: Wenn du für den Cluster nur drei Alarme einrichten dürftest — welche?** *(typische Interview-Frage)*
+1. **Kein oder mehr als ein Leader:** `count(patroni_primary == 1) != 1` für 1 Minute. Null Leader = keine Schreibzugriffe möglich; zwei = Split-Brain-Verdacht.
+2. **Datenbank nicht erreichbar:** `pg_up == 0` (bzw. `up == 0` für den Exporter selbst) für 1 Minute — pro Knoten, damit auch eine ausgefallene Replica auffällt, bevor die Redundanz fehlt.
+3. **WAL-Archivierung schlägt fehl:** `increase(pg_stat_archiver_failed_count[10m]) > 0`. Ohne Archiv kein PITR — und der Fehler ist im Betrieb völlig unsichtbar (im Lab: 567 Fehlversuche auf node2, die niemand bemerkt hat).
+Weitere sinnvolle Kandidaten: Replikations-Lag über Schwellwert, Platte > 85 % voll, letztes Backup älter als 24 h, Verbindungen nahe `max_connections`, etcd ohne Quorum.
+Prinzip dahinter: auf **Symptome** alarmieren, die Handeln erfordern — nicht auf jede schwankende Kurve, sonst stumpft das Team ab (Alarm-Müdigkeit).
+
+**F: Wie sieht Monitoring bei 50+ Clustern in einem Unternehmen aus?**
+Drei Ebenen: (1) **Alarmierung** über Alertmanager (Mail, Teams, Bereitschaft) — der Mensch wird gerufen, statt Dashboards zu beobachten; (2) **Übersichts-Dashboard** mit einer Zeile pro Cluster in Ampelfarben; (3) **Detail-Dashboards** (wie 1860/9628) als Lupe für die Diagnose. Dazu **Service Discovery** statt handgepflegter IP-Listen (Kubernetes, von Ansible erzeugte Dateien) und **Labels** wie `cluster`, `env`, `team` zum Filtern und Routen der Alarme. Ein Prometheus schafft Tausende Ziele; Thanos/Mimir/VictoriaMetrics erst für mehrere Standorte oder lange Aufbewahrung.
+
+**F: Das PostgreSQL-Dashboard zeigt `shared_buffers = 128 MiB` auf einer 4-GB-VM. Was sagt das?**
+Werkseinstellung — der Cluster ist ungetunt. PostgreSQL wird bewusst klein ausgeliefert, damit es überall startet. Üblicher Startwert sind etwa 25 % des RAM. Im Patroni-Cluster ändert man ihn per `patronictl edit-config`; `shared_buffers` braucht einen Restart (`patronictl restart`), kein Reload.
+
 ---
 
 ## K. Betrieb & Administration
