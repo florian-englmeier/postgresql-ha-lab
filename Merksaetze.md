@@ -94,6 +94,8 @@ Alle wichtigen Hinweise, Merksätze und Praxis-Lehren an einem Ort — automatis
 
 - **Werkseinstellungen erkennen:** `shared_buffers = 128 MiB` auf 4 GB RAM heißt „nie getunt“. Startwert ≈ 25 % RAM; Änderung über `patronictl edit-config`, braucht Restart.
 
+- **Restart-Parameter im Cluster rollierend anwenden:** `patronictl edit-config` → `patronictl restart` Knoten für Knoten, Replicas zuerst, Leader zuletzt bzw. per Switchover. Der Cluster bleibt durchgehend erreichbar.
+
 ## Betrieb & Werkzeuge
 
 - **Patroni-Knoten nie einfach rebooten:** Ist er Leader, vorher `patronictl switchover`, sonst gibt es einen unnötigen Failover.

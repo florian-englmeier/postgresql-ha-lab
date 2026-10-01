@@ -399,7 +399,11 @@ Prinzip dahinter: auf **Symptome** alarmieren, die Handeln erfordern — nicht a
 Drei Ebenen: (1) **Alarmierung** über Alertmanager (Mail, Teams, Bereitschaft) — der Mensch wird gerufen, statt Dashboards zu beobachten; (2) **Übersichts-Dashboard** mit einer Zeile pro Cluster in Ampelfarben; (3) **Detail-Dashboards** (wie 1860/9628) als Lupe für die Diagnose. Dazu **Service Discovery** statt handgepflegter IP-Listen (Kubernetes, von Ansible erzeugte Dateien) und **Labels** wie `cluster`, `env`, `team` zum Filtern und Routen der Alarme. Ein Prometheus schafft Tausende Ziele; Thanos/Mimir/VictoriaMetrics erst für mehrere Standorte oder lange Aufbewahrung.
 
 **F: Das PostgreSQL-Dashboard zeigt `shared_buffers = 128 MiB` auf einer 4-GB-VM. Was sagt das?**
-Werkseinstellung — der Cluster ist ungetunt. PostgreSQL wird bewusst klein ausgeliefert, damit es überall startet. Üblicher Startwert sind etwa 25 % des RAM. Im Patroni-Cluster ändert man ihn per `patronictl edit-config`; `shared_buffers` braucht einen Restart (`patronictl restart`), kein Reload.
+Werkseinstellung — der Cluster ist ungetunt. PostgreSQL wird bewusst klein ausgeliefert, damit es überall startet. Üblicher Startwert sind etwa 25 % des RAM.
+
+**F: Wie änderst du `shared_buffers` in einem Patroni-Cluster — und reicht ein Reload?** *(typische Interview-Frage)*
+„Mit `patronictl edit-config`, nicht in der `postgresql.conf` und nicht per `ALTER SYSTEM` — sonst überschreibt Patroni das wieder. Der Wert wird automatisch an alle Knoten verteilt. Weil PostgreSQL den Speicher beim Start reserviert, ist ein Reload wirkungslos (Patroni zeigt `Pending restart`); es braucht einen **Restart**. Den löse ich kontrolliert mit `patronictl restart` aus, Knoten für Knoten: Replicas zuerst, den Leader zuletzt bzw. vorher per Switchover. So bleibt der Cluster die ganze Zeit erreichbar.“
+Der letzte Satz macht den Unterschied: Er zeigt, dass man an die Verfügbarkeit denkt, nicht nur an den Parameter.
 
 ---
 
