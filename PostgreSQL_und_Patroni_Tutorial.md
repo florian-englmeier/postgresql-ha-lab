@@ -1052,7 +1052,7 @@ Mit WAL-Archivierung wird jede Änderung nach dem Backup lückenlos protokollier
             → Datenverlust: 0 Sekunden ✅
 ```
 
-**Für den produktiven Einsatz (z.B. LDBV mit 6.000 Datenbanken)** ist PITR keine Kür sondern Pflicht — Katasterdaten oder Vermessungsdaten sind im Verlustfall unter Umständen nicht wiederherstellbar.
+**Für den produktiven Einsatz (z.B. in einer Behörde mit Tausenden Datenbanken)** ist PITR keine Kür sondern Pflicht — Fachdaten wie Kataster- oder Steuerdaten sind im Verlustfall unter Umständen nicht wiederherstellbar.
 
 #### Einrichtung
 

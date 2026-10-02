@@ -388,7 +388,7 @@ Prometheus-Konvention: immer Basiseinheiten (Bytes, Sekunden), die Einheit steht
 **F: Prometheus fragt alle 15 s ab. Was bedeutet das für einen Failover?**
 Monitoring zeigt Stichproben, keinen Film. Ein Failover erscheint als Sprung; durch gestaffelte Scrapes kann kurz „zwei Leader“ oder „kein Leader“ erscheinen — Messartefakt, kein Split-Brain. Für kurze Ereignisse sind Logs und `patronictl history` die Wahrheit; Alarme bekommen deshalb eine Wartezeit (`for: 1m`).
 
-**F: Wenn du für den Cluster nur drei Alarme einrichten dürftest — welche?** *(typische Interview-Frage)*
+**F: Wenn du für den Cluster nur drei Alarme einrichten dürftest — welche?**
 1. **Kein oder mehr als ein Leader:** `count(patroni_primary == 1) != 1` für 1 Minute. Null Leader = keine Schreibzugriffe möglich; zwei = Split-Brain-Verdacht.
 2. **Datenbank nicht erreichbar:** `pg_up == 0` (bzw. `up == 0` für den Exporter selbst) für 1 Minute — pro Knoten, damit auch eine ausgefallene Replica auffällt, bevor die Redundanz fehlt.
 3. **WAL-Archivierung schlägt fehl:** `increase(pg_stat_archiver_failed_count[10m]) > 0`. Ohne Archiv kein PITR — und der Fehler ist im Betrieb völlig unsichtbar (im Lab: 567 Fehlversuche auf node2, die niemand bemerkt hat).
@@ -404,13 +404,13 @@ Werkseinstellung — der Cluster ist ungetunt. PostgreSQL wird bewusst klein aus
 **F: Was ist `shared_buffers`?**
 Der RAM-Bereich, in dem PostgreSQL häufig gebrauchte Tabellenblöcke (Pages à 8 KB) vorhält, damit nicht jedes Mal von der Platte gelesen werden muss. „Shared“, weil sich alle Verbindungen diesen einen Bereich teilen — holt einer eine Tabelle von der Platte, liegt sie danach für alle griffbereit. Bild: Festplatte = Lager im Keller, `shared_buffers` = Werkbank. Werkseinstellung 128 MB, Faustregel ≈ 25 % des RAM (16 GB → 4 GB).
 
-**F: Wie änderst du `shared_buffers` in einem Patroni-Cluster — und reicht ein Reload?** *(typische Interview-Frage)*
-„`shared_buffers` lässt sich nicht im laufenden Betrieb ändern, weil PostgreSQL den Speicher beim Start reserviert — ein Reload ist wirkungslos, Patroni zeigt `Pending restart`. Ich setze den Wert mit `patronictl edit-config` (nicht in der `postgresql.conf`, nicht per `ALTER SYSTEM` — das überschreibt Patroni wieder); Patroni verteilt ihn an alle Knoten. Dann starte ich mit `patronictl restart` neu — nicht hart über Proxmox oder `systemctl`.“
+**F: Wie änderst du `shared_buffers` in einem Patroni-Cluster — und reicht ein Reload?**
+Nein, ein Reload reicht nicht: PostgreSQL reserviert den Speicher beim Start, Patroni zeigt deshalb `Pending restart`. Der Wert wird mit `patronictl edit-config` gesetzt, nicht in der `postgresql.conf` und nicht per `ALTER SYSTEM`, weil Patroni beides wieder überschreibt. Patroni verteilt ihn an alle Knoten. Danach folgt der Neustart über `patronictl restart`, nicht hart über Proxmox oder `systemctl`.
 Reihenfolge: zuerst den Wert **ändern**, dann **neu starten** — nicht umgekehrt.
 
-**F: Nachfrage: „Und während des Restarts ist unsere Datenbank dann weg?“**
-„Nein, wir starten rollierend neu: erst Replica 1, dann Replica 2 — die Anwendung merkt davon nichts, der Leader läuft weiter. Dann übergebe ich per `patronictl switchover` die Leader-Rolle an eine bereits neu gestartete Replica und starte den alten Leader zuletzt. Die Anwendung sieht höchstens beim Switchover eine kurze Unterbrechung von wenigen Sekunden für Schreibzugriffe, bis HAProxy umgeschwenkt hat.“
-Die kurze Unterbrechung offen zu nennen wirkt kompetenter als „man merkt gar nichts“.
+**F: Ist die Datenbank während dieses Restarts weg?**
+Nein, wenn rollierend neu gestartet wird: erst Replica 1, dann Replica 2, der Leader läuft weiter. Dann übernimmt per `patronictl switchover` eine bereits neu gestartete Replica die Leader-Rolle, und der alte Leader startet zuletzt. Die Anwendung sieht höchstens beim Switchover eine Unterbrechung von wenigen Sekunden.
+Völlig unterbrechungsfrei ist es also nicht: Der Switchover kostet einen kurzen Moment.
 
 ---
 
@@ -469,7 +469,7 @@ Für Anwendungen ja (neue Verbindungen scheitern mit `could not translate host n
 
 ---
 
-## M. Einordnung (Bewerbung & Ausblick)
+## M. Einordnung & Ausblick
 
 **F: Wie bildet CloudNativePG das Lab ab?**
 Der Kubernetes-Operator übernimmt Patronis Rolle, Kubernetes ersetzt etcd als Konsens-Speicher, Services ersetzen HAProxy/VIP, Backups/WAL-Archiv sind deklarativ konfiguriert. Statt Befehle auszuführen beschreibt man den Soll-Zustand in YAML, der Operator gleicht laufend ab (Reconciliation Loop).
