@@ -2598,6 +2598,141 @@ Vollständige Liste: `patronictl --help`, Details zu einem Kommando: `patronictl
 
 > **Merksatz:** Switchover heißt „wir wechseln planmäßig“, Failover heißt „der Leader ist weg, wir müssen“.
 
+### 17.10 Praxis: Rollierendes Patchen des ganzen Clusters
+
+Der Login-Banner meldete auf allen Knoten rund 28 ausstehende Updates. Ziel: alle drei Knoten auf denselben Stand bringen, ohne dass die Datenbank länger als ein paar Sekunden für Schreibzugriffe ausfällt. Das Verfahren heißt **rollierendes Patchen**: immer nur ein Knoten auf einmal, und nie der aktuelle Leader.
+
+> **Hinweis zu den Uhrzeiten:** Die VMs laufen auf UTC (Ubuntu-Server-Standard). 07:18 UTC entspricht im Oktober 09:18 deutscher Sommerzeit. NTP (`systemd-timesyncd`) hält die Uhr synchron, die Zeitzone regelt nur die Anzeige. Für Server ist UTC üblich: keine doppelte Stunde bei der Zeitumstellung, gleiche Zeit über alle Standorte.
+
+#### Grundregel
+
+| Rolle des Knotens | Vorgehen |
+|---|---|
+| Replica | `apt upgrade`, bei Bedarf `reboot` |
+| Leader | erst `patronictl switchover` auf eine bereits gepatchte Replica, dann wie eine Replica behandeln |
+
+Vor jedem Schritt: `patronictl list` und der Blick auf den Hostnamen im Prompt.
+
+#### Stolperstein 1: `needrestart` startet Patroni neu
+
+Nach dem ersten `apt upgrade` auf `ph-node1` (Replica) stand am Ende:
+
+```
+Restarting services...
+ systemctl restart cron.service packagekit.service patroni.service ssh.service ...
+```
+
+Ubuntus Werkzeug `needrestart` prüft nach jedem Upgrade, welche Dienste noch alte Bibliotheken im Speicher haben, und startet sie automatisch neu, Patroni eingeschlossen. Auf einer Replica ist das harmlos, sie war Sekunden später wieder `streaming`. Auf dem Leader wäre es ein ungeplanter Failover, ausgelöst allein durch `apt upgrade`, ganz ohne Reboot.
+
+Dazu kommt eine zweite Kette: Die Patroni-Unit enthält `Requires=etcd.service`. Startet ein Update `etcd` neu, stoppt systemd Patroni gleich mit.
+
+> **Merksatz:** Auf dem Leader wird nicht gepatcht, auch kein `apt upgrade`. Erst Switchover, dann Updates.
+
+#### Der Switchover
+
+```bash
+sudo patronictl -c /etc/patroni.yml switchover
+```
+
+```
+Primary [ph-node3]: ph-node3
+Candidate ['ph-node1', 'ph-node2'] []: ph-node2
+When should the switchover take place (e.g. 2026-10-02T08:18 )  [now]: now
+Are you sure you want to switchover cluster postgres-ha, demoting current leader ph-node3? [y/N]: y
+2026-10-02 07:18:49.70276 Successfully switched over to "ph-node2"
+```
+
+Direkt danach zeigt `patronictl list` einen Zwischenzustand:
+
+```
+| ph-node1 | 192.168.178.201 | Replica | running |  7 | 0/420000A0 | 0 | 0/420000A0 | 0 |
+| ph-node2 | 192.168.178.202 | Leader  | running |  7 |            |   |            |   |
+| ph-node3 | 192.168.178.203 | Replica | stopped |    |    unknown |   |    unknown |   |
+```
+
+Der alte Leader wird heruntergefahren und als Replica neu gestartet, `ph-node1` verbindet sich zur neuen Quelle. Zehn Sekunden später:
+
+```
+| ph-node1 | 192.168.178.201 | Replica | streaming |  8 | 0/42000AE8 | 0 | 0/42000AE8 | 0 |
+| ph-node2 | 192.168.178.202 | Leader  | running   |  8 |            |   |            |   |
+| ph-node3 | 192.168.178.203 | Replica | streaming |  8 | 0/42000AE8 | 0 | 0/42000AE8 | 0 |
+```
+
+**Timeline 7 → 8.** Jede Beförderung erzeugt eine neue Timeline, egal ob geplant oder nach einem Absturz. Ab diesem Punkt schreibt ein anderer Knoten weiter, und die Replicas müssen eindeutig erkennen, welchem Strang sie folgen.
+
+`patronictl history` ergänzt eine Zeile:
+
+```
+| 7 | 1107296416 | no recovery target specified | 2026-10-02T07:18:49.221187+00:00 | ph-node2 |
+```
+
+Zwei Details zum Lesen:
+
+- Die LSN steht hier dezimal. `1107296416` ist hexadezimal `0x420000A0`, also `0/420000A0`, genau der Wert aus dem Zwischenzustand oben. An dieser Stelle im WAL zweigt Timeline 8 ab.
+- „Reason“ mit `no recovery target specified` ist kein Grund für den Wechsel, sondern die Standardnotiz, die PostgreSQL bei jeder Beförderung schreibt. Ob geplant oder nicht, steht dort nicht.
+
+Später am Vormittag folgte ein zweiter Switchover auf `ph-node1`, damit auch `ph-node2` gepatcht werden konnte: **Timeline 8 → 9.**
+
+#### Stolperstein 2: Kernel-Drift zwischen den Knoten
+
+Nach dem Reboot von `ph-node3` (Start um 07:26:04 UTC, neun Sekunden später schon wieder `streaming`):
+
+```
+uname -r   →   6.8.0-146-generic
+```
+
+`ph-node2` lief nach seinem ersten Reboot aber mit `6.8.0-142`, und auch `ph-node1` hatte nur `139` und `142` installiert. Drei Knoten, zwei Kernel-Versionen, obwohl alle am selben Vormittag gepatcht wurden.
+
+Die Diagnose lief in drei Schritten. Statt zu raten, `apt` simulieren lassen:
+
+```bash
+sudo apt -s upgrade
+```
+
+```
+The following upgrades have been deferred due to phasing:
+  sosreport thermald
+Die folgenden Pakete werden aktualisiert (Upgrade):
+  linux-generic linux-headers-generic linux-image-generic
+```
+
+Damit war klar:
+
+- **Phased Updates** gibt es wirklich. Ubuntu verteilt manche Updates stufenweise, ob ein Rechner schon dran ist, entscheidet ein aus seiner `machine-id` berechneter Zufallswert. Hier betraf das `sosreport` und `thermald`.
+- Der Kernel `146` war davon nicht betroffen. `ph-node1` kannte ihn beim ersten Upgrade schlicht noch nicht, seine Paketliste war älter als die von `ph-node3`.
+
+> **Merke:** Wer Knoten nacheinander patcht, bekommt nicht automatisch denselben Stand. Im Betrieb friert man deshalb einen geprüften Paketstand auf einem eigenen Spiegel ein (Landscape, aptly, bei SUSE der SUSE Manager), und alle Server ziehen genau diesen.
+
+`apt -s` (Simulation) ist das Werkzeug der Wahl, um zu sehen, was `apt` tun würde und warum, ohne etwas zu verändern.
+
+#### Nebenbefund: Wer liefert Sicherheitsupdates?
+
+```
+Get more security updates through Ubuntu Pro with 'esm-apps' enabled:
+  prometheus-postgres-exporter etcd-client python3-wheel
+  prometheus-node-exporter etcd-server python3-pip
+```
+
+| Bereich | Wer pflegt | Sicherheitsupdates |
+|---|---|---|
+| `main` (Kernel, PostgreSQL, OpenSSH) | Canonical | für alle, kostenlos |
+| `universe` (etcd, Exporter, python3-pip) | Community | nur mit Ubuntu Pro (`esm-apps`) |
+
+Ausgerechnet etcd, das Herz des Konsens, bekommt ohne Ubuntu Pro keine Sicherheitsfixes. Ubuntu Pro ist privat auf bis zu fünf Rechnern kostenlos und wird pro Rechner angehängt:
+
+```bash
+sudo pro attach <TOKEN>
+pro status
+```
+
+Pro bringt außerdem **Livepatch**, das kritische Kernel-Fixes im laufenden Betrieb einspielt. Neue Kernel-Versionen brauchen trotzdem einen Reboot, Livepatch verschafft nur Zeit bis zum nächsten Wartungsfenster.
+
+#### Ergebnis
+
+Alle drei Knoten laufen auf Kernel `6.8.0-146-generic`, Leader ist `ph-node1`, beide Replicas `streaming` mit Lag 0, Timeline 9. Zwei geplante Switchover, kein ungeplanter Failover, die Datenbank war zu keinem Zeitpunkt länger als wenige Sekunden ohne Leader.
+
+**Verifiziert 02.10.2026.**
+
 #### Schnell-Referenz (zum Abfragen)
 
 - **Pull oder Push bei Prometheus?** → Pull: Prometheus holt die Werte selbst ab.
@@ -2618,3 +2753,8 @@ Vollständige Liste: `patronictl --help`, Details zu einem Kommando: `patronictl
 - **Warum braucht `patronictl` plötzlich `sudo`?** → `/etc/patroni.yml` ist auf `root:postgres 640` gehärtet.
 - **Switchover vs. Failover?** → Geplant vs. erzwungen.
 - **Warum ist `pause` für einen Leader-Reboot falsch?** → Es schaltet den automatischen Failover ab.
+- **Darf man auf dem Leader `apt upgrade` ausführen?** → Nein, `needrestart` startet danach `patroni.service` neu.
+- **Ändert ein Switchover die Timeline?** → Ja, jede Beförderung erzeugt eine neue.
+- **Warum haben gleich gepatchte Knoten verschiedene Kernel?** → Unterschiedlich alte Paketlisten, dazu Phased Updates.
+- **Wie sieht man, was `apt` tun würde?** → `sudo apt -s upgrade` (Simulation).
+- **Warum braucht etcd Ubuntu Pro?** → Es liegt in `universe`, Sicherheitsupdates dort nur über `esm-apps`.

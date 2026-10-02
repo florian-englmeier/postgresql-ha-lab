@@ -437,6 +437,27 @@ Zieht eine abgehängte oder beschädigte Replica komplett neu vom Leader (frisch
 **F: Was zeigt `patronictl history`?**
 Alle bisherigen Failover und Switchover mit Timeline und Zeitpunkt. Bei kurzen Ereignissen verlässlicher als das Monitoring.
 
+**F: Warum darf man auf dem Leader nicht einfach `apt upgrade` ausführen?**
+Weil `needrestart` nach dem Upgrade Dienste mit veralteten Bibliotheken automatisch neu startet, darunter `patroni.service`. Auf dem Leader bedeutet das einen ungeplanten Failover. Richtig: Replicas zuerst patchen, dann `patronictl switchover`, den alten Leader zuletzt als Replica patchen.
+
+**F: Ändert ein geplanter Switchover die Timeline?**
+Ja. Jede Beförderung einer Replica erzeugt eine neue Timeline, egal ob geplant oder nach einem Absturz. Ab diesem Punkt schreibt ein anderer Knoten weiter, die Timeline markiert den Abzweig in der WAL-Geschichte.
+
+**F: `patronictl history` zeigt LSN `1107296416`, `list` zeigt `0/420000A0`. Widerspruch?**
+Nein, dieselbe Position: `history` schreibt die LSN dezimal, `list` hexadezimal. Die Spalte „Reason“ (`no recovery target specified`) ist übrigens nur PostgreSQLs Standardnotiz bei jeder Beförderung, kein Hinweis auf geplant oder ungeplant.
+
+**F: Drei Knoten am selben Vormittag gepatcht, trotzdem verschiedene Kernel. Warum?**
+Die Knoten hatten unterschiedlich alte Paketlisten, und Ubuntu verteilt manche Updates stufenweise (Phased Updates, abhängig von der `machine-id`). Im Betrieb löst man das mit einem eigenen Paket-Spiegel, der einen geprüften Stand für alle Server einfriert.
+
+**F: Wie prüft man, was `apt upgrade` tun würde, ohne etwas zu ändern?**
+`sudo apt -s upgrade`. Die Simulation zeigt auch, welche Pakete zurückgehalten oder „deferred due to phasing“ sind.
+
+**F: Wer liefert Sicherheitsupdates für etcd unter Ubuntu?**
+etcd liegt in `universe`. Sicherheitsupdates dafür gibt es nur mit Ubuntu Pro (`esm-apps`). Pakete aus `main` (Kernel, PostgreSQL) bekommen sie kostenlos.
+
+**F: Warum laufen Server meist auf UTC?**
+Keine doppelte oder fehlende Stunde bei der Zeitumstellung, Logs bleiben eindeutig sortierbar, Standorte loggen in derselben Zeit. NTP hält die Uhr synchron, die Zeitzone regelt nur die Anzeige.
+
 **F: Wie macht man einen Rolling Reboot?**
 `patronictl list` → Replicas einzeln neu starten, warten bis `streaming` → `patronictl switchover` → alten Leader neu starten.
 

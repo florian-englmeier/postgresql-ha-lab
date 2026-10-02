@@ -131,6 +131,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 **Betrieb & Härtung**
 - [x] Patroni-Autostart war auf allen Knoten deaktiviert, behoben und per Neustart-Test bestätigt
 - [x] `/etc/patroni.yml` (enthält Passwörter) von weltlesbar auf `root:postgres 640`
+- [x] Rollierendes Patchen aller drei Knoten mit zwei geplanten Switchovers (Timeline 7 → 8 → 9), Kernel-Drift durch Phased Updates erkannt und behoben, `needrestart`-Falle am Leader dokumentiert
 
 **Monitoring**
 - [x] Eigene Monitoring-VM `ph-monitor`, getrennt vom Cluster
@@ -175,7 +176,7 @@ Dieses Lab ist ein lebendes Projekt — der Cluster steht, die Grundlagen sind d
 Der vollständige Lernweg inkl. aller Konzepte, Befehle und Entscheidungen steht im [Tutorial-Dokument](./PostgreSQL_und_Patroni_Tutorial.md).
 
 Zum Wiederholen:
-- [Kontrollfragen](./Kontrollfragen.md) — 144 Fragen mit Antworten, nach Themen sortiert (A–M)
+- [Kontrollfragen](./Kontrollfragen.md) — 151 Fragen mit Antworten, nach Themen sortiert (A–M)
 - [Merksätze](./Merksaetze.md) — die wichtigsten Faustregeln und Lehren aus dem Lab
 
 Architektur inspiriert von [technotim.live — PostgreSQL High Availability](https://technotim.live/posts/postgresql-high-availability/), eigenständig auf Proxmox umgesetzt und dokumentiert.
