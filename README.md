@@ -71,7 +71,7 @@ Das eingebaute HAProxy-Stats-Dashboard (Port `7000`) zeigt live, dass Client-Tra
 | **keepalived** | Virtuelle IP (VRRP) als stabiler Einstiegspunkt |
 | **Prometheus** | Sammelt Metriken von 11 Zielen (Pull-Prinzip, 15-s-Intervall) |
 | **node_exporter / postgres_exporter** | Betriebssystem- und Datenbank-Metriken je Knoten; Exporter mit eigener `pg_monitor`-Rolle |
-| **Grafana** | Dashboards (in Arbeit) |
+| **Grafana** | Dashboards: Node Exporter Full (1860), PostgreSQL (9628); eigenes HA-Dashboard in Arbeit |
 | **Pi-hole** | Lokaler DNS: `pg-vip.home.arpa` → VIP |
 | **Proxmox VE** | Virtualisierungsplattform für die 3 Cluster-Knoten |
 | **Ubuntu Server** | 24.04 LTS, je Knoten |
@@ -103,40 +103,53 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 ### ✅ Abgeschlossen
 
-- [x] PostgreSQL-Grundlagen (Architektur, Rollen, MVCC/VACUUM, WAL)
-- [x] Streaming-Replikation (manuell, Single-VM-Testumgebung)
-- [x] Manueller Failover live durchgeführt & verstanden (Split-Brain-Problematik)
-- [x] Konsensus-Theorie: etcd/Raft, Mehrheitsprinzip
-- [x] Patroni-Konzept: Automatisierung des manuellen Failover-Prozesses
-- [x] HAProxy- und keepalived-Konzept
-- [x] `ph-node1` (VMID 201) in Proxmox provisioniert, PostgreSQL 16 + Patroni + etcd installiert
-- [x] `ph-node2` / `ph-node3` per Klon erstellt und individualisiert (Hostname, IP, machine-id, SSH-Keys)
-- [x] etcd-3-Knoten-Cluster konfiguriert
-- [x] Patroni-Cluster konfiguriert und gestartet (ph-node1 Leader, ph-node2/ph-node3 Replicas, Lag = 0)
-- [x] HAProxy konfiguriert (Health-Check gegen Patroni REST-API, routet automatisch zur Primary)
-- [x] keepalived konfiguriert (virtuelle IP `192.168.178.200`, Unicast-VRRP, Track-Script gegen HAProxy — verifiziert: VIP korrekt auf ph-node1 gebunden, Ping + `psql` über die VIP erfolgreich)
-- [x] Kompletter automatisierter Failover-Test durchgeführt (HAProxy auf Primary-Knoten gestoppt, VIP + Traffic sind automatisch zum nächsten Knoten gewandert, `psql` über die VIP blieb durchgehend erreichbar)
-- [x] Titanic Passenger Data eingespielt, SQL-Abfragen und Auswertungen mit realen Passagierdaten geübt (`GROUP BY`, `FILTER`, Aggregationen)
-- [x] Logisches Backup mit `pg_dump` / `pg_restore` (inkl. Restore-Test auf neue Datenbank) verifiziert
-- [x] Physisches Backup mit `pg_basebackup` + WAL-Archivierung + Point-in-Time-Recovery (PITR) — sekundengenauer Restore auf isolierter Testinstanz bewiesen
-- [x] Performance-Analyse mit `pgbench` — Sättigungskurve (10/50/90 Clients), Durchsatz-Latenz-Trade-off, Lasttest über VIP/HAProxy mit 0 % Fehlerquote
-- [x] Query-Analyse mit `EXPLAIN ANALYZE` — Ausführungspläne lesen, Seq Scan vs. Index Scan, Selektivität live nachgewiesen, Collation-Falle (`de_DE.UTF-8`) bei `LIKE` mit `text_pattern_ops` gelöst
-- [x] DNS-Name für die VIP über Pi-hole (`pg-vip.home.arpa`), Kette Name → VIP → HAProxy → Leader Ende-zu-Ende verifiziert
-- [x] Ausfalltest des VIP-Halters gemessen: VIP-Umzug in ~3 s, Anwendung ~5 s verzögert ohne Fehlermeldung, kein Patroni-Failover (Timeline unverändert)
-- [x] Fund dabei: Patroni-Autostart war auf allen drei Knoten deaktiviert — behoben und per Neustart-Test bestätigt
-- [x] Härtung: `/etc/patroni.yml` (enthält Passwörter) von weltlesbar auf `root:postgres 640`
-- [x] Monitoring-Unterbau: eigene VM `ph-monitor`, node_exporter, Patroni-Metriken, postgres_exporter mit `pg_monitor`-Rolle (inkl. Passwort-Rotation), Prometheus mit 11/11 Zielen `UP`, Grafana installiert
+**Grundlagen & Replikation (Single-VM)**
+- [x] PostgreSQL-Architektur: Cluster, PGDATA, Rollen, MVCC/VACUUM, WAL
+- [x] Streaming-Replikation von Hand aufgesetzt, Replica read-only verifiziert
+- [x] Manueller Failover per `pg_ctl promote`, Split-Brain-Problematik verstanden
+- [x] Konsens-Theorie: etcd/Raft, Quorum, warum ungerade Knotenzahl
 
-**Kernziel erreicht:** vollautomatisierter 3-Knoten-Failover ohne manuellen Eingriff, End-to-End verifiziert — inklusive Backup/PITR, Performance-Nachweis, Query-Analyse und Monitoring-Unterbau.
+**HA-Cluster auf Proxmox (3 Knoten)**
+- [x] Template-Knoten `ph-node1` vorbereitet, zweimal geklont und individualisiert (Hostname, IP, machine-id, SSH-Keys)
+- [x] etcd-3-Knoten-Cluster, Patroni-Cluster (Leader + 2 Replicas, Lag = 0)
+- [x] HAProxy mit Health-Check gegen die Patroni-REST-API, routet automatisch zur Primary
+- [x] keepalived mit virtueller IP `192.168.178.200` (Unicast-VRRP, Track-Script); drei Bugs beim Aufsetzen gefunden und behoben
+- [x] Automatischer Failover-Test Ende-zu-Ende: VIP und Traffic wandern, `psql` über die VIP bleibt erreichbar
+- [x] DNS-Name `pg-vip.home.arpa` über Pi-hole: Name → VIP → HAProxy → Leader verifiziert
+- [x] Ausfalltest des VIP-Halters gemessen: VIP-Umzug ~3 s, Anwendung ~5 s verzögert ohne Fehler, kein Patroni-Failover
 
-> Details zu den drei Bugs, die beim Aufsetzen von keepalived gefunden und gefixt wurden (VRRP-`weight`-Logik, `enable_script_security`, Dateiberechtigungen), stehen in [Teil 12 des Tutorials](./PostgreSQL_und_Patroni_Tutorial.md#teil-12--der-echte-failover-test-und-drei-bugs-unterwegs).
+**Backup & Recovery**
+- [x] Logisches Backup `pg_dump` / `pg_restore` mit Restore-Test
+- [x] Physisches Backup `pg_basebackup`, WAL-Archivierung über `patronictl edit-config`
+- [x] Point-in-Time-Recovery sekundengenau auf isolierter Testinstanz bewiesen
+- [x] Archiv-Lücke nach Failover per `pg_stat_archiver` gefunden und behoben
+
+**Performance & Query-Analyse**
+- [x] `pgbench`-Sättigungskurve (10/50/90 Clients), Durchsatz-Latenz-Trade-off, Lasttest über VIP mit 0 % Fehlern
+- [x] `EXPLAIN ANALYZE`: Seq Scan vs. Index Scan, Selektivität, Collation-Falle (`de_DE.UTF-8`) mit `text_pattern_ops` gelöst
+
+**Betrieb & Härtung**
+- [x] Patroni-Autostart war auf allen Knoten deaktiviert, behoben und per Neustart-Test bestätigt
+- [x] `/etc/patroni.yml` (enthält Passwörter) von weltlesbar auf `root:postgres 640`
+
+**Monitoring**
+- [x] Eigene Monitoring-VM `ph-monitor`, getrennt vom Cluster
+- [x] node_exporter, Patroni-Metriken, postgres_exporter mit `pg_monitor`-Rolle (inkl. Passwort-Rotation)
+- [x] Prometheus mit 11/11 Zielen `UP`
+- [x] Grafana mit Prometheus-Datenquelle, Dashboards 1860 (Node Exporter Full) und 9628 (PostgreSQL)
+- [x] Befund aus dem Dashboard: `shared_buffers` und weitere Parameter stehen noch auf Werkseinstellung
+
+**Kernziel erreicht:** vollautomatisierter 3-Knoten-Failover ohne manuellen Eingriff, Ende-zu-Ende verifiziert — inklusive Backup/PITR, Performance-Nachweis, Query-Analyse und Monitoring.
+
+> Details zu den drei Bugs beim Aufsetzen von keepalived (VRRP-`weight`-Logik, `enable_script_security`, Dateiberechtigungen) stehen in [Teil 12 des Tutorials](./PostgreSQL_und_Patroni_Tutorial.md#teil-12--der-echte-failover-test-und-drei-bugs-unterwegs).
 
 ### 🔜 Als Nächstes
 
-- [ ] Grafana: Prometheus als Datenquelle, Dashboards (Leader-Status, Replikations-Lag, Cache-Hit-Ratio, Connections, Server-Last)
-- [ ] Platten der Knoten per `lvextend` auf volle Größe erweitern (Vorbereitung Lasttest, WAL-Archiv wächst)
-- [ ] Lasttest mit `pgbench` von `ph-monitor` aus (getrennter Lastgenerator) — live im Dashboard
+- [ ] Eigenes HA-Dashboard in Grafana: Leader-Status, Replikations-Lag, Cache-Hit-Ratio, Connections
+- [ ] Platten der Knoten per `lvextend` auf volle Größe erweitern (WAL-Archiv wächst)
+- [ ] Lasttest mit `pgbench` von `ph-monitor` aus (getrennter Lastgenerator), live im Dashboard
 - [ ] Failover unter Last, im Dashboard sichtbar gemacht
+- [ ] Basis-Tuning (`shared_buffers` u. a.) per `patronictl edit-config` und rollierendem Restart
 
 ---
 
@@ -144,24 +157,16 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 Dieses Lab ist ein lebendes Projekt — der Cluster steht, die Grundlagen sind dokumentiert. Geplante Erweiterungen:
 
-### Ergänzender Lernpfad: SUSE / SLES-Systemadministration
-
-Parallel zum PostgreSQL-HA-Lab wird ein separater SUSE-Lernpfad aufgebaut. Ziel ist, die Datenbankadministration in den Kontext eines professionellen Linux- und Rechenzentrumsbetriebs einzuordnen, ohne das bestehende Ubuntu-HA-Lab umzubauen.
-
-**Lernlinie:** Linux/SUSE → PostgreSQL → Backup & Recovery → Patroni → etcd → HAProxy/VIP → Monitoring → Security → Automatisierung.
-
-Geplante SUSE-Themen: **YaST** als Systemkonfigurationswerkzeug, **zypper/RPM** für Paket- und Repository-Verwaltung, `systemd`/`journalctl`, Netzwerk, Benutzer und Rechte, Storage, Dienste sowie PostgreSQL-Betrieb unter SUSE/SLES. Dabei steht nicht das Auswendiglernen einzelner Befehle im Vordergrund, sondern das Verständnis von Betrieb, Diagnose, Verifikation und Fehlerbehebung.
-
-
 | # | Thema | Beschreibung |
 |---|---|---|
-| 1 | **Monitoring** | 🔧 in Arbeit — Prometheus + Exporter laufen, Grafana-Dashboards folgen; ergänzend `pg_activity` |
+| 1 | **Alerting** | Alertmanager-Regeln (Leader weg, Lag zu hoch, Archivierung fehlgeschlagen) statt Dashboards beobachten |
 | 2 | **Connection Pooling** | PgBouncer vor HAProxy schalten — reduziert Verbindungs-Overhead bei vielen Clients |
 | 3 | **Sicherheitshärtung** | 🔧 begonnen (Dateirechte `patroni.yml`, Exporter-Config) — offen: `keepalived.conf`, SSL/TLS, `pg_hba.conf` Restriktionen, BSI IT-Grundschutz |
-| 4 | **Parametrisiertes Setup-Skript** | `setup_patroni_node.sh --node-id 1 --ip 192.168.178.201` — Cluster reproduzierbar per Skript aufsetzen |
+| 4 | **Automatisierung mit Ansible** | Cluster-Aufbau als Ansible-Rolle — reproduzierbar statt Schritt-für-Schritt von Hand |
 | 5 | **Read-only Load Balancing** | Replicas über separaten HAProxy-Port (z.B. `5433`) für Leseabfragen nutzen |
 | 6 | **Switchover vs. Failover** | `patronictl switchover` (kontrolliert) vs. automatischer Failover — Unterschied live demonstrieren |
 | 7 | **pg_upgrade** | Versionswechsel (z.B. PostgreSQL 16 → 17) im laufenden Cluster dokumentieren |
+| 8 | **CloudNativePG** | PostgreSQL-HA auf Kubernetes (on-prem) als Gegenstück zum Patroni-Ansatz |
 
 ---
 
@@ -169,7 +174,9 @@ Geplante SUSE-Themen: **YaST** als Systemkonfigurationswerkzeug, **zypper/RPM** 
 
 Der vollständige Lernweg inkl. aller Konzepte, Befehle und Entscheidungen steht im [Tutorial-Dokument](./PostgreSQL_und_Patroni_Tutorial.md).
 
-Zum Wiederholen: [Kontrollfragen](./Kontrollfragen.md) — über 120 Fragen mit Antworten, nach Themen sortiert.
+Zum Wiederholen:
+- [Kontrollfragen](./Kontrollfragen.md) — 137 Fragen mit Antworten, nach Themen sortiert (A–M)
+- [Merksätze](./Merksaetze.md) — die wichtigsten Faustregeln und Lehren aus dem Lab
 
 Architektur inspiriert von [technotim.live — PostgreSQL High Availability](https://technotim.live/posts/postgresql-high-availability/), eigenständig auf Proxmox umgesetzt und dokumentiert.
 
