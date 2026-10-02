@@ -98,7 +98,13 @@ Alle wichtigen Hinweise, Merksätze und Praxis-Lehren an einem Ort — automatis
 
 ## Betrieb & Werkzeuge
 
-- **Patroni-Knoten nie einfach rebooten:** Ist er Leader, vorher `patronictl switchover`, sonst gibt es einen unnötigen Failover.
+- **Vor jedem Reboot die Rolle prüfen:** `sudo reboot` ist für Patroni-Knoten in Ordnung, weil Patroni PostgreSQL dabei selbst sauber stoppt. Replica: direkt rebooten. Leader: vorher `patronictl switchover`, sonst gibt es einen unnötigen Failover.
+
+- **Zwei Arten von „Neustart nötig“:** Ubuntus „System restart required“ meint die ganze VM (Kernel-Update, siehe `/var/run/reboot-required.pkgs`). Patronis „Pending restart“ meint nur PostgreSQL (geänderter Parameter, `patronictl restart`).
+
+- **Switchover vs. Failover:** Switchover heißt „wir wechseln planmäßig“, Failover heißt „der Leader ist weg, wir müssen“. `pause` schaltet den automatischen Failover ab und ist deshalb für Leader-Wartung das falsche Werkzeug.
+
+- **Erst den Hostnamen im Prompt lesen:** Richtiger Befehl auf dem falschen Server ist der häufigste Admin-Fehler. Bei `reboot`, `rm` oder `switchover` immer zuerst auf `user@host` schauen.
 
 - **`systemctl` vs. `patronictl`:** Die eiserne Regel gilt für PostgreSQL selbst. Dienste, die Patroni nicht kennt (Exporter, Prometheus, Grafana), startet man normal mit `systemctl`.
 

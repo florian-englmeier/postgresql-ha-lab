@@ -2437,7 +2437,166 @@ systemctl is-enabled grafana-server   # enabled
 
 Erstanmeldung unter `http://192.168.178.204:3000` mit `admin`/`admin`, danach erzwingt Grafana ein neues Passwort.
 
-**Stand 01.10.2026:** Unterbau komplett, Grafana läuft. Als Nächstes: Prometheus als Datenquelle, Dashboards, Lasttest von ph-monitor aus und ein Failover unter Last.
+#### Prometheus als Datenquelle
+
+Grafana speichert selbst keine Messwerte. Es fragt bei jeder Ansicht eine Datenquelle ab, hier Prometheus. Eingerichtet unter *Connections → Data sources → Add data source → Prometheus*, als URL:
+
+```
+http://localhost:9090
+```
+
+Das wirkt zunächst falsch, weil Grafana im Browser auf dem Mac läuft. Die Abfrage stellt aber der Grafana-Server, und der sitzt zusammen mit Prometheus auf `ph-monitor`. Aus seiner Sicht ist Prometheus tatsächlich `localhost`.
+
+> **Merke:** Adressen immer aus der Perspektive dessen lesen, der die Verbindung aufbaut. Der Browser zeigt nur das Ergebnis an.
+
+#### Fertige Dashboards importieren
+
+Für den Anfang muss man kein Dashboard selbst bauen. Die Community pflegt auf grafana.com Hunderte Vorlagen, die sich über ihre ID importieren lassen (*Dashboards → New → Import → ID eingeben → Datenquelle Prometheus wählen*):
+
+| ID | Dashboard | Zeigt |
+|---|---|---|
+| 1860 | Node Exporter Full | CPU, RAM, Platte, Netz je Knoten (Daten vom node_exporter) |
+| 9628 | PostgreSQL Database | Verbindungen, Transaktionen, Cache, Einstellungen (Daten vom postgres_exporter) |
+
+Beide laufen. Ein eigenes HA-Dashboard mit Leader-Status, Replikations-Lag, Cache-Hit-Ratio und Verbindungen folgt, denn die Fertigvorlagen kennen Patroni nicht.
+
+#### Erster Befund: Der Cluster ist ungetunt
+
+Das PostgreSQL-Dashboard zeigt gleich auf der ersten Seite die wichtigsten Einstellungen. Dort stand:
+
+```
+shared_buffers = 128 MiB
+```
+
+Auf einer VM mit 4 GB RAM ist das die Werkseinstellung. PostgreSQL wird bewusst sparsam ausgeliefert, damit es auch auf einem Raspberry Pi startet. `shared_buffers` ist der gemeinsame Arbeitsspeicher, in dem PostgreSQL häufig gebrauchte Tabellenblöcke vorhält. Bild dazu: Die Festplatte ist das Lager im Keller, `shared_buffers` die Werkbank. Üblicher Startwert sind rund 25 % des RAM, hier also etwa 1 GB.
+
+Geändert wird der Wert wie alle Cluster-Parameter über `patronictl edit-config`. Weil PostgreSQL den Speicher beim Start reserviert, folgt danach ein rollierender `patronictl restart`. Das Tuning steht als eigener Schritt auf der Liste.
+
+> **Merke:** Ein Monitoring-Dashboard zeigt nicht nur, ob etwas läuft, sondern auch, wie es eingestellt ist. Werkseinstellungen fallen dort oft zuerst auf.
+
+**Verifiziert 01.10.2026:** Datenquelle verbunden, Dashboards 1860 und 9628 zeigen Daten aller drei Knoten.
+
+### 17.8 Praxis: Kernel-Update auf einer Replica
+
+Beim Login auf `ph-node2` erschien:
+
+```
+*** Neustart des Systems erforderlich ***
+```
+
+Naheliegende Vermutung: Patroni will einen Neustart, etwa wegen eines geänderten Parameters. `patronictl list` zeigte aber keine Spalte *Pending restart*. Patroni blendet sie nur ein, wenn mindestens ein Knoten so ein Flag trägt. Die Meldung kam also von Ubuntu:
+
+```bash
+cat /var/run/reboot-required.pkgs
+# linux-image-6.8.0-142-generic
+# linux-base
+```
+
+Ein neuer Kernel war installiert, wird aber erst nach einem Neustart der VM aktiv.
+
+#### Zwei Arten von „Neustart nötig“
+
+| | Patroni „Pending restart“ | Ubuntu „System restart required“ |
+|---|---|---|
+| Was muss neu starten | nur PostgreSQL | die ganze VM |
+| Auslöser | Parameter wie `shared_buffers` oder `archive_mode` geändert | Kernel- oder Bibliotheks-Update |
+| Werkzeug | `patronictl restart` | `sudo reboot` |
+| Sichtbar in | `patronictl list` | Login-Banner, `/var/run/reboot-required` |
+
+#### Darf man eine Patroni-VM einfach rebooten?
+
+Die Regel aus Teil 13 lautet: PostgreSQL nie an Patroni vorbei anfassen. `sudo reboot` tut das nicht. Beim Herunterfahren stoppt systemd den Dienst `patroni.service`, Patroni fährt seine PostgreSQL-Instanz selbst sauber herunter und gibt seinen Platz in etcd frei. Nach dem Boot startet der Autostart (seit Teil 16 aktiv) Patroni wieder, und der Knoten reiht sich als Replica ein.
+
+| Aktion | Wer stoppt PostgreSQL? | In Ordnung? |
+|---|---|---|
+| `systemctl restart postgresql` | systemd, an Patroni vorbei | ❌ |
+| `patronictl restart` | Patroni | ✅ nur PostgreSQL |
+| `sudo reboot` | Patroni, über seinen eigenen Stopp | ✅ ganze VM |
+
+Ob vorher ein Switchover nötig ist, entscheidet allein die Rolle des Knotens:
+
+- **Replica:** `sudo reboot` genügt. Der Leader schreibt weiter, die Anwendung merkt nichts.
+- **Leader:** erst `patronictl switchover`, dann rebooten. Sonst läuft der Leader-Lock nach seiner TTL ab, und es folgt ein ungeplanter Failover mit etwa 30 Sekunden ohne Schreibzugriff.
+
+#### Durchgeführt
+
+`ph-node2` war Replica, Leader war `ph-node3`. Also ohne Umweg:
+
+```bash
+sudo reboot
+```
+
+Nach gut einer Minute war der Knoten zurück, der Login-Banner zeigte den neuen Kernel `6.8.0-142-generic`, und `patronictl list` lieferte:
+
+```
+| ph-node1 | 192.168.178.201 | Replica | streaming |  7 | 0/410088E0 | 0 | 0/410088E0 | 0 |
+| ph-node2 | 192.168.178.202 | Replica | streaming |  7 | 0/410088E0 | 0 | 0/410088E0 | 0 |
+| ph-node3 | 192.168.178.203 | Leader  | running   |  7 |            |   |            |   |
+```
+
+Timeline 7 vor und nach dem Reboot: Es gab keinen Failover. `ph-node2` streamt wieder, ohne dass jemand eingegriffen hat. Lag 0 ist hier allerdings kein Kunststück, denn in der Zwischenzeit hat niemand geschrieben (gleiche LSN überall). Aussagekräftiger wird der Test unter Last mit pgbench.
+
+#### Stolperstein: `patronictl` ohne `sudo`
+
+```
+Error: Provided config file /etc/patroni.yml not existing or no read rights.
+```
+
+Das ist die Härtung aus Teil 16 bei der Arbeit. `/etc/patroni.yml` gehört `root:postgres` mit Rechten `640`, und der Login-User `florian` steht in keiner der beiden Gruppen. Lösung: `sudo patronictl …`. Den User in die Gruppe `postgres` aufzunehmen würde die Härtung wieder aufweichen.
+
+#### Was der Login-Banner sonst noch verrät
+
+- `New release '26.04.1 LTS' available`: kein `do-release-upgrade` auf einem Cluster-Knoten. Ein Release-Upgrade kann die PostgreSQL-Hauptversion aus den Ubuntu-Paketen mitziehen, und Streaming-Replikation funktioniert nur innerhalb derselben Hauptversion.
+- `28 Aktualisierungen können sofort angewendet werden`: der Normalfall im Betrieb, gelöst durch rollierendes Patchen (Replicas zuerst, dann Switchover, alter Leader zuletzt).
+- `Usage of /: 53.9% of 9.75GB` bei einer 20-GB-Platte: Der Ubuntu-Installer nutzt bei LVM nur etwa die Hälfte, `lvextend` steht auf der Liste.
+
+> **Merksatz:** Vor jedem Reboot eines Patroni-Knotens zuerst `patronictl list` und die Rolle prüfen. Replica: einfach rebooten. Leader: erst Switchover.
+
+**Verifiziert 02.10.2026.**
+
+### 17.9 Der Werkzeugkasten `patronictl`
+
+Der Reboot hat gezeigt, wie viel davon abhängt, das richtige Unterkommando zu kennen. Eine Übersicht, nach Zweck sortiert:
+
+**Schauen**
+
+| Befehl | Wofür |
+|---|---|
+| `list` | Leader, Replicas, Lag, Timeline, Pending restart |
+| `topology` | wie `list`, zeigt zusätzlich, wer von wem repliziert |
+| `history` | alle bisherigen Failover und Switchover mit Timeline und Zeitpunkt |
+| `show-config` | aktuelle Cluster-Konfiguration aus etcd |
+
+**Konfigurieren**
+
+| Befehl | Wofür |
+|---|---|
+| `edit-config` | Cluster-weite Parameter in etcd ändern |
+| `reload` | Konfiguration neu einlesen, für Parameter ohne Neustart |
+| `restart` | PostgreSQL kontrolliert neu starten, für Pending-restart-Parameter |
+
+**Rollen wechseln**
+
+| Befehl | Wofür |
+|---|---|
+| `switchover` | geplanter Leader-Wechsel, der alte Leader wird sauber Replica |
+| `failover` | erzwungener Leader-Wechsel für den Notfall, wenn der Leader nicht mehr sauber abgeben kann |
+
+**Wartung und Reparatur**
+
+| Befehl | Wofür |
+|---|---|
+| `pause` / `resume` | Wartungsmodus: automatischer Failover aus bzw. wieder an |
+| `reinit` | abgehängte Replica komplett neu vom Leader ziehen (frisches Basebackup) |
+| `remove` | Cluster-Eintrag aus etcd löschen, nur beim endgültigen Abbau |
+
+Zwei Fallen gehören dazu. `pause` klingt nach dem passenden Befehl für Wartung, schaltet aber den automatischen Failover ab. Für den Reboot eines Leaders wäre das genau verkehrt, denn dann übernimmt niemand. Und ein `patronictl start` gibt es nicht: Patroni selbst startet über systemd, ab dann steuert man es mit `patronictl`.
+
+`reinit` schließt übrigens die Lücke aus Teil 4. Dort blieb offen, wie man einen alten Primary sauber als Replica wieder eingliedert. Patroni erledigt das meist selbst, und wenn nicht, mit einem Befehl.
+
+Vollständige Liste: `patronictl --help`, Details zu einem Kommando: `patronictl switchover --help`.
+
+> **Merksatz:** Switchover heißt „wir wechseln planmäßig“, Failover heißt „der Leader ist weg, wir müssen“.
 
 #### Schnell-Referenz (zum Abfragen)
 
@@ -2452,3 +2611,10 @@ Erstanmeldung unter `http://192.168.178.204:3000` mit `admin`/`admin`, danach er
 - **Was prüft `promtool check config`?** → Nur die Syntax, nicht die Erreichbarkeit.
 - **Was macht `== 1` in PromQL?** → Filtert auf Zeitreihen mit Wert 1.
 - **Startet Grafana nach der Installation automatisch?** → Nein, bei Paketen aus dem Grafana-Repository nicht.
+- **Warum `localhost:9090` als Datenquelle?** → Grafana fragt serverseitig ab, und Prometheus läuft auf derselben VM.
+- **Was verrät `shared_buffers = 128 MiB` auf 4 GB RAM?** → Werkseinstellung, der Cluster ist ungetunt.
+- **„System restart required“ vs. „Pending restart“?** → Ganze VM (Kernel) vs. nur PostgreSQL (Parameter).
+- **Replica rebooten: Switchover nötig?** → Nein. Nur beim Leader zuerst `patronictl switchover`.
+- **Warum braucht `patronictl` plötzlich `sudo`?** → `/etc/patroni.yml` ist auf `root:postgres 640` gehärtet.
+- **Switchover vs. Failover?** → Geplant vs. erzwungen.
+- **Warum ist `pause` für einen Leader-Reboot falsch?** → Es schaltet den automatischen Failover ab.

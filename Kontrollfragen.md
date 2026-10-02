@@ -1,6 +1,6 @@
 # Kontrollfragen — PostgreSQL & Patroni (Gesamtsammlung)
 
-Stand: 01.10.2026 · zusammengestellt aus dem Tutorial und allen bisherigen Sessions
+Stand: 02.10.2026 · zusammengestellt aus dem Tutorial und allen bisherigen Sessions
 
 Nach **Themen** sortiert, nicht nach Teil-Nummern. Ergänzt die Schnell-Referenzen am Ende der einzelnen Tutorial-Teile. Gedacht zum Selbstabfragen: Frage lesen, eigene Antwort überlegen, dann vergleichen.
 
@@ -415,6 +415,27 @@ Völlig unterbrechungsfrei ist es also nicht: Der Switchover kostet einen kurzen
 ---
 
 ## K. Betrieb & Administration
+
+**F: Login-Banner meldet „System restart required“, `patronictl list` zeigt keinen Pending restart. Was ist los?**
+Zwei verschiedene Ebenen. Ubuntu verlangt einen Neustart der ganzen VM, meist nach einem Kernel-Update (`/var/run/reboot-required.pkgs` zeigt das Paket). Patronis „Pending restart“ betrifft nur PostgreSQL nach geänderten Parametern und wird dann mit `patronictl restart` erledigt.
+
+**F: Darf man eine Patroni-VM mit `sudo reboot` neu starten?**
+Ja. systemd stoppt dabei `patroni.service`, Patroni fährt PostgreSQL selbst sauber herunter. Vorher die Rolle prüfen: Eine Replica wird direkt rebootet, beim Leader kommt zuerst `patronictl switchover`, sonst folgt nach Ablauf der TTL ein ungeplanter Failover.
+
+**F: Warum meldet `patronictl` „no read rights“ auf `/etc/patroni.yml`?**
+Die Datei ist gehärtet (`root:postgres`, `640`), der Login-User gehört zu keiner der Gruppen. Lösung: `sudo patronictl …`, nicht die Rechte wieder öffnen.
+
+**F: Unterschied zwischen `patronictl switchover` und `patronictl failover`?**
+Switchover ist ein geplanter Leader-Wechsel bei gesundem Leader, der danach sauber Replica wird. Failover erzwingt den Wechsel für den Notfall, wenn der Leader nicht mehr ordentlich abgeben kann.
+
+**F: Wofür sind `pause`/`resume`, und warum nicht für einen Leader-Reboot?**
+`pause` schaltet den automatischen Failover ab (Wartungsmodus), etwa für Arbeiten, bei denen Patroni nicht eingreifen soll. Beim Leader-Reboot würde dann niemand übernehmen. Dafür ist der Switchover da.
+
+**F: Was macht `patronictl reinit`?**
+Zieht eine abgehängte oder beschädigte Replica komplett neu vom Leader (frisches Basebackup). Automatisiert den Schritt „alten Primary wieder als Replica eingliedern“.
+
+**F: Was zeigt `patronictl history`?**
+Alle bisherigen Failover und Switchover mit Timeline und Zeitpunkt. Bei kurzen Ereignissen verlässlicher als das Monitoring.
 
 **F: Wie macht man einen Rolling Reboot?**
 `patronictl list` → Replicas einzeln neu starten, warten bis `streaming` → `patronictl switchover` → alten Leader neu starten.
