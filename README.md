@@ -178,6 +178,7 @@ Der vollständige Lernweg inkl. aller Konzepte, Befehle und Entscheidungen steht
 Zum Wiederholen:
 - [Kontrollfragen](./Kontrollfragen.md) — 151 Fragen mit Antworten, nach Themen sortiert (A–M)
 - [Merksätze](./Merksaetze.md) — die wichtigsten Faustregeln und Lehren aus dem Lab
+- [Betriebslog](./Betriebslog.md) — jede Änderung am Cluster mit Grund und Ergebnis
 
 Architektur inspiriert von [technotim.live — PostgreSQL High Availability](https://technotim.live/posts/postgresql-high-availability/), eigenständig auf Proxmox umgesetzt und dokumentiert.
 
