@@ -401,9 +401,16 @@ Drei Ebenen: (1) **Alarmierung** über Alertmanager (Mail, Teams, Bereitschaft) 
 **F: Das PostgreSQL-Dashboard zeigt `shared_buffers = 128 MiB` auf einer 4-GB-VM. Was sagt das?**
 Werkseinstellung — der Cluster ist ungetunt. PostgreSQL wird bewusst klein ausgeliefert, damit es überall startet. Üblicher Startwert sind etwa 25 % des RAM.
 
+**F: Was ist `shared_buffers`?**
+Der RAM-Bereich, in dem PostgreSQL häufig gebrauchte Tabellenblöcke (Pages à 8 KB) vorhält, damit nicht jedes Mal von der Platte gelesen werden muss. „Shared“, weil sich alle Verbindungen diesen einen Bereich teilen — holt einer eine Tabelle von der Platte, liegt sie danach für alle griffbereit. Bild: Festplatte = Lager im Keller, `shared_buffers` = Werkbank. Werkseinstellung 128 MB, Faustregel ≈ 25 % des RAM (16 GB → 4 GB).
+
 **F: Wie änderst du `shared_buffers` in einem Patroni-Cluster — und reicht ein Reload?** *(typische Interview-Frage)*
-„Mit `patronictl edit-config`, nicht in der `postgresql.conf` und nicht per `ALTER SYSTEM` — sonst überschreibt Patroni das wieder. Der Wert wird automatisch an alle Knoten verteilt. Weil PostgreSQL den Speicher beim Start reserviert, ist ein Reload wirkungslos (Patroni zeigt `Pending restart`); es braucht einen **Restart**. Den löse ich kontrolliert mit `patronictl restart` aus, Knoten für Knoten: Replicas zuerst, den Leader zuletzt bzw. vorher per Switchover. So bleibt der Cluster die ganze Zeit erreichbar.“
-Der letzte Satz macht den Unterschied: Er zeigt, dass man an die Verfügbarkeit denkt, nicht nur an den Parameter.
+„`shared_buffers` lässt sich nicht im laufenden Betrieb ändern, weil PostgreSQL den Speicher beim Start reserviert — ein Reload ist wirkungslos, Patroni zeigt `Pending restart`. Ich setze den Wert mit `patronictl edit-config` (nicht in der `postgresql.conf`, nicht per `ALTER SYSTEM` — das überschreibt Patroni wieder); Patroni verteilt ihn an alle Knoten. Dann starte ich mit `patronictl restart` neu — nicht hart über Proxmox oder `systemctl`.“
+Reihenfolge: zuerst den Wert **ändern**, dann **neu starten** — nicht umgekehrt.
+
+**F: Nachfrage: „Und während des Restarts ist unsere Datenbank dann weg?“**
+„Nein, wir starten rollierend neu: erst Replica 1, dann Replica 2 — die Anwendung merkt davon nichts, der Leader läuft weiter. Dann übergebe ich per `patronictl switchover` die Leader-Rolle an eine bereits neu gestartete Replica und starte den alten Leader zuletzt. Die Anwendung sieht höchstens beim Switchover eine kurze Unterbrechung von wenigen Sekunden für Schreibzugriffe, bis HAProxy umgeschwenkt hat.“
+Die kurze Unterbrechung offen zu nennen wirkt kompetenter als „man merkt gar nichts“.
 
 ---
 
