@@ -401,6 +401,9 @@ Drei Ebenen: (1) **Alarmierung** über Alertmanager (Mail, Teams, Bereitschaft) 
 **F: Das PostgreSQL-Dashboard zeigt `shared_buffers = 128 MiB` auf einer 4-GB-VM. Was sagt das?**
 Werkseinstellung — der Cluster ist ungetunt. PostgreSQL wird bewusst klein ausgeliefert, damit es überall startet. Üblicher Startwert sind etwa 25 % des RAM.
 
+**F: Prometheus läuft, aber jede Seite der Weboberfläche liefert `404`. Was ist los?**
+Das Ubuntu-/Debian-Paket (`2.45.3+ds`) ist „dfsg-stripped“: Die JavaScript-Weboberfläche wurde beim Neubau entfernt. Server und API laufen normal. Prüfen per `curl …/api/v1/targets` oder über Grafana; wer die Oberfläche braucht, nimmt das offizielle Release.
+
 **F: Was ist `shared_buffers`?**
 Der RAM-Bereich, in dem PostgreSQL häufig gebrauchte Tabellenblöcke (Pages à 8 KB) vorhält, damit nicht jedes Mal von der Platte gelesen werden muss. „Shared“, weil sich alle Verbindungen diesen einen Bereich teilen — holt einer eine Tabelle von der Platte, liegt sie danach für alle griffbereit. Bild: Festplatte = Lager im Keller, `shared_buffers` = Werkbank. Werkseinstellung 128 MB, Faustregel ≈ 25 % des RAM (16 GB → 4 GB).
 

@@ -186,7 +186,7 @@ Dieses Lab ist ein lebendes Projekt — der Cluster steht, die Grundlagen sind d
 Der vollständige Lernweg inkl. aller Konzepte, Befehle und Entscheidungen steht im [Tutorial-Dokument](./PostgreSQL_und_Patroni_Tutorial.md).
 
 Zum Wiederholen:
-- [Kontrollfragen](./Kontrollfragen.md) — 154 Fragen mit Antworten, nach Themen sortiert (A–M)
+- [Kontrollfragen](./Kontrollfragen.md) — 155 Fragen mit Antworten, nach Themen sortiert (A–M)
 - [Merksätze](./Merksaetze.md) — die wichtigsten Faustregeln und Lehren aus dem Lab
 - [Betriebslog](./Betriebslog.md) — jede Änderung am Cluster mit Grund und Ergebnis
 

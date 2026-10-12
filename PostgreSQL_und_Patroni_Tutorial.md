@@ -2379,7 +2379,7 @@ promtool check config /etc/prometheus/prometheus.yml   # SUCCESS
 sudo systemctl reload prometheus
 ```
 
-`promtool` prüft nur die Syntax — ob die Ziele erreichbar sind, zeigt erst *Status → Targets* in der Weboberfläche (`http://192.168.178.204:9090`):
+`promtool` prüft nur die Syntax. Ob die Ziele auch erreichbar sind, zeigt erst die Abfrage der laufenden Instanz:
 
 | Job | Ziele |
 |---|---|
@@ -2388,7 +2388,39 @@ sudo systemctl reload prometheus
 | postgres | 3/3 up |
 | prometheus | 1/1 up |
 
-**11 von 11 Zielen `UP`.** Die Scrape-Dauer spiegelt die Menge der Metriken: node_exporter ~35 ms, postgres_exporter ~15 ms, Patroni ~1,7 ms.
+**11 von 11 Zielen `UP`.** Am übersichtlichsten zeigt das Grafana unter *Explore* mit der Abfrage `up` als Tabelle. Der Wert 1 heißt: Prometheus hat das Ziel beim letzten Scrape erreicht.
+
+![Grafana Explore: Abfrage up, alle 11 Ziele mit Wert 1](./images/grafana-up-targets.png)
+
+#### Stolperstein: Prometheus ohne Weboberfläche
+
+Der naheliegende Weg über die Prometheus-eigene Seite `http://192.168.178.204:9090/targets` endete mit `404 page not found`, und zwar auf jeder UI-Seite. Prometheus selbst lief einwandfrei. Die Erklärung steckt in der Versionsnummer:
+
+```bash
+prometheus --version
+# prometheus, version 2.45.3+ds (branch: debian/sid, revision: 2.45.3+ds-2ubuntu0.3)
+```
+
+`+ds` steht bei Debian für „dfsg-stripped“: Das Paket wurde neu gebaut, damit es den Debian-Richtlinien (DFSG) entspricht, und dabei ist entfernt worden, was sich nicht aus Quellcode bauen ließ. Bei Prometheus betrifft das die Weboberfläche, eine JavaScript-Anwendung mit Hunderten Abhängigkeiten. Server, Datenbank und API sind vollständig da.
+
+Die API liefert dieselbe Information ohne Oberfläche:
+
+```bash
+curl -s http://localhost:9090/api/v1/targets | grep -o '"health":"[a-z]*"' | sort | uniq -c
+#      11 "health":"up"
+```
+
+| Weg | Funktioniert mit dem Ubuntu-Paket |
+|---|---|
+| Prometheus-Weboberfläche (`/targets`, `/graph`) | nein, `404` |
+| HTTP-API (`/api/v1/...`) | ja |
+| Grafana mit Prometheus als Datenquelle | ja |
+
+> **Merke:** Distributionspakete sind nicht immer identisch mit dem, was der Hersteller ausliefert. Ein Kürzel wie `+ds` oder `+dfsg` in der Version ist der Hinweis darauf. Fehlt die Oberfläche, fragt man die API. Wer die Oberfläche braucht, installiert das offizielle Release von prometheus.io, so wie Grafana hier ohnehin aus dem Hersteller-Repository kommt.
+
+**Verifiziert 12.10.2026.**
+
+Die Scrape-Dauer spiegelt die Menge der Metriken: node_exporter ~35 ms, postgres_exporter ~15 ms, Patroni ~1,7 ms.
 
 Erste PromQL-Abfrage:
 
@@ -2808,6 +2840,7 @@ Beim Reload ist ein ungültiger Wert harmlos: PostgreSQL meldet einen Fehler im 
 - **Was prüft `promtool check config`?** → Nur die Syntax, nicht die Erreichbarkeit.
 - **Was macht `== 1` in PromQL?** → Filtert auf Zeitreihen mit Wert 1.
 - **Startet Grafana nach der Installation automatisch?** → Nein, bei Paketen aus dem Grafana-Repository nicht.
+- **Prometheus liefert auf `/targets` nur `404`?** → Ubuntu-Paket `+ds` ohne Weboberfläche; API (`/api/v1/targets`) oder Grafana nutzen.
 - **Warum `localhost:9090` als Datenquelle?** → Grafana fragt serverseitig ab, und Prometheus läuft auf derselben VM.
 - **Was verrät `shared_buffers = 128 MiB` auf 4 GB RAM?** → Werkseinstellung, der Cluster ist ungetunt.
 - **„System restart required“ vs. „Pending restart“?** → Ganze VM (Kernel) vs. nur PostgreSQL (Parameter).

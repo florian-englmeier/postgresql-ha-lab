@@ -92,6 +92,8 @@ Alle wichtigen Hinweise, Merksätze und Praxis-Lehren an einem Ort — automatis
 
 - **Monitoring im Großen = drei Ebenen:** Alarm ruft den Menschen → Übersicht zeigt *wo* → Detail-Dashboard zeigt *warum*. Niemand schaut Dashboards zu, solange nichts passiert.
 
+- **Distributionspaket ≠ Herstellerpaket:** `+ds`/`+dfsg` in der Version heißt „für Debian umgebaut“, beim Prometheus-Paket fehlt dadurch die Weboberfläche. Dann die API fragen (`/api/v1/targets`) oder Grafana nutzen.
+
 - **Werkseinstellungen erkennen:** `shared_buffers = 128 MiB` auf 4 GB RAM heißt „nie getunt“. Startwert ≈ 25 % RAM; Änderung über `patronictl edit-config`, braucht Restart.
 
 - **Restart-Parameter im Cluster rollierend anwenden:** `patronictl edit-config` → `patronictl restart` Knoten für Knoten, Replicas zuerst, Leader zuletzt bzw. per Switchover. Der Cluster bleibt durchgehend erreichbar.
