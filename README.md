@@ -13,6 +13,10 @@ Ein selbst gebautes, hochverfügbares PostgreSQL-Cluster-Lab auf Proxmox — von
 
 Entstanden als strukturiertes Lernprojekt, vollständig dokumentiert als Portfolio-Nachweis.
 
+![Grafana-Dashboard des Clusters: PostgreSQL-Kennzahlen live aus Prometheus](./images/grafana-postgresql-dashboard.png)
+
+*Live-Monitoring des Leaders mit Prometheus und Grafana. Die Kachelreihe „Settings“ zeigt den ersten Befund: `shared_buffers` steht noch auf der Werkseinstellung von 128 MiB.*
+
 ---
 
 ## Architektur

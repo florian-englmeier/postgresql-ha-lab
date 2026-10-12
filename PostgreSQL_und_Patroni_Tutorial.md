@@ -2464,6 +2464,8 @@ Beide laufen. Ein eigenes HA-Dashboard mit Leader-Status, Replikations-Lag, Cach
 
 Das PostgreSQL-Dashboard zeigt gleich auf der ersten Seite die wichtigsten Einstellungen. Dort stand:
 
+![PostgreSQL-Dashboard 9628 mit der Kachelreihe Settings: shared_buffers 128 MiB](./images/grafana-postgresql-dashboard.png)
+
 ```
 shared_buffers = 128 MiB
 ```
