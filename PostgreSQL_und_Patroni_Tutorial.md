@@ -513,7 +513,7 @@ etcdctl endpoint health --cluster
 
 **Ergebnis (verifiziert am 16.09.2026):** Alle drei Knoten haben sich gefunden, jeder mit eigener Member-ID im Status `started`, und der Health-Check bestätigt für alle drei Endpoints ein erfolgreich committetes Proposal — das Mehrheitsprinzip funktioniert nicht nur theoretisch, sondern live:
 
-<!-- Screenshot folgt: ![etcd 3-Knoten-Cluster: member list und Health-Check](./images/etcd-cluster-health.png) -->
+![etcd 3-Knoten-Cluster: member list und Health-Check aller drei Endpunkte](./images/etcd-cluster-health.png)
 
 ## Teil 9 — Patroni konfigurieren und Cluster starten
 
