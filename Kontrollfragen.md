@@ -458,6 +458,15 @@ etcd liegt in `universe`. Sicherheitsupdates dafür gibt es nur mit Ubuntu Pro (
 **F: Warum laufen Server meist auf UTC?**
 Keine doppelte oder fehlende Stunde bei der Zeitumstellung, Logs bleiben eindeutig sortierbar, Standorte loggen in derselben Zeit. NTP hält die Uhr synchron, die Zeitzone regelt nur die Anzeige.
 
+**F: Muss `patronictl edit-config` auf dem Leader ausgeführt werden?**
+Nein. Es schreibt die Änderung nach etcd, und jeder Patroni-Prozess liest von dort selbst. Auf dem Leader müssen dagegen Datenänderungen passieren (`INSERT`, `CREATE ROLE`), weil die Replicas read-only sind und Daten nur über den WAL-Strom bekommen.
+
+**F: Die Zeitzone wurde mit `timedatectl` auf einem Knoten geändert. Haben die anderen sie jetzt auch?**
+Nein. Betriebssystem-Einstellungen verteilt weder etcd noch die Replikation, jede VM wird einzeln umgestellt. Die PostgreSQL-Parameter `timezone` und `log_timezone` sind davon unabhängig und werden per `edit-config` gesetzt.
+
+**F: Ein ungültiger Wert für einen Reload-Parameter wurde per `edit-config` gesetzt. Was passiert?**
+Beim Reload nichts Sichtbares: PostgreSQL loggt einen Fehler und behält den alten Wert. Beim nächsten Neustart startet der Knoten dagegen nicht. Deshalb Diff lesen und nach der Änderung mit `SHOW` prüfen.
+
 **F: Wie macht man einen Rolling Reboot?**
 `patronictl list` → Replicas einzeln neu starten, warten bis `streaming` → `patronictl switchover` → alten Leader neu starten.
 

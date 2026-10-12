@@ -116,6 +116,12 @@ Alle wichtigen Hinweise, Merksätze und Praxis-Lehren an einem Ort — automatis
 
 - **`main` vs. `universe`:** Sicherheitsupdates für `universe`-Pakete wie etcd oder die Exporter gibt es nur mit Ubuntu Pro.
 
+- **Diff lesen, dann `y`:** Den Diff von `edit-config` Zeichen für Zeichen prüfen und danach mit `SHOW` verifizieren. Ein Tippfehler in einem Reload-Parameter fällt sonst erst beim nächsten Neustart auf, als Knoten, der nicht mehr startet.
+
+- **Drei Wege durch den Cluster:** Daten gehen vom Leader über den WAL-Strom, Cluster-Parameter von beliebigem Knoten über etcd, OS-Einstellungen gar nicht (jede VM einzeln).
+
+- **Sicherungen statt Konzentration:** Fehlerfrei tippt niemand dauerhaft. Diff prüfen, kopieren statt abtippen, hinterher verifizieren, Wiederkehrendes automatisieren.
+
 - **`systemctl` vs. `patronictl`:** Die eiserne Regel gilt für PostgreSQL selbst. Dienste, die Patroni nicht kennt (Exporter, Prometheus, Grafana), startet man normal mit `systemctl`.
 
 - **Pre-Commit-Hook meldet Secrets:** Treffer erst mit eigenen Augen prüfen. Nur bei echten Fehlalarmen bewusst `git commit --no-verify` — nie aus Bequemlichkeit.

@@ -58,6 +58,12 @@ Entstanden als strukturiertes Lernprojekt, vollständig dokumentiert als Portfol
 
 Das eingebaute HAProxy-Stats-Dashboard (Port `7000`) zeigt live, dass Client-Traffic ausschließlich zur aktuellen Primary (`ph-node1`, grün) geroutet wird — die beiden Replicas werden korrekt aus dem Schreib-Pool ausgeschlossen (rot, weil Patronis REST-API dort `503` statt `200` liefert). Details zur Interpretation im [Tutorial-Dokument](./PostgreSQL_und_Patroni_Tutorial.md#teil-10--haproxy-automatisches-routing-zur-aktuellen-primary).
 
+### Live-Nachweis: Geplanter Switchover
+
+![Geplanter Switchover von ph-node3 auf ph-node2, Timeline 7 auf 8](./images/switchover-timeline-8-history.png)
+
+Rollierendes Patchen aller drei Knoten: Der Leader wird per `patronictl switchover` kontrolliert übergeben, bevor er gepatcht wird. Jeder Wechsel erzeugt eine neue Timeline, `patronictl history` dokumentiert alle Leader-Wechsel lückenlos. Ablauf und Stolpersteine (`needrestart`, Kernel-Drift) in [Teil 17.10](./PostgreSQL_und_Patroni_Tutorial.md#1710-praxis-rollierendes-patchen-des-ganzen-clusters).
+
 ---
 
 ## Tech-Stack
@@ -176,7 +182,7 @@ Dieses Lab ist ein lebendes Projekt — der Cluster steht, die Grundlagen sind d
 Der vollständige Lernweg inkl. aller Konzepte, Befehle und Entscheidungen steht im [Tutorial-Dokument](./PostgreSQL_und_Patroni_Tutorial.md).
 
 Zum Wiederholen:
-- [Kontrollfragen](./Kontrollfragen.md) — 151 Fragen mit Antworten, nach Themen sortiert (A–M)
+- [Kontrollfragen](./Kontrollfragen.md) — 154 Fragen mit Antworten, nach Themen sortiert (A–M)
 - [Merksätze](./Merksaetze.md) — die wichtigsten Faustregeln und Lehren aus dem Lab
 - [Betriebslog](./Betriebslog.md) — jede Änderung am Cluster mit Grund und Ergebnis
 

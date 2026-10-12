@@ -10,6 +10,9 @@ Neueste Einträge oben. Zeiten in UTC, wo sie aus Systemausgaben stammen. Detail
 
 | Datum | Knoten | Aktion | Grund | Ergebnis | Doku |
 |---|---|---|---|---|---|
+| 02.10.2026 | Cluster | `log_timezone` korrigiert (`Europ/Berlin` → `Europe/Berlin`) | Tippfehler im ersten `edit-config`, hätte beim nächsten Neustart den Start verhindert | `SHOW` zeigt `Europe/Berlin`, kein Pending restart | Teil 17.11 |
+| 02.10.2026 | Cluster | `timezone` und `log_timezone` auf `Europe/Berlin` per `patronictl edit-config` | PostgreSQL stand weiter auf `Etc/UTC` | per Reload übernommen, kein Neustart nötig | Teil 17.11 |
+| 02.10.2026 | ph-node1, ph-node3, ph-monitor | `timedatectl set-timezone Europe/Berlin` (ph-node2 war es bereits) | Zeitzonen waren zwischen den VMs uneinheitlich | alle vier VMs auf Europe/Berlin, NTP synchron | Teil 17.11 |
 | 02.10.2026 | ph-node2 | `apt upgrade` + Reboot auf Kernel 6.8.0-146 | letzter Knoten des rollierenden Patchens | Replica `streaming`, Lag 0, alle drei Knoten einheitlich | Teil 17.10 |
 | 02.10.2026 | ph-node2 → ph-node1 | `patronictl switchover` | ph-node2 (Leader) sollte gepatcht werden | TL 8 → 9, kein Failover | Teil 17.10 |
 | 02.10.2026 | ph-node1 | `apt upgrade` (Kernel 146 nachgezogen) + Reboot | Kernel-Drift: node1 hatte 146 beim ersten Upgrade nicht bekommen | Replica `streaming` | Teil 17.10 |

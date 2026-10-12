@@ -513,7 +513,7 @@ etcdctl endpoint health --cluster
 
 **Ergebnis (verifiziert am 16.09.2026):** Alle drei Knoten haben sich gefunden, jeder mit eigener Member-ID im Status `started`, und der Health-Check bestätigt für alle drei Endpoints ein erfolgreich committetes Proposal — das Mehrheitsprinzip funktioniert nicht nur theoretisch, sondern live:
 
-![etcd 3-Knoten-Cluster: member list und Health-Check](./images/etcd-cluster-health.png)
+<!-- Screenshot folgt: ![etcd 3-Knoten-Cluster: member list und Health-Check](./images/etcd-cluster-health.png) -->
 
 ## Teil 9 — Patroni konfigurieren und Cluster starten
 
@@ -2602,7 +2602,7 @@ Vollständige Liste: `patronictl --help`, Details zu einem Kommando: `patronictl
 
 Der Login-Banner meldete auf allen Knoten rund 28 ausstehende Updates. Ziel: alle drei Knoten auf denselben Stand bringen, ohne dass die Datenbank länger als ein paar Sekunden für Schreibzugriffe ausfällt. Das Verfahren heißt **rollierendes Patchen**: immer nur ein Knoten auf einmal, und nie der aktuelle Leader.
 
-> **Hinweis zu den Uhrzeiten:** Die VMs laufen auf UTC (Ubuntu-Server-Standard). 07:18 UTC entspricht im Oktober 09:18 deutscher Sommerzeit. NTP (`systemd-timesyncd`) hält die Uhr synchron, die Zeitzone regelt nur die Anzeige. Für Server ist UTC üblich: keine doppelte Stunde bei der Zeitumstellung, gleiche Zeit über alle Standorte.
+> **Hinweis zu den Uhrzeiten:** Während des Patchens liefen die VMs noch auf UTC, alle Zeiten in diesem Abschnitt sind daher UTC. 07:18 UTC entspricht im Oktober 09:18 deutscher Sommerzeit. Direkt im Anschluss wurde auf Europe/Berlin umgestellt, siehe 17.11.
 
 #### Grundregel
 
@@ -2621,6 +2621,8 @@ Nach dem ersten `apt upgrade` auf `ph-node1` (Replica) stand am Ende:
 Restarting services...
  systemctl restart cron.service packagekit.service patroni.service ssh.service ...
 ```
+
+![needrestart startet nach apt upgrade automatisch patroni.service neu](./images/needrestart-patroni-neustart.png)
 
 Ubuntus Werkzeug `needrestart` prüft nach jedem Upgrade, welche Dienste noch alte Bibliotheken im Speicher haben, und startet sie automatisch neu, Patroni eingeschlossen. Auf einer Replica ist das harmlos, sie war Sekunden später wieder `streaming`. Auf dem Leader wäre es ein ungeplanter Failover, ausgelöst allein durch `apt upgrade`, ganz ohne Reboot.
 
@@ -2641,6 +2643,8 @@ When should the switchover take place (e.g. 2026-10-02T08:18 )  [now]: now
 Are you sure you want to switchover cluster postgres-ha, demoting current leader ph-node3? [y/N]: y
 2026-10-02 07:18:49.70276 Successfully switched over to "ph-node2"
 ```
+
+![Switchover von ph-node3 auf ph-node2 mit Zwischenzustand direkt danach](./images/switchover-node3-zu-node2.png)
 
 Direkt danach zeigt `patronictl list` einen Zwischenzustand:
 
@@ -2665,6 +2669,8 @@ Der alte Leader wird heruntergefahren und als Replica neu gestartet, `ph-node1` 
 ```
 | 7 | 1107296416 | no recovery target specified | 2026-10-02T07:18:49.221187+00:00 | ph-node2 |
 ```
+
+![patronictl list mit Timeline 8 und patronictl history mit allen Leader-Wechseln](./images/switchover-timeline-8-history.png)
 
 Zwei Details zum Lesen:
 
@@ -2695,6 +2701,8 @@ The following upgrades have been deferred due to phasing:
 Die folgenden Pakete werden aktualisiert (Upgrade):
   linux-generic linux-headers-generic linux-image-generic
 ```
+
+![apt -s upgrade: Phased Updates für sosreport und thermald, Kernel 146 wird regulär installiert](./images/apt-simulation-phasing.png)
 
 Damit war klar:
 
@@ -2733,6 +2741,58 @@ Alle drei Knoten laufen auf Kernel `6.8.0-146-generic`, Leader ist `ph-node1`, b
 
 **Verifiziert 02.10.2026.**
 
+### 17.11 Zeitzone vereinheitlichen
+
+Beim Vergleich der Ausgaben fiel auf: `ph-node2` zeigte Ortszeit, `ph-node1` UTC. Die Uhren selbst stimmten, NTP lief überall (`systemd-timesyncd`). Unterschiedlich war nur die Anzeige. Bei Logs von mehreren Knoten führt das schnell zu falschen Schlüssen: „07:26 Fehler“ auf dem einen und „09:26 Fehler“ auf dem anderen Knoten sind dasselbe Ereignis.
+
+```bash
+timedatectl
+```
+
+```
+               Local time: Fr 2026-10-02 10:15:43 CEST
+           Universal time: Fr 2026-10-02 08:15:43 UTC
+                 RTC time: Fr 2026-10-02 08:15:43
+                Time zone: Europe/Berlin (CEST, +0200)
+System clock synchronized: yes
+              NTP service: active
+          RTC in local TZ: no
+```
+
+| Zeile | Bedeutung |
+|---|---|
+| `System clock synchronized: yes` | NTP hat die Uhr abgeglichen |
+| `NTP service: active` | der Zeitdienst läuft |
+| `RTC in local TZ: no` | die Hardware-Uhr läuft in UTC, so soll es sein |
+
+Entscheidung: alle vier VMs auf `Europe/Berlin`. Für Server ist UTC verbreiteter (keine doppelte Stunde bei der Zeitumstellung), im Lab mit einem Admin passt Ortszeit besser zur Wanduhr. Entscheidend ist, dass es überall gleich ist.
+
+#### Drei Ebenen, drei Wege
+
+| Was | Wie geändert | Erreicht die anderen Knoten |
+|---|---|---|
+| Zeitzone des Betriebssystems | `sudo timedatectl set-timezone Europe/Berlin` | gar nicht, jede VM einzeln |
+| PostgreSQL-Parameter `timezone`, `log_timezone` | `patronictl edit-config` | über etcd, jeder Patroni liest selbst |
+| Daten (`INSERT`, `CREATE ROLE`) | SQL auf dem Leader | über den WAL-Strom |
+
+PostgreSQL übernimmt die System-Zeitzone nicht nachträglich. Sie wird beim Anlegen des Clusters einmal eingetragen und stand danach weiter auf `Etc/UTC`. `log_timezone` steuert die Zeitstempel im Server-Log, `timezone` die Ausgabe von `timestamptz` an Clients. Gespeichert wird intern immer UTC.
+
+Beide sind Reload-Parameter. Nach `edit-config` zeigte `patronictl list` deshalb kein „Pending restart“.
+
+#### Stolperstein: Tippfehler im Diff
+
+Der erste Versuch sah im Diff von `edit-config` so aus:
+
+![Diff von patronictl edit-config mit dem Tippfehler Europ/Berlin](./images/edit-config-tippfehler-timezone.png)
+
+Beim Reload ist ein ungültiger Wert harmlos: PostgreSQL meldet einen Fehler im Log und behält den alten Wert. Beim nächsten **Neustart** dagegen liest es die Konfiguration frisch, stößt auf den ungültigen Wert und startet nicht. Der Fehler wäre also erst beim nächsten Patch-Tag aufgefallen, als Knoten, der nach dem Reboot nicht mehr hochkommt. Sofort korrigiert per zweitem `edit-config`, danach verifiziert:
+
+![SHOW timezone und log_timezone zeigen Europe/Berlin, Cluster auf Timeline 9 ohne Pending restart](./images/timezone-verifiziert-timeline-9.png)
+
+> **Merksatz:** Den Diff von `edit-config` Zeichen für Zeichen lesen, bevor man `y` drückt, und danach mit `SHOW` verifizieren. Ein ungültiger Reload-Parameter fällt nicht beim Reload auf, sondern erst beim nächsten Neustart.
+
+**Verifiziert 02.10.2026.**
+
 #### Schnell-Referenz (zum Abfragen)
 
 - **Pull oder Push bei Prometheus?** → Pull: Prometheus holt die Werte selbst ab.
@@ -2758,3 +2818,6 @@ Alle drei Knoten laufen auf Kernel `6.8.0-146-generic`, Leader ist `ph-node1`, b
 - **Warum haben gleich gepatchte Knoten verschiedene Kernel?** → Unterschiedlich alte Paketlisten, dazu Phased Updates.
 - **Wie sieht man, was `apt` tun würde?** → `sudo apt -s upgrade` (Simulation).
 - **Warum braucht etcd Ubuntu Pro?** → Es liegt in `universe`, Sicherheitsupdates dort nur über `esm-apps`.
+- **Verteilt `timedatectl` die Zeitzone im Cluster?** → Nein, jede VM einzeln.
+- **Muss `edit-config` auf dem Leader laufen?** → Nein, es schreibt nach etcd, jeder Patroni liest selbst.
+- **Wann fällt ein Tippfehler in einem Reload-Parameter auf?** → Erst beim nächsten Neustart, dann startet PostgreSQL nicht.
