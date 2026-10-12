@@ -2203,6 +2203,25 @@ done
 
 *(Harmlose Meldung beim Testen mit `| head -5`: `curl: (23) Failure writing output to destination` — `head` schließt die Leitung nach fünf Zeilen, curl will aber weiterschreiben.)*
 
+Sichtbar werden diese Metriken im Grafana-Dashboard *Node Exporter Full* (Import-ID 1860), hier für `ph-node1` über sechs Stunden:
+
+![Grafana Node Exporter Full für ph-node1: Zeiger für CPU, Last, RAM, Root-FS sowie Verlauf von CPU, Speicher, Netz und Platte](./images/grafana-node-exporter.png)
+
+Ablesbar ohne eine einzige Zeile Shell: 2 vCPU kaum ausgelastet, 4 GiB RAM zu knapp 15 % belegt, kein Swap eingerichtet (deshalb `N/A`), und die Root-Partition mit 10 GiB zu **69,5 %** voll.
+
+#### Befund: Die Root-Partition läuft voll
+
+Am 02.10. meldete der Login-Banner von `ph-node2` noch `Usage of /: 53.9% of 9.75GB`, zehn Tage später zeigt das Dashboard für `ph-node1` 69,5 %. Zwei Ursachen liegen nahe: das WAL-Archiv unter `/var/lib/postgresql/wal_archive` wächst mit jeder Änderung, und nach dem Patchen liegen alte Kernel auf der Platte. Ursache genau messen:
+
+```bash
+sudo du -sh /var/lib/postgresql/wal_archive /var/lib/postgresql/16/main /boot
+dpkg -l 'linux-image-6*' | grep ^ii
+```
+
+Gegenmittel in drei Stufen: alte Kernel mit `sudo apt autoremove` entfernen, das logische Volume per `lvextend` auf die volle 20-GB-Platte vergrößern und langfristig eine Aufbewahrungsregel für das WAL-Archiv festlegen. Ohne Regel wächst ein Archiv, bis die Platte voll ist, und dann bleibt PostgreSQL stehen.
+
+> **Merke:** Platte voll ist einer der häufigsten Gründe, warum eine PostgreSQL-Instanz stehen bleibt. Ein Alarm bei 85 % Füllstand gehört zu den ersten, die man einrichtet.
+
 ### 17.4 Patroni-Metriken
 
 Patroni liefert Prometheus-Metriken direkt über seine REST-API:
@@ -2837,6 +2856,7 @@ Beim Reload ist ein ungültiger Wert harmlos: PostgreSQL meldet einen Fehler im 
 - **Welches Recht braucht der Exporter?** → Mitgliedschaft in `pg_monitor`.
 - **Warum `\password` statt `ALTER ROLE … PASSWORD`?** → Kein Klartext in History und Server-Log.
 - **Warum zeigt sich ein falsches Passwort oft erst später?** → PostgreSQL prüft nur beim Verbindungsaufbau.
+- **Root-FS bei 69,5 % – was füllt die Platte?** → WAL-Archiv und alte Kernel; `du -sh`, `apt autoremove`, `lvextend`, Archiv-Aufbewahrung.
 - **Was prüft `promtool check config`?** → Nur die Syntax, nicht die Erreichbarkeit.
 - **Was macht `== 1` in PromQL?** → Filtert auf Zeitreihen mit Wert 1.
 - **Startet Grafana nach der Installation automatisch?** → Nein, bei Paketen aus dem Grafana-Repository nicht.

@@ -157,7 +157,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 ### 🔜 Als Nächstes
 
 - [ ] Eigenes HA-Dashboard in Grafana: Leader-Status, Replikations-Lag, Cache-Hit-Ratio, Connections
-- [ ] Platten der Knoten per `lvextend` auf volle Größe erweitern (WAL-Archiv wächst)
+- [ ] **Vorrangig:** Platten der Knoten per `lvextend` auf volle Größe erweitern, Root-FS bereits bei ~70 % (WAL-Archiv, alte Kernel)
 - [ ] Lasttest mit `pgbench` von `ph-monitor` aus (getrennter Lastgenerator), live im Dashboard
 - [ ] Failover unter Last, im Dashboard sichtbar gemacht
 - [ ] Basis-Tuning (`shared_buffers` u. a.) per `patronictl edit-config` und rollierendem Restart

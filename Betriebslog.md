@@ -10,6 +10,7 @@ Neueste Einträge oben. Zeiten in UTC, wo sie aus Systemausgaben stammen. Detail
 
 | Datum | Knoten | Aktion | Grund | Ergebnis | Doku |
 |---|---|---|---|---|---|
+| 12.10.2026 | ph-node1 | Befund im Grafana-Dashboard: Root-FS 69,5 % belegt | Screenshot für die Doku | am 02.10. noch 53,9 % (ph-node2); Ursache noch zu messen, `lvextend` vorgezogen | Teil 17.3 |
 | 12.10.2026 | ph-monitor | Diagnose: Prometheus-Weboberfläche liefert `404` | Screenshot der Targets für die Doku | Ursache Ubuntu-Paket `+ds` ohne UI; 11/11 Ziele `up` per API und Grafana bestätigt, keine Änderung am System | Teil 17.6 |
 | 02.10.2026 | Cluster | `log_timezone` korrigiert (`Europ/Berlin` → `Europe/Berlin`) | Tippfehler im ersten `edit-config`, hätte beim nächsten Neustart den Start verhindert | `SHOW` zeigt `Europe/Berlin`, kein Pending restart | Teil 17.11 |
 | 02.10.2026 | Cluster | `timezone` und `log_timezone` auf `Europe/Berlin` per `patronictl edit-config` | PostgreSQL stand weiter auf `Etc/UTC` | per Reload übernommen, kein Neustart nötig | Teil 17.11 |
