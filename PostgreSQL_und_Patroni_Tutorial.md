@@ -2222,6 +2222,62 @@ Gegenmittel in drei Stufen: alte Kernel mit `sudo apt autoremove` entfernen, das
 
 > **Merke:** Platte voll ist einer der häufigsten Gründe, warum eine PostgreSQL-Instanz stehen bleibt. Ein Alarm bei 85 % Füllstand gehört zu den ersten, die man einrichtet.
 
+#### Inventur auf `ph-node2`
+
+Erst messen, dann handeln. Wer die Platte vergrößert, ohne die Ursache zu kennen, steht in ein paar Wochen wieder am selben Punkt.
+
+```bash
+df -h /
+sudo du -xh --max-depth=1 / 2>/dev/null | sort -h | tail -8
+sudo grep data_dir /etc/patroni.yml
+sudo du -sh /var/lib/postgresql/16/patroni /var/lib/postgresql/wal_archive /var/log /var/cache/apt /usr/src
+journalctl --disk-usage
+sudo vgs
+```
+
+| Bereich | Größe | Anteil an 6,3 GB |
+|---|---|---|
+| Betriebssystem `/usr` (davon 311 MB Kernel-Header in `/usr/src`) | 3,1 GB | ~49 % |
+| Datenbank `/var/lib/postgresql/16/patroni` | 1,2 GB | ~19 % |
+| WAL-Archiv | 0,88 GB | ~14 % |
+| `/var/log` (davon Journal 390 MB) | 0,51 GB | ~8 % |
+| apt-Paket-Cache | 0,2 GB | ~3 % |
+| Rest in `/var` | ~0,4 GB | ~6 % |
+
+Drei Erkenntnisse:
+
+- Das eigentliche Datenverzeichnis steht in `data_dir` der `patroni.yml`: `/var/lib/postgresql/16/patroni`. Der Ordner `16/main` mit 39 MB ist ein unbenutztes Überbleibsel der Paketinstallation.
+- `/boot` taucht bei `du -x` nicht auf, es ist eine eigene Partition und belastet `/` nicht.
+- Fast die Hälfte belegt das Betriebssystem. 10 GB sind für einen Datenbankserver schlicht knapp. Wachsen werden Datenbank und WAL-Archiv.
+
+`sudo vgs` zeigte in der Spalte `VFree` 8,22 GB, die der Ubuntu-Installer ungenutzt gelassen hatte.
+
+#### Erweitern im laufenden Betrieb
+
+```bash
+sudo lvextend -r -l +100%FREE /dev/ubuntu-vg/ubuntu-lv
+df -h /
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `-l +100%FREE` | den gesamten freien Platz der Volume Group hinzufügen |
+| `-r` | das Dateisystem (ext4) gleich mitvergrößern, sonst wäre nur das Volume größer |
+| `/dev/ubuntu-vg/ubuntu-lv` | das logische Volume, auf dem `/` liegt |
+
+```
+Filesystem                         Size  Used Avail Use% Mounted on
+/dev/mapper/ubuntu--vg-ubuntu--lv   18G  6,3G   11G  38% /
+```
+
+Kein Neustart, kein Switchover, PostgreSQL hat davon nichts bemerkt. Ein zweiter Aufruf meldet nur `Nothing to do`, der Befehl ist gefahrlos wiederholbar.
+
+Erwartet waren rund 35 % (6,3 von 18 GB), angezeigt werden 38 %. Der Unterschied: ext4 reserviert 5 % der Fläche für root, damit das System auch bei voller Platte arbeitsfähig bleibt. `df` berechnet Use% als Used / (Used + Avail), und die Reserve fehlt im Nenner.
+
+> **Merke:** `lvextend -r` vergrößert Volume und Dateisystem in einem Schritt und im laufenden Betrieb. Platz schafft das nur einmal. Was dauerhaft wächst, braucht eine Regel, beim WAL-Archiv eine Aufbewahrungsfrist.
+
+**Verifiziert 12.10.2026 (ph-node2).**
+
 ### 17.4 Patroni-Metriken
 
 Patroni liefert Prometheus-Metriken direkt über seine REST-API:
@@ -2856,6 +2912,8 @@ Beim Reload ist ein ungültiger Wert harmlos: PostgreSQL meldet einen Fehler im 
 - **Welches Recht braucht der Exporter?** → Mitgliedschaft in `pg_monitor`.
 - **Warum `\password` statt `ALTER ROLE … PASSWORD`?** → Kein Klartext in History und Server-Log.
 - **Warum zeigt sich ein falsches Passwort oft erst später?** → PostgreSQL prüft nur beim Verbindungsaufbau.
+- **Erweitert `lvextend` auch das Dateisystem?** → Nur mit `-r`, sonst bleibt `df` unverändert.
+- **Warum 38 % statt 35 % nach dem Erweitern?** → ext4 reserviert 5 % für root.
 - **Root-FS bei 69,5 % – was füllt die Platte?** → WAL-Archiv und alte Kernel; `du -sh`, `apt autoremove`, `lvextend`, Archiv-Aufbewahrung.
 - **Was prüft `promtool check config`?** → Nur die Syntax, nicht die Erreichbarkeit.
 - **Was macht `== 1` in PromQL?** → Filtert auf Zeitreihen mit Wert 1.

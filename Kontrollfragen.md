@@ -488,6 +488,12 @@ Der Ubuntu-Installer nutzt bei LVM nur etwa die Hälfte. Prüfen mit `sudo vgs` 
 **F: Was muss vor dem Klonen eines Templates passieren, was danach?**
 Vorher: alles Identische (Pakete), Dienste wie etcd/PostgreSQL stoppen und Daten leeren. Danach pro Knoten: Hostname, IP, `machine-id`, SSH-Host-Keys, knotenspezifische Config.
 
+**F: Wie findet man heraus, was eine Partition füllt?**
+Von grob nach fein messen: `df -h /` für den Füllstand, `du -xh --max-depth=1 /` für die großen Ordner (`-x` bleibt auf der Partition), dann gezielt `du -sh` auf die Verdächtigen und `journalctl --disk-usage`. Beim Datenverzeichnis vorher in der `patroni.yml` nachsehen, wo es wirklich liegt.
+
+**F: Wie vergrößert man eine LVM-Partition im laufenden Betrieb?**
+`sudo vgs` zeigt freien Platz (VFree), `sudo lvextend -r -l +100%FREE /dev/ubuntu-vg/ubuntu-lv` erweitert Volume und Dateisystem in einem Schritt. Kein Neustart nötig, auch auf dem Leader.
+
 **F: Warum Full Clone statt Linked Clone?**
 Ein Linked Clone hängt dauerhaft am Template — für unabhängige Knoten ungeeignet.
 

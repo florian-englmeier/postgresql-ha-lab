@@ -157,7 +157,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 ### 🔜 Als Nächstes
 
 - [ ] Eigenes HA-Dashboard in Grafana: Leader-Status, Replikations-Lag, Cache-Hit-Ratio, Connections
-- [ ] **Vorrangig:** Platten der Knoten per `lvextend` auf volle Größe erweitern, Root-FS bereits bei ~70 % (WAL-Archiv, alte Kernel)
+- [ ] Platten per `lvextend` auf volle Größe erweitern: ph-node2 ✅ (18 GB, 38 %), ph-node1 und ph-node3 offen
 - [ ] Lasttest mit `pgbench` von `ph-monitor` aus (getrennter Lastgenerator), live im Dashboard
 - [ ] Failover unter Last, im Dashboard sichtbar gemacht
 - [ ] Basis-Tuning (`shared_buffers` u. a.) per `patronictl edit-config` und rollierendem Restart
@@ -186,7 +186,7 @@ Dieses Lab ist ein lebendes Projekt — der Cluster steht, die Grundlagen sind d
 Der vollständige Lernweg inkl. aller Konzepte, Befehle und Entscheidungen steht im [Tutorial-Dokument](./PostgreSQL_und_Patroni_Tutorial.md).
 
 Zum Wiederholen:
-- [Kontrollfragen](./Kontrollfragen.md) — 155 Fragen mit Antworten, nach Themen sortiert (A–M)
+- [Kontrollfragen](./Kontrollfragen.md) — 157 Fragen mit Antworten, nach Themen sortiert (A–M)
 - [Merksätze](./Merksaetze.md) — die wichtigsten Faustregeln und Lehren aus dem Lab
 - [Betriebslog](./Betriebslog.md) — jede Änderung am Cluster mit Grund und Ergebnis
 
