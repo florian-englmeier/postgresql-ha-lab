@@ -8,10 +8,10 @@ secrets/
 *.key
 .pgpass
 
-# --- Claude Code: persönlich / lokal ---
+# --- Claude Code: nur lokal (Sicherung im privaten Repo) ---
+CLAUDE.md
 CLAUDE.local.md
-.claude/settings.local.json
-.claude/worktrees/
+.claude/
 
 # --- Sonstiges ---
 .DS_Store

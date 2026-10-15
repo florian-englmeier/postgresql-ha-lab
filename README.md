@@ -164,6 +164,16 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 ---
 
+## Lessons Learned
+
+- **Replikation ersetzt kein Backup.** Replikation schützt vor dem Ausfall eines Knotens, nicht vor einem versehentlichen `DROP TABLE`. Deshalb Base Backup plus WAL-Archivierung für Point-in-Time-Recovery, und ein Backup gilt erst als Backup, wenn der Restore getestet ist. Weil der Leader wandert, muss das WAL-Archiv auf allen drei Knoten funktionieren.
+- **Patroni besitzt die PostgreSQL-Konfiguration.** Parameter werden nur über `patronictl edit-config` geändert, nie per `ALTER SYSTEM` oder in der `postgresql.conf`. Entscheidend ist, ob ein Parameter einen Reload oder einen Restart braucht. Restart-Parameter werden rollierend angewendet: erst die Replicas, der Leader per Switchover zuletzt. Den Diff vor dem Bestätigen lesen und danach mit `SHOW` prüfen, denn ein Tippfehler fällt sonst erst beim nächsten Neustart auf.
+- **Patchen kann einen Failover auslösen.** `needrestart` startet nach `apt upgrade` automatisch `patroni.service` neu, auf dem Leader ist das ein ungeplanter Failover. Daher rollierendes Patchen mit Switchover vor dem Leader und anschließend Kernel-Versionen vergleichen, weil Phased Updates zu Versionsdrift zwischen den Knoten führen.
+- **Benchmarks im HA-Cluster brauchen den Leader-Zustand.** Läuft der Lastgenerator auf dem Leader-Knoten, konkurrieren beide um dieselben CPUs und die Messung kippt. Leader-Position und Parameter werden zu jedem Lauf protokolliert, pro Schritt ändert sich nur eine Variable.
+- **Monitoring misst jeden Knoten direkt.** Anwendungen gehen über die VIP, Exporter nicht, sonst wird nur der Leader gemessen. Alarme sitzen auf Symptomen (kein oder zwei Leader, `pg_up == 0`, WAL-Archiv scheitert) und haben eine Wartezeit, weil Scrape-Intervalle kurze Ereignisse verzerren. Für den genauen Ablauf eines Failovers sind `patronictl history` und die Logs maßgeblich.
+
+---
+
 ## Roadmap
 
 Dieses Lab ist ein lebendes Projekt — der Cluster steht, die Grundlagen sind dokumentiert. Geplante Erweiterungen:
@@ -185,10 +195,7 @@ Dieses Lab ist ein lebendes Projekt — der Cluster steht, die Grundlagen sind d
 
 Der vollständige Lernweg inkl. aller Konzepte, Befehle und Entscheidungen steht im [Tutorial-Dokument](./PostgreSQL_und_Patroni_Tutorial.md).
 
-Zum Wiederholen:
-- [Kontrollfragen](./Kontrollfragen.md) — 157 Fragen mit Antworten, nach Themen sortiert (A–M)
-- [Merksätze](./Merksaetze.md) — die wichtigsten Faustregeln und Lehren aus dem Lab
-- [Betriebslog](./Betriebslog.md) — jede Änderung am Cluster mit Grund und Ergebnis
+Jede Änderung am laufenden Cluster steht mit Grund und Ergebnis im [Betriebslog](./Betriebslog.md).
 
 Architektur inspiriert von [technotim.live — PostgreSQL High Availability](https://technotim.live/posts/postgresql-high-availability/), eigenständig auf Proxmox umgesetzt und dokumentiert.
 
