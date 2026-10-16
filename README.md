@@ -149,6 +149,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 - [x] Prometheus mit 11/11 Zielen `UP`
 - [x] Grafana mit Prometheus-Datenquelle, Dashboards 1860 (Node Exporter Full) und 9628 (PostgreSQL)
 - [x] Befund aus dem Dashboard: `shared_buffers` und weitere Parameter stehen noch auf Werkseinstellung
+- [x] Root-FS bei ~70 %: Inventur (OS, DB, WAL-Archiv, Logs) und `lvextend` auf allen drei Knoten im laufenden Betrieb, 9,8 → 18 GB
 
 **Kernziel erreicht:** vollautomatisierter 3-Knoten-Failover ohne manuellen Eingriff, Ende-zu-Ende verifiziert — inklusive Backup/PITR, Performance-Nachweis, Query-Analyse und Monitoring.
 
@@ -157,7 +158,6 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 ### 🔜 Als Nächstes
 
 - [ ] Eigenes HA-Dashboard in Grafana: Leader-Status, Replikations-Lag, Cache-Hit-Ratio, Connections
-- [ ] Platten per `lvextend` auf volle Größe erweitern: ph-node2 ✅ (18 GB, 38 %), ph-node1 und ph-node3 offen
 - [ ] Lasttest mit `pgbench` von `ph-monitor` aus (getrennter Lastgenerator), live im Dashboard
 - [ ] Failover unter Last, im Dashboard sichtbar gemacht
 - [ ] Basis-Tuning (`shared_buffers` u. a.) per `patronictl edit-config` und rollierendem Restart

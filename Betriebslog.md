@@ -10,6 +10,9 @@ Neueste Einträge oben. Zeiten in UTC, wo sie aus Systemausgaben stammen. Detail
 
 | Datum | Knoten | Aktion | Grund | Ergebnis | Doku |
 |---|---|---|---|---|---|
+| 15.10.2026 | ph-monitor | **Störung (behoben):** nach dem Reboot zeigen alle Grafana-Dashboards „datasource not found“ | Grafana 13 aktualisiert beim Start das Prometheus-Plugin (13.2.2 → 13.2.3): alte Version gestoppt, Download von `storage.googleapis.com` scheitert, weil Pi-hole die Domain blockiert (`getent` → `0.0.0.0`/`::`; Quelle laut `pihole -q`: Blockliste *phishing.army extended*) | Domain in Pi-hole v6 freigegeben (`pihole allow storage.googleapis.com`), DNS-Cache geleert, Grafana neu gestartet: Plugin geladen, beide Dashboards wieder aktiv. Offen: Plugin-Auto-Update beim Start abschalten | Postmortem folgt |
+| 15.10.2026 | ph-monitor | `apt upgrade` + Reboot | Login-Banner meldete ausstehende Updates und Neustart; kein Cluster-Knoten, daher ohne Switchover | Prometheus und Grafana wieder aktiv, kurze Lücke im Monitoring | – |
+| 12.10.2026 | ph-node1, ph-node3 | `lvextend -r -l +100%FREE` wie auf ph-node2 | einheitliche Plattengröße im Cluster | am 15.10. per Prometheus-Abfrage bestätigt: alle drei Knoten 19,1 GB (dezimal, entspricht 18 GiB) | Teil 17.3 |
 | 12.10.2026 | ph-node2 | `lvextend -r -l +100%FREE`: Root-FS 9,8 → 18 GB | Root-FS bei 69 %; Inventur: OS 3,1 GB, DB 1,2 GB, WAL-Archiv 0,88 GB, Logs 0,51 GB | 38 % belegt, 11 GB frei, im laufenden Betrieb ohne Neustart | Teil 17.3 |
 | 12.10.2026 | ph-node1 | Befund im Grafana-Dashboard: Root-FS 69,5 % belegt | Screenshot für die Doku | am 02.10. noch 53,9 % (ph-node2); Inventur und Erweiterung siehe Zeile darüber | Teil 17.3 |
 | 12.10.2026 | ph-monitor | Diagnose: Prometheus-Weboberfläche liefert `404` | Screenshot der Targets für die Doku | Ursache Ubuntu-Paket `+ds` ohne UI; 11/11 Ziele `up` per API und Grafana bestätigt, keine Änderung am System | Teil 17.6 |
