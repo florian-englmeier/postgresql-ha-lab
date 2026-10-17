@@ -3345,9 +3345,9 @@ Visualisierung **Stat**, Legend **Custom** `{{name}}` (Patroni liefert das Label
 
 #### Das fertige Dashboard
 
-![Eigenes Dashboard PostgreSQL HA-Cluster mit allen vier Panels](images/grafana-ha-dashboard.png)
+![Eigenes Dashboard PostgreSQL HA-Cluster mit allen sechs Panels](images/grafana-ha-dashboard.png)
 
-Vier Panels, zwei Zielgruppen: die Ampel oben links für den Operator, Lag, Cache-Hit-Ratio und Connections für den DBA. **Fertiggestellt 17.10.2026.**
+Sechs Panels, zwei Zielgruppen und ein Zweck: die Ampel oben links für den Operator, Lag, Cache-Hit-Ratio und Connections für den DBA, TPS und aktueller Leader als Sensoren für Lasttest und Failover. **Fertiggestellt 17.10.2026.**
 
 #### Schnell-Referenz (zum Abfragen)
 

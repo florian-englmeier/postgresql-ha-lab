@@ -70,9 +70,9 @@ Rollierendes Patchen aller drei Knoten: Der Leader wird per `patronictl switchov
 
 ### Live-Nachweis: Eigenes HA-Dashboard für den Betrieb
 
-![Eigenes Grafana-Dashboard „PostgreSQL HA-Cluster“: Leader-Status, Replikations-Lag, Cache-Hit-Ratio, Connections](./images/grafana-ha-dashboard.png)
+![Eigenes Grafana-Dashboard „PostgreSQL HA-Cluster“: Leader-Status, Replikations-Lag, Cache-Hit-Ratio, Connections, TPS, aktueller Leader](./images/grafana-ha-dashboard.png)
 
-Neben den Community-Dashboards (Dutzende Panels zum Stöbern) ein selbst gebautes Dashboard, das eine Frage beantwortet: **Ist der Cluster gesund — und wenn nicht, wo klemmt es?** Oben links die Ampel für den Bereitschaftsdienst (`sum(patroni_primary)`: `OK` / `KEIN LEADER` / `SPLIT-BRAIN` / `KEINE DATEN`), daneben die Detailkurven für den DBA: Byte-Lag je Replica mit Warnlinie bei einem WAL-Segment (16 MiB), Cache-Hit-Ratio je Knoten mit Schwellen bei 95 / 99 %, Connections mit Warnlinie bei 80 % von `max_connections`. Aufbau, PromQL und Stolpersteine (Standard-Thresholds als „Immer-grün-Ampel“, Lag in Sekunden vs. Bytes, Rohwert vs. Anzeige) in [Teil 17.12](./PostgreSQL_und_Patroni_Tutorial.md#1712-eigenes-ha-dashboard).
+Neben den Community-Dashboards (Dutzende Panels zum Stöbern) ein selbst gebautes Dashboard, das eine Frage beantwortet: **Ist der Cluster gesund — und wenn nicht, wo klemmt es?** Oben links die Ampel für den Bereitschaftsdienst (`sum(patroni_primary)`: `OK` / `KEIN LEADER` / `SPLIT-BRAIN` / `KEINE DATEN`), daneben die Detailkurven für den DBA: Byte-Lag je Replica mit Warnlinie bei einem WAL-Segment (16 MiB), Cache-Hit-Ratio je Knoten mit Schwellen bei 95 / 99 %, Connections mit Warnlinie bei 80 % von `max_connections`. Dazu zwei Sensoren für Lasttest und Failover: Transaktionen pro Sekunde je Knoten und der Name des aktuellen Leaders, der beim Failover sichtbar wechselt. Aufbau, PromQL und Stolpersteine (Standard-Thresholds als „Immer-grün-Ampel“, Lag in Sekunden vs. Bytes, Rohwert vs. Anzeige) in [Teil 17.12](./PostgreSQL_und_Patroni_Tutorial.md#1712-eigenes-ha-dashboard).
 
 ---
 
@@ -87,7 +87,7 @@ Neben den Community-Dashboards (Dutzende Panels zum Stöbern) ein selbst gebaute
 | **keepalived** | Virtuelle IP (VRRP) als stabiler Einstiegspunkt |
 | **Prometheus** | Sammelt Metriken von 11 Zielen (Pull-Prinzip, 15-s-Intervall) |
 | **node_exporter / postgres_exporter** | Betriebssystem- und Datenbank-Metriken je Knoten; Exporter mit eigener `pg_monitor`-Rolle |
-| **Grafana** | Dashboards: Node Exporter Full (1860), PostgreSQL (9628); eigenes HA-Dashboard `PostgreSQL HA-Cluster` (Leader-Status, Lag, Cache-Hit-Ratio, Connections) |
+| **Grafana** | Dashboards: Node Exporter Full (1860), PostgreSQL (9628); eigenes HA-Dashboard `PostgreSQL HA-Cluster` (Leader-Status, aktueller Leader, Lag, Cache-Hit-Ratio, Connections, TPS) |
 | **Pi-hole** | Lokaler DNS: `pg-vip.home.arpa` → VIP |
 | **Proxmox VE** | Virtualisierungsplattform für die 3 Cluster-Knoten |
 | **Ubuntu Server** | 24.04 LTS, je Knoten |
@@ -155,7 +155,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 - [x] Prometheus mit 11/11 Zielen `UP`
 - [x] Grafana mit Prometheus-Datenquelle, Dashboards 1860 (Node Exporter Full) und 9628 (PostgreSQL)
 - [x] Befund aus dem Dashboard: `shared_buffers` und weitere Parameter stehen noch auf Werkseinstellung
-- [x] Eigenes HA-Dashboard in Grafana: Leader-Status (inkl. Split-Brain-Erkennung), Replikations-Lag, Cache-Hit-Ratio, Connections
+- [x] Eigenes HA-Dashboard in Grafana: Leader-Status (inkl. Split-Brain-Erkennung), aktueller Leader, Replikations-Lag, Cache-Hit-Ratio, Connections, TPS
 - [x] Root-FS bei ~70 %: Inventur (OS, DB, WAL-Archiv, Logs) und `lvextend` auf allen drei Knoten im laufenden Betrieb, 9,8 → 18 GB
 
 **Kernziel erreicht:** vollautomatisierter 3-Knoten-Failover ohne manuellen Eingriff, Ende-zu-Ende verifiziert — inklusive Backup/PITR, Performance-Nachweis, Query-Analyse und Monitoring.
