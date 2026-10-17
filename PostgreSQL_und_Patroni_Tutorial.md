@@ -2925,6 +2925,48 @@ Visualisierung **Stat**, Thresholds: Base rot, 1 grün, 2 rot.
 
 > **Merksatz:** Ein ausgefallener Knoten meldet nicht 0, sondern gar nichts — seine Zeitreihe fehlt. Die Summe bleibt trotzdem aussagekräftig, solange mindestens ein Knoten antwortet. Deshalb braucht das Panel zusätzlich ein Mapping für „keine Daten“.
 
+#### Warum ein eigenes Dashboard? Zielgruppe statt Vollständigkeit
+
+| Zielgruppe | Braucht | Dashboard |
+|---|---|---|
+| Operator / Bereitschaft | „Ist alles gut? Wenn nein, was?“ in zwei Sekunden | wenige große Ampel-Kacheln (OK / KEIN LEADER / SPLIT-BRAIN), keine Query nötig |
+| DBA / Admin | „Warum? Wo genau?“ | Detailkurven: Lag, WAL-Durchsatz, Connections, Cache-Hit |
+| Community-Dashboards (9628, 1860) | „Alles über alles“ | Dutzende Panels — gut zum Stöbern, schlecht im Ernstfall nachts um drei |
+
+Die Daten sind überall dieselben (die Targets in Prometheus), nur die Sicht wird je Rolle zugeschnitten — eine Quelle, viele Views, wie `CREATE VIEW` in SQL.
+
+> **Merksatz:** Ein Dashboard beantwortet die Frage seiner Zielgruppe, nicht alle Fragen auf einmal.
+
+#### Panel 1 in Grafana bauen — Schritt für Schritt (Grafana 12/13)
+
+Begriffe vorab: Ein **Dashboard** ist die ganze Seite (das Armaturenbrett), ein **Panel** eine einzelne Kachel darauf (ein Instrument). Eigene Panels gehören in ein **eigenes** Dashboard, nicht in importierte (9628, 1860): Beim Re-Import wären Änderungen weg, und fürs Portfolio zählt, was man selbst gebaut hat.
+
+1. **Dashboards → New → New dashboard.** Layout *Auto grid* belassen.
+2. Rechts in der schmalen Leiste das blaue **➕** → **Panel**. Achtung: Das Menü *Choose variable type* ist für Dashboard-Variablen (Dropdowns) — mit ✕ schließen.
+3. **Title:** `Leader-Status (Anzahl Primaries)` → **Edit visualization**.
+4. Datenquelle *prometheus*, Editor auf **Code**, Query `sum(patroni_primary)` → **Run queries**. Vorschau: Linie bei 1.
+5. Visualisierung **Stat** wählen (rechts *Suggestions* oder *All visualizations* → `stat`).
+6. Früh speichern: **Save**, Titel `PostgreSQL HA-Cluster`. Grafana führt eine Versionshistorie mit Kommentar (*Dashboard settings → Versions*, inkl. Diff) — ähnlich wie Git.
+7. **Thresholds** (Lupe 🔍 rechts oben → `thresholds`): Base 🔴, `1` 🟢, `2` 🔴, Modus **Absolute**.
+8. **Value mappings** → *Add value mappings* → Typ **Value**: `1` → `OK` (grün), `0` → `KEIN LEADER` (rot). Für Split-Brain Typ **Range** `2`–`99` → `SPLIT-BRAIN`, für fehlende Daten Typ **Special** (*Null/NaN*) → `KEINE DATEN`.
+
+| Mapping-Typ | Wofür |
+|---|---|
+| Value | genau eine Zahl übersetzen |
+| Range | einen Zahlenbereich übersetzen |
+| Regex | Text per Muster umschreiben |
+| Special | null, NaN, leer, boolesche Werte |
+
+#### Stolpersteine beim Bauen
+
+- **Die Standard-Thresholds sind eine Falle.** Grafana setzt *Base grün, 80 rot*. Für `sum(patroni_primary)` hieße das: 0 (kein Leader) und 2 (Split-Brain) leuchten **grün**. Eine Ampel, die immer grün ist, ist schlimmer als keine.
+- **Thresholds liest man von unten nach oben:** Jeder Eintrag gilt ab seinem Wert bis zum nächsthöheren.
+- **Absolute vs. Percentage:** Absolute = echte Messwerte; Percentage = Prozent zwischen Min und Max des Panels.
+- **Value mapping: Text im falschen Feld.** Die linke Spalte *Value* ist die **Bedingung** (der Messwert, z. B. `1`), die mittlere *Display text* die Anzeige (`OK`). Steht `OK` links, sucht Grafana nach einem Messwert „OK“, den Prometheus nie liefert — die Kachel zeigt weiter `1`. Denkhilfe: `CASE WHEN wert = 1 THEN 'OK'`.
+- **Special-Mapping für fehlende Daten:** Nicht als *Value* „keine Daten“ eintippen (gleicher Fehler wie oben), sondern Typ **Special** wählen — links erscheint dann ein Auswahlmenü, dort **Null + NaN**. Bei Value/Range tippt man links eine Zahl, bei Special wählt man einen *Zustand*.
+- **Mapping-Farben schlagen Thresholds.** Eine rote Farbe am Mapping `OK` färbt die Kachel rot, egal was die Thresholds sagen. Farben deshalb bewusst setzen (OK grün, KEIN LEADER rot) oder leer lassen.
+- **Versehentliche leere Query B** (Zähler bei *Queries* steht auf 2) mit dem Mülleimer der Zeile löschen.
+
 #### Panel 2: Wer ist Leader?
 
 ```promql
@@ -3043,7 +3085,121 @@ Im Graphen sind nur drei Linien zu sehen, obwohl die Legende vier Jobs nennt: `p
 
 Zum Vergleich: Der Filter `up{job="postgres"}` liefert dagegen drei Zeilen *mit* IP — Filtern behält die einzelnen Zeitreihen, Zählen fasst sie zusammen.
 
-**Panel 1 und 2 verifiziert 17.10.2026** (Leader ph-node2, Anzeige `OK`).
+#### Panel 3: Replikations-Lag — Bytes oder Sekunden?
+
+Zwei Messarten:
+
+| Messart | Berechnung | Leader schreibt 1 h lang nichts, Replikation gesund |
+|---|---|---|
+| **Bytes** | WAL-Position Leader − eingespielte WAL-Position Replica | bleibt **0** — korrekt |
+| **Sekunden** | `now() − pg_last_xact_replay_timestamp()` auf der Replica | wächst auf **3600 s** — Fehlalarm |
+
+Der Grund: Die Sekunden-Messung liefert das Alter der zuletzt eingespielten *Transaktion*, nicht den Zeitpunkt der letzten erfolgreichen Replikationsprüfung. Ohne neue Transaktionen bleibt der Zeitstempel stehen, während `now()` weiterläuft.
+
+> **Merksatz:** Lag in Sekunden misst „wie alt ist die letzte Änderung“, nicht „wie weit hinkt die Replica hinterher“. Für Alarme auf einem ruhigen Cluster ist der Byte-Lag die ehrliche Größe.
+
+#### Die `patroni_xlog_*`-Metriken („xlog“ = alter Name für WAL)
+
+| Metrik | Bedeutung | sinnvoll auf |
+|---|---|---|
+| `patroni_xlog_location` | aktuelle Schreibposition im WAL (Byte-Offset) | Leader |
+| `patroni_xlog_received_location` | bis wohin WAL **empfangen** wurde | Replicas |
+| `patroni_xlog_replayed_location` | bis wohin WAL **eingespielt** wurde (erst dann sichtbar für Leser) | Replicas |
+| `patroni_xlog_replayed_timestamp` | Zeitstempel der zuletzt eingespielten Transaktion (→ Sekunden-Falle) | Replicas |
+| `patroni_xlog_paused` | Einspielen pausiert? (1/0) | Replicas |
+
+Patroni liefert alle fünf Metriken auf **allen** Knoten und füllt die für die aktuelle Rolle sinnlosen mit **0**. Im Lab (Leader ph-node2) spiegeln sich die beiden Abfragen exakt:
+
+| Knoten | `patroni_xlog_location` | `patroni_xlog_replayed_location` |
+|---|---|---|
+| ph-node1 (Replica) | 0 | 2 231 406 13x |
+| ph-node2 (Leader) | 2 231 406 13x | 0 |
+| ph-node3 (Replica) | 0 | 2 231 406 13x |
+
+Die Position ist ein Kilometerzähler: rund 2,2 GB WAL seit Cluster-Initialisierung. Gleiche Zahlen bei Leader und Replicas heißen Lag 0. Grafana markiert die Metriken als **Counter** und schlägt `rate()` vor — `rate(patroni_xlog_location[5m])` ergibt den WAL-Schreibdurchsatz in Bytes/s (Panel für den Lasttest). Für den Lag braucht man die Rohwerte.
+
+#### Die Lag-Query
+
+```promql
+scalar(max(patroni_xlog_location)) - (patroni_xlog_replayed_location > 0)
+```
+
+| Baustein | Aufgabe |
+|---|---|
+| `max(patroni_xlog_location)` | holt die Leader-Position heraus (alle anderen sind 0) — egal, wer gerade Leader ist |
+| `scalar(...)` | macht aus dem einzeiligen Ergebnis eine Zahl, die von jeder Zeile abgezogen werden kann |
+| `> 0` | Filter: wirft den Leader (replayed = 0) raus, sonst entstünde ein Fake-Lag von 2 GB |
+
+> **Bild zum Merken — das Tonband:** Das WAL ist ein endloses Tonband. Der Leader schreibt jede Änderung darauf, die Position seines Schreibkopfs ist `patroni_xlog_location`. Die Replica spielt das Band ab, ihr Lesekopf steht bei `patroni_xlog_replayed_location`. Die Differenz ist der Lag — **in Bytes, nicht in Zeit**. Ob 1 MB Lag eine Millisekunde oder eine Minute bedeutet, hängt davon ab, wie schnell gerade geschrieben wird. In PostgreSQL heißt die Bandposition **LSN** (Log Sequence Number), dort meist hexadezimal geschrieben (`0/8500ABCD`); Patroni rechnet sie in eine Dezimalzahl um.
+
+**Gegenprobe in SQL** (auf dem Leader, z. B. `psql -h 192.168.178.200 -p 5000 -U postgres`):
+
+```sql
+SELECT pg_current_wal_lsn()                        AS lsn_hex,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') AS bytes_seit_start;
+--   lsn_hex   | bytes_seit_start
+-- ------------+------------------
+--  0/85008E38 |       2231406136
+```
+
+Exakt Patronis Wert. `0x85008E38` = 2 231 369 728 + 36 408 = 2 231 406 136; das `0/` ist der obere 32-Bit-Teil und springt erst nach 4 GB WAL auf `1/`. `pg_wal_lsn_diff(a, b)` rechnet die Differenz zweier LSNs in Bytes — dieselbe Rechnung wie die Lag-Query, nur in SQL.
+
+#### Stolperstein: `SHOW TABLES` (MySQL-Reflex)
+
+```
+postgres=# SHOW TABLES;
+ERROR:  unrecognized configuration parameter "tables"
+```
+
+In PostgreSQL zeigt `SHOW` nur Konfigurationsparameter. Die MySQL-Befehle haben in `psql` Meta-Befehle als Gegenstück:
+
+| MySQL | PostgreSQL (psql) |
+|---|---|
+| `SHOW DATABASES;` | `\l` |
+| `USE titanic;` | `\c titanic` |
+| `SHOW TABLES;` | `\dt` |
+| `DESCRIBE tabelle;` | `\d tabelle` |
+| `SHOW VARIABLES LIKE 'max%';` | `SHOW max_connections;` bzw. `\dconfig max*` |
+
+**Verifiziert 17.10.2026.**
+
+> **Merksatz:** Metriken mit rollenabhängiger 0 nie blind verrechnen — erst die sinnlosen Zeilen herausfiltern.
+
+#### Panel 3 im Dashboard
+
+- Query: Lag-Query von oben, Visualisierung **Time series**, Titel `Replikations-Lag (Bytes)`
+- Legend: Custom `{{name}}`
+- Unit: `Data → bytes(IEC)` (zeigt `0 B`, `16 MiB` statt Rohzahlen)
+- Thresholds: Basis grün, rot ab `16777216` (16 MiB = ein WAL-Segment), *Show thresholds: As lines*
+
+- Axis → **Soft max** `20971520` (20 MiB), damit die Warnlinie sichtbar ist
+
+**Stolperstein: Warnlinie unsichtbar.** Grafana skaliert die Y-Achse nur nach den Daten (hier 0 bis 96 B), Thresholds zieht es nicht mit ein — die Linie bei 16 MiB lag rund 175 000-mal über dem Achsenende. Lösung **Soft max** statt **Max**:
+
+| Option | Verhalten |
+|---|---|
+| Max (hart) | Achse endet immer dort, größere Werte werden abgeschnitten — gefährlich |
+| Soft max | Achse reicht *mindestens* bis dort und wächst bei größeren Werten mit |
+
+Weitere Kleinigkeiten aus der Praxis: Die Lupe in den Panel-Optionen ist ein **Filter** („Matched 2/53 options“) — mit *Clear* kommen alle Abschnitte zurück. Werte übernimmt Grafana zuverlässig, wenn man danach außerhalb des Feldes klickt. Speicher-Messages wie Commit-Messages formulieren (*was* hat sich geändert), z. B. `Lag-Panel hinzugefügt (Bytes, Warnlinie 16 MiB)`.
+
+**Die orange Warnung „Selected metric is a counter. Consider rate()“** ist nur ein Hinweis. Patroni deklariert die Positionen als Counter, und meist will man bei Countern die Änderungsrate. Für den Lag zieht man aber bewusst zwei Stände voneinander ab — wie der Abstand zweier Autos aus ihren Kilometersteinen, nicht aus ihren Tachos. `rate()` braucht man erst für den WAL-Durchsatz.
+
+#### Lag lesen: Trend statt Größe
+
+Bild aus der Physik — ein Behälter mit Zu- und Ablauf: Zulauf = Leader schreibt WAL, Ablauf = Replica spielt ein, Füllstand = Lag.
+
+| Verlauf | Bedeutung |
+|---|---|
+| zappelt um einen kleinen Wert | Pipeline-Latenz (Netz, Platte, Einspielen) — Zulauf ≈ Ablauf, gesund |
+| Spitze, die wieder abfällt | kurzer Lastschub, Replica holt auf — okay |
+| **steigt stetig**, auch wenn noch klein | Ablauf < Zulauf — Replica holt nie auf; Failover verliert Daten, Leser sehen Altes, Leader hält WAL zurück (Replication Slot) bis zur vollen Platte |
+
+> **Merksatz:** Beim Lag zählt die Richtung, nicht die Höhe. Alarme deshalb als „Lag > X **für 5 Minuten**“, damit kurze Spitzen nicht auslösen.
+
+![Eigenes Dashboard PostgreSQL HA-Cluster mit Leader-Status OK](images/grafana-ha-leader-status.png)
+
+**Panel 1 verifiziert 17.10.2026:** Leader ph-node2, Kachel zeigt grün `OK`; Mappings `1`→OK, `0`→KEIN LEADER, `[2-99]`→SPLIT-BRAIN, `Null + NaN`→KEINE DATEN.
 
 #### Schnell-Referenz (zum Abfragen)
 
@@ -3084,3 +3240,15 @@ Zum Vergleich: Der Filter `up{job="postgres"}` liefert dagegen drei Zeilen *mit*
 - **`up` = 1, `pg_up` = 0 — wo liegt das Problem?** → Exporter läuft, Datenbank nicht erreichbar.
 - **Gauge vs. Counter?** → Momentwert (rauf und runter) vs. nur steigend; `rate()` nur auf Counter.
 - **`count by (postgres) (up)` liefert `{}` und 11 — warum?** → In `by (...)` gehört der Label-Name (`job`), nicht der Wert; ein unbekanntes Label gruppiert alles zusammen.
+- **Warum schlägt Lag in Sekunden auf einem ruhigen Cluster Alarm?** → Er misst das Alter der letzten Transaktion; ohne Schreiblast wächst er, obwohl nichts hinterherhinkt. Byte-Lag bleibt 0.
+- **Warum `> 0` in der Lag-Query?** → Der Leader meldet `replayed_location = 0`; ohne Filter erschiene bei ihm die gesamte WAL-Position als Lag.
+- **Was ergibt `rate()` auf `patroni_xlog_location`?** → WAL-Schreibdurchsatz in Bytes pro Sekunde.
+- **In welcher Einheit stehen `patroni_xlog_*_location`?** → Bytes (Position im WAL, die LSN), keine Zeit.
+- **`SHOW TABLES` in PostgreSQL?** → Gibt es nicht; `SHOW` liest Parameter. Tabellen listet `\dt`.
+- **Lag klein, aber stetig steigend — harmlos?** → Nein. Die Replica spielt langsamer ein, als der Leader schreibt, und holt nie auf.
+- **Warum Alarm mit „für 5 Minuten“?** → Kurze Lastspitzen sind normal; nur dauerhafter Lag ist ein Problem.
+- **Standard-Thresholds bei `sum(patroni_primary)`?** → Base grün/80 rot färbt auch 0 und 2 grün — unbrauchbar, selbst setzen.
+- **Value mapping zeigt weiter die Zahl?** → Text steht in der Bedingungsspalte *Value* statt in *Display text*.
+- **Wer gewinnt: Mapping-Farbe oder Threshold?** → Die Mapping-Farbe.
+- **Warum ein eigenes HA-Dashboard neben den Community-Dashboards?** → Zielgruppe: Der Operator braucht in zwei Sekunden eine Ampel, nicht 50 Panels.
+- **Warnlinie im Time-Series-Panel nicht zu sehen?** → Auto-Skalierung folgt nur den Daten; Axis → Soft max setzen (nicht Max, das schneidet ab).
