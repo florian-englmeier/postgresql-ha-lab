@@ -3174,6 +3174,10 @@ In PostgreSQL zeigt `SHOW` nur Konfigurationsparameter. Die MySQL-Befehle haben 
 
 - Axis → **Soft max** `20971520` (20 MiB), damit die Warnlinie sichtbar ist
 
+![Dashboard mit Leader-Status und Replikations-Lag, Warnlinie bei 16 MiB](images/grafana-ha-leader-lag.png)
+
+**Panel 3 verifiziert 17.10.2026:** Lag beider Replicas konstant 0 B, Warnlinie bei 16 MiB sichtbar.
+
 **Stolperstein: Warnlinie unsichtbar.** Grafana skaliert die Y-Achse nur nach den Daten (hier 0 bis 96 B), Thresholds zieht es nicht mit ein — die Linie bei 16 MiB lag rund 175 000-mal über dem Achsenende. Lösung **Soft max** statt **Max**:
 
 | Option | Verhalten |
