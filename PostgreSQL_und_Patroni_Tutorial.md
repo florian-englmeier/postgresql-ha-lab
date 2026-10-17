@@ -3310,6 +3310,39 @@ Die Anzeige ist nur so frisch wie das langsamere Zahnrad. Für ein Operator-Dash
 
 Formulierung fürs Gespräch: „`numbackends` zählt nur an eine Datenbank gebundene Sessions. Die WAL-Sender der physischen Replikation hängen an keiner Datenbank, deshalb sieht der Leader dort nicht mehr Verbindungen als die Replicas.“
 
+#### Panel 5: Transaktionen pro Sekunde (TPS) — Sensor für den Lasttest
+
+Vor einem Versuch die Sensoren anbringen: Die vier Zustands-Panels zeigen nicht, wie viel Arbeit geleistet wird. Für Lasttest und Failover unter Last kommen deshalb TPS und „Wer ist Leader?“ dazu.
+
+```promql
+sum by (instance) (rate(pg_stat_database_xact_commit[1m]))
+```
+
+`xact_commit` ist ein Counter → `rate()`. Fenster `[1m]` statt `[5m]`, damit ein Failover von wenigen Sekunden nicht weggemittelt wird. Jede Anweisung ist eine Transaktion (Autocommit), auch ein `SELECT`. Replikation zählt **nicht** — der WAL-Sender streamt Bytes, keine Transaktionen. Unit *ops/sec*, keine Thresholds (viel TPS ist Leistung, kein Fehler).
+
+Ruhezustand im Lab (Hypothese vorher: „der Leader hat die meisten“ — bestätigt):
+
+| Knoten | TPS | Ursache |
+|---|---|---|
+| ph-node1, ph-node3 | ~2,0 | Dauergäste (Exporter, Patroni) |
+| ph-node2 (Leader) | ~3,2 | Dauergäste + vermutlich Autovacuum (~1,2) |
+
+**Stolperstein: abgeschnittene Achse.** Grafana zoomt auf den Datenbereich (hier 1,8–3,4) — Unterschiede und Rauschen von ±0,1 wirken dramatisch. Für ehrliche Proportionen Axis → Soft min `0`.
+
+**Begriff:** Statt „Master“ heißt es heute *Primary* (PostgreSQL) bzw. *Leader* (Patroni).
+
+#### Panel 6: Aktueller Leader
+
+```promql
+patroni_primary == 1
+```
+
+Visualisierung **Stat**, Legend **Custom** `{{name}}` (Patroni liefert das Label `name` direkt, kein Regex nötig), Stat styles → **Text mode: Name**. Beim Failover springt der angezeigte Name auf den neuen Leader.
+
+**Stolperstein:** Text mode *Name* allein zeigt die komplette Label-Liste `{__name__="patroni_primary", instance=…, name="ph-node2", …}`. Text mode bestimmt, *dass* der Name erscheint; die Legend bestimmt, *welcher* Name das ist.
+
+**Verifiziert 17.10.2026:** zeigt `ph-node2`.
+
 #### Das fertige Dashboard
 
 ![Eigenes Dashboard PostgreSQL HA-Cluster mit allen vier Panels](images/grafana-ha-dashboard.png)
@@ -3376,3 +3409,6 @@ Vier Panels, zwei Zielgruppen: die Ampel oben links für den Operator, Lag, Cach
 - **Warum zeigt der Leader in `numbackends` nicht mehr Verbindungen?** → WAL-Sender hängen an keiner Datenbank; `numbackends` zählt nur DB-gebundene Sessions.
 - **Wie sieht man alle Prozesse samt Typ?** → `pg_stat_activity`, gruppiert nach `backend_type`.
 - **Dashboard zeigt eine Änderung nicht an, obwohl Prometheus sie hat?** → Auto-Refresh steht auf Off; Scrape-Intervall und Refresh-Intervall sind zwei getrennte Takte.
+- **Zählt Replikation als Transaktion in `xact_commit`?** → Nein, der WAL-Sender streamt Bytes.
+- **Warum `rate(...[1m])` statt `[5m]` beim Lasttest?** → Kurze Ereignisse wie ein Failover würden sonst weggemittelt.
+- **Stat-Kachel zeigt die ganze Label-Liste statt eines Namens?** → Legend auf Custom `{{label}}` setzen; Text mode allein reicht nicht.
