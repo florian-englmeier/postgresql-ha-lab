@@ -2902,7 +2902,7 @@ Beim Reload ist ein ungültiger Wert harmlos: PostgreSQL meldet einen Fehler im 
 
 **Verifiziert 02.10.2026.**
 
-### 17.12 Eigenes HA-Dashboard: Leader-Status
+### 17.12 Eigenes HA-Dashboard
 
 Die importierten Dashboards (1860, 9628) zeigen Knoten und Datenbanken einzeln. Für einen HA-Cluster braucht man vor allem die Antwort auf die Frage, ob **genau ein** Leader da ist. Das beantwortet ein eigenes Dashboard `PostgreSQL HA-Cluster`.
 
@@ -2967,7 +2967,7 @@ Begriffe vorab: Ein **Dashboard** ist die ganze Seite (das Armaturenbrett), ein 
 - **Mapping-Farben schlagen Thresholds.** Eine rote Farbe am Mapping `OK` färbt die Kachel rot, egal was die Thresholds sagen. Farben deshalb bewusst setzen (OK grün, KEIN LEADER rot) oder leer lassen.
 - **Versehentliche leere Query B** (Zähler bei *Queries* steht auf 2) mit dem Mülleimer der Zeile löschen.
 
-#### Panel 2: Wer ist Leader?
+#### Optional: Wer ist Leader?
 
 ```promql
 patroni_primary == 1
@@ -3085,7 +3085,7 @@ Im Graphen sind nur drei Linien zu sehen, obwohl die Legende vier Jobs nennt: `p
 
 Zum Vergleich: Der Filter `up{job="postgres"}` liefert dagegen drei Zeilen *mit* IP — Filtern behält die einzelnen Zeitreihen, Zählen fasst sie zusammen.
 
-#### Panel 3: Replikations-Lag — Bytes oder Sekunden?
+#### Panel 2: Replikations-Lag — Bytes oder Sekunden?
 
 Zwei Messarten:
 
@@ -3165,7 +3165,7 @@ In PostgreSQL zeigt `SHOW` nur Konfigurationsparameter. Die MySQL-Befehle haben 
 
 > **Merksatz:** Metriken mit rollenabhängiger 0 nie blind verrechnen — erst die sinnlosen Zeilen herausfiltern.
 
-#### Panel 3 im Dashboard
+#### Panel 2 im Dashboard
 
 - Query: Lag-Query von oben, Visualisierung **Time series**, Titel `Replikations-Lag (Bytes)`
 - Legend: Custom `{{name}}`
@@ -3176,7 +3176,7 @@ In PostgreSQL zeigt `SHOW` nur Konfigurationsparameter. Die MySQL-Befehle haben 
 
 ![Dashboard mit Leader-Status und Replikations-Lag, Warnlinie bei 16 MiB](images/grafana-ha-leader-lag.png)
 
-**Panel 3 verifiziert 17.10.2026:** Lag beider Replicas konstant 0 B, Warnlinie bei 16 MiB sichtbar.
+**Panel 2 verifiziert 17.10.2026:** Lag beider Replicas konstant 0 B, Warnlinie bei 16 MiB sichtbar.
 
 **Stolperstein: Warnlinie unsichtbar.** Grafana skaliert die Y-Achse nur nach den Daten (hier 0 bis 96 B), Thresholds zieht es nicht mit ein — die Linie bei 16 MiB lag rund 175 000-mal über dem Achsenende. Lösung **Soft max** statt **Max**:
 
@@ -3204,6 +3204,117 @@ Bild aus der Physik — ein Behälter mit Zu- und Ablauf: Zulauf = Leader schrei
 ![Eigenes Dashboard PostgreSQL HA-Cluster mit Leader-Status OK](images/grafana-ha-leader-status.png)
 
 **Panel 1 verifiziert 17.10.2026:** Leader ph-node2, Kachel zeigt grün `OK`; Mappings `1`→OK, `0`→KEIN LEADER, `[2-99]`→SPLIT-BRAIN, `Null + NaN`→KEINE DATEN.
+
+#### Panel 3: Cache-Hit-Ratio — Vorarbeit in Explore
+
+PostgreSQL hält Datenblöcke (je 8 KB) in den `shared_buffers`. Jeder benötigte Block ist entweder ein **Treffer** (`blks_hit`, liegt im RAM — Werkbank) oder muss **gelesen** werden (`blks_read`, von Platte bzw. OS-Cache — Keller). Gesund gilt eine Hit-Ratio über 99 %:
+
+```
+Hit-Ratio = blks_hit / (blks_hit + blks_read)
+```
+
+Nach einem Neustart ist der Cache **kalt** (leere Werkbank), die Ratio sinkt und erholt sich, während der Cache warm läuft (`pg_prewarm` kann vorwärmen). Weil `pg_stat_database_blks_hit/read` **Counter** mit Lebenszeit-Summen sind, würde ein kalter Cache in der Gesamt-Ratio kaum auffallen — deshalb `rate(...[5m])`: aktueller Verbrauch statt Kilometerstand.
+
+`rate(pg_stat_database_blks_hit[5m])` liefert eine Zeile je Datenbank und Knoten (im Lab 5–6 DBs × 3 Knoten). Zwei Beobachtungen, obwohl niemand Abfragen stellt:
+
+| Zeile | Wert | Ursache |
+|---|---|---|
+| `postgres` auf allen Knoten | ~100 Treffer/s | Der **postgres_exporter selbst** fragt bei jedem Scrape Statistiken ab — Beobachter-Effekt: Die Messung erzeugt Last, die sie misst. |
+| `titanic`, `pgbench_test` nur auf dem Leader (.202) | ~1,3 Treffer/s | **Autovacuum**: Der Launcher schickt regelmäßig (`autovacuum_naptime`, Standard 1 min) einen Worker in jede Datenbank. Replicas sind read-only und räumen nicht auf — sie bekommen die aufgeräumten Blöcke per WAL. |
+
+> **Merksatz:** Eine „leere“ Datenbank ist nie ganz still — Exporter und Autovacuum lesen mit. Und wo Autovacuum arbeitet, sitzt der Leader.
+
+#### Panel 3 im Dashboard
+
+```promql
+sum by (instance) (rate(pg_stat_database_blks_hit[5m]))
+/
+(
+  sum by (instance) (rate(pg_stat_database_blks_hit[5m]))
++ sum by (instance) (rate(pg_stat_database_blks_read[5m]))
+)
+```
+
+`sum by (instance)` fasst alle Datenbanken eines Knotens zusammen → drei Kacheln. Visualisierung **Stat** (große Zahl + Sparkline), Unit **Percent (0.0-1.0)** — nicht *Percent (0-100)*, sonst erscheint der Rohwert 1 als „1 %“.
+
+| Threshold (Rohwert) | Anzeige | Farbe |
+|---|---|---|
+| Base | < 95 % | rot |
+| `0.95` | 95–99 % | orange |
+| `0.99` | ≥ 99 % | grün |
+
+**Stolperstein: Thresholds vergleichen mit dem Rohwert, nicht mit der Anzeige.** Mit den Standard-Schwellen (Base grün, 80 rot) wäre ein Cache-Einbruch auf 50 % (Rohwert 0,5) grün. Und **Thresholds mode „Percentage“** heißt nicht „Werte in Prozent“, sondern „relativ zu Min/Max des Panels“ — bei konstanten Werten unberechenbar. Deshalb: Absolute, Schwellen im Rohwert (`0.95`, Dezimalpunkt).
+
+**Verifiziert 17.10.2026:** alle drei Knoten 100 %. Kachel-Titel mit Knotennamen statt `IP:9187` (der postgres_exporter hat kein `name`-Label wie Patroni):
+
+1. Query-Options → Legend **Custom** `{{instance}}` — damit der Feldname feststeht.
+2. Reiter **Transformations** (rechts neben *Queries*) → **Rename fields by regex**:
+   - Match: `.*\.20(\d):9187.*`
+   - Replace: `ph-node$1`
+
+Die letzte IP-Ziffer ist die Knotennummer; `(\d)` merkt sie sich, `$1` setzt sie ein — in Python `re.sub(r".*\.20(\d):9187.*", r"ph-node\1", name)`.
+
+**Stolperstein:** Beim Kopieren rutschte das Wort „Match: “ mit ins Feld. Regex nimmt alles wörtlich — es wurde nichts umbenannt, ohne Fehlermeldung.
+
+#### Panel 4: Connections — und warum der Leader nicht mehr hat
+
+Jede Verbindung ist in PostgreSQL ein eigener **Prozess** (der postmaster forkt pro Verbindung ein Backend; MySQL nutzt Threads). Grenze: `max_connections` (Standard 100).
+
+```promql
+sum by (instance) (pg_stat_database_numbackends)
+```
+
+`numbackends` ist ein **Gauge** — kein `rate()`. Vermutung vorher: Der Leader hat mehr Verbindungen (WAL-Sender, Autovacuum). **Messung: alle drei Knoten gleich.**
+
+Der Grund: `numbackends` zählt pro Datenbank nur Prozesse, die **an diese Datenbank gebunden** sind. Bild: ein Hotel — Datenbanken sind Zimmer, `numbackends` zählt die Gäste pro Zimmer. Die WAL-Sender sind Lieferwagen im Hof (streamen das ganze WAL, wohnen in keinem Zimmer); der Autovacuum-Worker schaut nur Sekunden in ein Zimmer und wird beim 15-s-Scrape meist verpasst. Übrig bleiben auf jedem Knoten dieselben Dauergäste: Exporter und Patroni.
+
+Gegenprobe auf dem Leader:
+
+```sql
+SELECT backend_type, datname, count(*)
+FROM pg_stat_activity
+GROUP BY backend_type, datname
+ORDER BY backend_type;
+--         backend_type         | datname  | count
+-- -----------------------------+----------+-------
+--  archiver                     |          |     1
+--  autovacuum launcher          |          |     1
+--  background writer            |          |     1
+--  checkpointer                 |          |     1
+--  client backend               | postgres |     4
+--  logical replication launcher |          |     1
+--  walsender                    |          |     2
+--  walwriter                    |          |     1
+```
+
+Zwei `walsender` ohne `datname` (je Replica einer), `client backend` = Exporter, Patroni und die eigene psql-Sitzung (Beobachter-Effekt), `archiver` aus der WAL-Archivierung (Teil 13). Auf einer Replica erscheint statt der WAL-Sender ein `walreceiver`.
+
+**Live-Beweis im Dashboard:** Die ph-node2-Linie sprang um 16:22 von 4 auf 5 — genau als die psql-Sitzung auf dem Leader geöffnet wurde. Nach `\q` und Refresh fiel sie zurück auf 4. Man sieht sich selbst.
+
+![Connections-Panel: Stufe bei ph-node2 durch die eigene psql-Sitzung, Warnlinie bei 80](images/grafana-connections-psql-session.png)
+
+Panel-Einstellungen: Time series, Legend Custom `{{instance}}` + dieselbe Regex-Transformation wie beim Cache-Panel, Thresholds **Absolute** (Base grün, 80 rot — 80 % von `max_connections` = 100), *Show thresholds: As lines*, Soft max 100. Ab `max_connections` antwortet PostgreSQL mit *„too many clients already“*, deshalb die Warnung vorher. Tipp: Ein Klick auf einen Legenden-Eintrag blendet alle anderen Linien aus.
+
+**Panel 4 verifiziert 17.10.2026.**
+
+**Zwei Takte bestimmen die Frische der Anzeige:**
+
+| Takt | Wer | Intervall |
+|---|---|---|
+| Scrape | Prometheus holt Werte von den Exportern | 15 s |
+| Refresh | Grafana holt Werte von Prometheus | Auto-Refresh oben rechts (Off / 10s / 30s …) |
+
+Die Anzeige ist nur so frisch wie das langsamere Zahnrad. Für ein Operator-Dashboard Auto-Refresh z. B. auf 10 s stellen; steht er auf *Off*, ändert sich nichts, bis man selbst auf Refresh klickt.
+
+> **Merksatz:** Messen schlägt Vermuten — aber nur, wenn man weiß, was die Metrik zählt. Für das vollständige Bild `pg_stat_activity` nach `backend_type` gruppieren.
+
+Formulierung fürs Gespräch: „`numbackends` zählt nur an eine Datenbank gebundene Sessions. Die WAL-Sender der physischen Replikation hängen an keiner Datenbank, deshalb sieht der Leader dort nicht mehr Verbindungen als die Replicas.“
+
+#### Das fertige Dashboard
+
+![Eigenes Dashboard PostgreSQL HA-Cluster mit allen vier Panels](images/grafana-ha-dashboard.png)
+
+Vier Panels, zwei Zielgruppen: die Ampel oben links für den Operator, Lag, Cache-Hit-Ratio und Connections für den DBA. **Fertiggestellt 17.10.2026.**
 
 #### Schnell-Referenz (zum Abfragen)
 
@@ -3256,3 +3367,12 @@ Bild aus der Physik — ein Behälter mit Zu- und Ablauf: Zulauf = Leader schrei
 - **Wer gewinnt: Mapping-Farbe oder Threshold?** → Die Mapping-Farbe.
 - **Warum ein eigenes HA-Dashboard neben den Community-Dashboards?** → Zielgruppe: Der Operator braucht in zwei Sekunden eine Ampel, nicht 50 Panels.
 - **Warnlinie im Time-Series-Panel nicht zu sehen?** → Auto-Skalierung folgt nur den Daten; Axis → Soft max setzen (nicht Max, das schneidet ab).
+- **Warum zeigt `postgres` ~100 Cache-Treffer/s ohne Benutzer?** → Der postgres_exporter fragt bei jedem Scrape Statistiken ab (Beobachter-Effekt).
+- **Warum Autovacuum-Aktivität nur auf dem Leader?** → Replicas sind read-only; sie erhalten aufgeräumte Blöcke per WAL.
+- **Warum `rate()` für die Cache-Hit-Ratio?** → Lebenszeit-Counter verschleiern einen aktuell kalten Cache.
+- **Unit Percent (0.0-1.0) oder (0-100) für eine Ratio?** → 0.0-1.0; die Formel liefert einen Bruch.
+- **Thresholds bei Prozent-Unit in welcher Größe eintragen?** → Im Rohwert (0.99), nicht in Prozent (99).
+- **Kachelnamen aus IP-Adressen ableiten?** → Transformation *Rename fields by regex*, Gruppe `(\d)` und `$1`; Legend vorher auf Custom setzen.
+- **Warum zeigt der Leader in `numbackends` nicht mehr Verbindungen?** → WAL-Sender hängen an keiner Datenbank; `numbackends` zählt nur DB-gebundene Sessions.
+- **Wie sieht man alle Prozesse samt Typ?** → `pg_stat_activity`, gruppiert nach `backend_type`.
+- **Dashboard zeigt eine Änderung nicht an, obwohl Prometheus sie hat?** → Auto-Refresh steht auf Off; Scrape-Intervall und Refresh-Intervall sind zwei getrennte Takte.

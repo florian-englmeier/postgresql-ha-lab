@@ -68,6 +68,12 @@ Das eingebaute HAProxy-Stats-Dashboard (Port `7000`) zeigt live, dass Client-Tra
 
 Rollierendes Patchen aller drei Knoten: Der Leader wird per `patronictl switchover` kontrolliert übergeben, bevor er gepatcht wird. Jeder Wechsel erzeugt eine neue Timeline, `patronictl history` dokumentiert alle Leader-Wechsel lückenlos. Ablauf und Stolpersteine (`needrestart`, Kernel-Drift) in [Teil 17.10](./PostgreSQL_und_Patroni_Tutorial.md#1710-praxis-rollierendes-patchen-des-ganzen-clusters).
 
+### Live-Nachweis: Eigenes HA-Dashboard für den Betrieb
+
+![Eigenes Grafana-Dashboard „PostgreSQL HA-Cluster“: Leader-Status, Replikations-Lag, Cache-Hit-Ratio, Connections](./images/grafana-ha-dashboard.png)
+
+Neben den Community-Dashboards (Dutzende Panels zum Stöbern) ein selbst gebautes Dashboard, das eine Frage beantwortet: **Ist der Cluster gesund — und wenn nicht, wo klemmt es?** Oben links die Ampel für den Bereitschaftsdienst (`sum(patroni_primary)`: `OK` / `KEIN LEADER` / `SPLIT-BRAIN` / `KEINE DATEN`), daneben die Detailkurven für den DBA: Byte-Lag je Replica mit Warnlinie bei einem WAL-Segment (16 MiB), Cache-Hit-Ratio je Knoten mit Schwellen bei 95 / 99 %, Connections mit Warnlinie bei 80 % von `max_connections`. Aufbau, PromQL und Stolpersteine (Standard-Thresholds als „Immer-grün-Ampel“, Lag in Sekunden vs. Bytes, Rohwert vs. Anzeige) in [Teil 17.12](./PostgreSQL_und_Patroni_Tutorial.md#1712-eigenes-ha-dashboard).
+
 ---
 
 ## Tech-Stack
@@ -81,7 +87,7 @@ Rollierendes Patchen aller drei Knoten: Der Leader wird per `patronictl switchov
 | **keepalived** | Virtuelle IP (VRRP) als stabiler Einstiegspunkt |
 | **Prometheus** | Sammelt Metriken von 11 Zielen (Pull-Prinzip, 15-s-Intervall) |
 | **node_exporter / postgres_exporter** | Betriebssystem- und Datenbank-Metriken je Knoten; Exporter mit eigener `pg_monitor`-Rolle |
-| **Grafana** | Dashboards: Node Exporter Full (1860), PostgreSQL (9628); eigenes HA-Dashboard in Arbeit |
+| **Grafana** | Dashboards: Node Exporter Full (1860), PostgreSQL (9628); eigenes HA-Dashboard `PostgreSQL HA-Cluster` (Leader-Status, Lag, Cache-Hit-Ratio, Connections) |
 | **Pi-hole** | Lokaler DNS: `pg-vip.home.arpa` → VIP |
 | **Proxmox VE** | Virtualisierungsplattform für die 3 Cluster-Knoten |
 | **Ubuntu Server** | 24.04 LTS, je Knoten |
@@ -149,6 +155,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 - [x] Prometheus mit 11/11 Zielen `UP`
 - [x] Grafana mit Prometheus-Datenquelle, Dashboards 1860 (Node Exporter Full) und 9628 (PostgreSQL)
 - [x] Befund aus dem Dashboard: `shared_buffers` und weitere Parameter stehen noch auf Werkseinstellung
+- [x] Eigenes HA-Dashboard in Grafana: Leader-Status (inkl. Split-Brain-Erkennung), Replikations-Lag, Cache-Hit-Ratio, Connections
 - [x] Root-FS bei ~70 %: Inventur (OS, DB, WAL-Archiv, Logs) und `lvextend` auf allen drei Knoten im laufenden Betrieb, 9,8 → 18 GB
 
 **Kernziel erreicht:** vollautomatisierter 3-Knoten-Failover ohne manuellen Eingriff, Ende-zu-Ende verifiziert — inklusive Backup/PITR, Performance-Nachweis, Query-Analyse und Monitoring.
@@ -157,7 +164,6 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 ### 🔜 Als Nächstes
 
-- [ ] Eigenes HA-Dashboard in Grafana: Leader-Status, Replikations-Lag, Cache-Hit-Ratio, Connections
 - [ ] Lasttest mit `pgbench` von `ph-monitor` aus (getrennter Lastgenerator), live im Dashboard
 - [ ] Failover unter Last, im Dashboard sichtbar gemacht
 - [ ] Basis-Tuning (`shared_buffers` u. a.) per `patronictl edit-config` und rollierendem Restart
@@ -170,6 +176,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 - **Patroni besitzt die PostgreSQL-Konfiguration.** Parameter werden nur über `patronictl edit-config` geändert, nie per `ALTER SYSTEM` oder in der `postgresql.conf`. Entscheidend ist, ob ein Parameter einen Reload oder einen Restart braucht. Restart-Parameter werden rollierend angewendet: erst die Replicas, der Leader per Switchover zuletzt. Den Diff vor dem Bestätigen lesen und danach mit `SHOW` prüfen, denn ein Tippfehler fällt sonst erst beim nächsten Neustart auf.
 - **Patchen kann einen Failover auslösen.** `needrestart` startet nach `apt upgrade` automatisch `patroni.service` neu, auf dem Leader ist das ein ungeplanter Failover. Daher rollierendes Patchen mit Switchover vor dem Leader und anschließend Kernel-Versionen vergleichen, weil Phased Updates zu Versionsdrift zwischen den Knoten führen.
 - **Benchmarks im HA-Cluster brauchen den Leader-Zustand.** Läuft der Lastgenerator auf dem Leader-Knoten, konkurrieren beide um dieselben CPUs und die Messung kippt. Leader-Position und Parameter werden zu jedem Lauf protokolliert, pro Schritt ändert sich nur eine Variable.
+- **Ein Dashboard beantwortet die Frage seiner Zielgruppe.** Der Bereitschaftsdienst braucht in zwei Sekunden eine Ampel, nicht fünfzig Panels. Grafanas Standard-Schwellen (Base grün, 80 rot) hätten „kein Leader“ und „Split-Brain“ grün gefärbt — Thresholds werden deshalb bewusst gesetzt und gegen den Rohwert verglichen, nicht gegen die formatierte Anzeige.
 - **Monitoring misst jeden Knoten direkt.** Anwendungen gehen über die VIP, Exporter nicht, sonst wird nur der Leader gemessen. Alarme sitzen auf Symptomen (kein oder zwei Leader, `pg_up == 0`, WAL-Archiv scheitert) und haben eine Wartezeit, weil Scrape-Intervalle kurze Ereignisse verzerren. Für den genauen Ablauf eines Failovers sind `patronictl history` und die Logs maßgeblich.
 
 ---
