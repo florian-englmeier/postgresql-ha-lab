@@ -3027,7 +3027,21 @@ count by (job) (up)     # Gruppieren: nur der Label-NAME
 
 > **Merksatz:** In `by (...)` steht der Name des Labels, nie sein Wert. Ein Ergebnis mit `{}` heißt: Die Gruppierung hat nichts gefunden.
 
-Bestätigt im Lab: `up{job="postgres"}` liefert drei Zeilen (eine je Knoten-IP), alle `1`.
+Ergebnis im Lab (verifiziert 17.10.2026):
+
+| job | Anzahl | Was dahinter steckt |
+|---|---|---|
+| `node` | 4 | node_exporter auf ph-node1..3 und ph-monitor |
+| `patroni` | 3 | Patroni-REST-API (8008) auf ph-node1..3 |
+| `postgres` | 3 | postgres_exporter auf ph-node1..3 |
+| `prometheus` | 1 | Prometheus überwacht sich selbst |
+| **Summe** | **11** | = alle Targets aus `up` |
+
+![count by (job) (up) in Grafana Explore](images/grafana-count-by-job.png)
+
+Im Graphen sind nur drei Linien zu sehen, obwohl die Legende vier Jobs nennt: `patroni` und `postgres` haben beide den Wert 3, die Linien liegen deckungsgleich übereinander. Die Raw-Ansicht darunter zeigt alle vier Zeilen („Result series: 4“).
+
+Zum Vergleich: Der Filter `up{job="postgres"}` liefert dagegen drei Zeilen *mit* IP — Filtern behält die einzelnen Zeitreihen, Zählen fasst sie zusammen.
 
 **Panel 1 und 2 verifiziert 17.10.2026** (Leader ph-node2, Anzeige `OK`).
 
