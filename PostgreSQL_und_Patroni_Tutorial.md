@@ -3349,6 +3349,30 @@ Visualisierung **Stat**, Legend **Custom** `{{name}}` (Patroni liefert das Label
 
 Sechs Panels, zwei Zielgruppen und ein Zweck: die Ampel oben links für den Operator, Lag, Cache-Hit-Ratio und Connections für den DBA, TPS und aktueller Leader als Sensoren für Lasttest und Failover. **Fertiggestellt 17.10.2026.**
 
+#### Erster Kurztest unter Last (17.10.2026, 19:48)
+
+`pgbench -h 192.168.178.200 -p 5000 -U postgres -c 10 -j 2 -T 60 pgbench_test` von **ph-node1** (Replica) aus — nicht auf dem Leader, sonst konkurrieren Lastgenerator und Datenbank um dieselbe CPU. Dashboard auf *Last 15 minutes*, Auto-Refresh 5–10 s.
+
+![Erster pgbench-Kurztest im eigenen Dashboard](images/grafana-pgbench-erster-test.png)
+
+| Panel | Beobachtung | Deutung |
+|---|---|---|
+| TPS | ph-node2 von ~3 auf ~1 500 ops/s | Schreiblast landet über VIP/HAProxy beim Leader |
+| Connections | ph-node2 von 4 auf ~14 | 10 pgbench-Clients + 4 Dauergäste — geht exakt auf |
+| Cache-Hit-Ratio | ph-node2 93,9 % (rot), ph-node3 98,9 % (orange) | Zufallszugriffe von pgbench passen nicht in `shared_buffers` = 128 MiB (Werkseinstellung) → Vorher-Wert fürs Basis-Tuning |
+| Leader-Status / Aktueller Leader | OK / ph-node2 | kein Wechsel, wie erwartet |
+| Replikations-Lag | **negativ, bis −128 MiB** | Messartefakt, siehe unten |
+
+#### Stolperstein: negativer Lag — nicht gleichzeitige Abtastung
+
+Eine Replica kann nie vor dem Leader liegen. Der negative Wert entsteht, weil Prometheus jeden Knoten einzeln und zu leicht verschiedenen Zeitpunkten abfragt. In Ruhe steht das WAL-Band still, der Versatz fällt nicht auf. Unter Last läuft es mit mehreren MB/s: Wird der Leader um 19:48:00 abgefragt und die Replica erst Sekunden später, ist die Replica in der Zwischenzeit weitergelaufen — `Leader-Position − Replica-Position` wird negativ.
+
+Bild: Zwei Autos auf der Autobahn, von zwei Fotografen zu verschiedenen Zeitpunkten fotografiert. Aus den Kilometersteinen auf den Fotos lässt sich kein Abstand berechnen. Messtechnisch: zwei bewegte Größen nicht gleichzeitig abgetastet — die Differenz misst vor allem den Zeitversatz.
+
+> **Merksatz:** Eine Differenz ist nur so gut wie die Gleichzeitigkeit ihrer beiden Messwerte.
+
+Lösung (nächster Schritt): beide Positionen im selben Moment am selben Ort messen. Der Leader kennt in `pg_stat_replication` je Replica seine eigene Position und die eingespielte Position der Replica — in einer Abfrage, ein Foto mit beiden Autos. Das Lag-Panel wird auf die entsprechende postgres_exporter-Metrik umgebaut.
+
 #### Schnell-Referenz (zum Abfragen)
 
 - **Pull oder Push bei Prometheus?** → Pull: Prometheus holt die Werte selbst ab.
@@ -3412,3 +3436,5 @@ Sechs Panels, zwei Zielgruppen und ein Zweck: die Ampel oben links für den Oper
 - **Zählt Replikation als Transaktion in `xact_commit`?** → Nein, der WAL-Sender streamt Bytes.
 - **Warum `rate(...[1m])` statt `[5m]` beim Lasttest?** → Kurze Ereignisse wie ein Failover würden sonst weggemittelt.
 - **Stat-Kachel zeigt die ganze Label-Liste statt eines Namens?** → Legend auf Custom `{{label}}` setzen; Text mode allein reicht nicht.
+- **Warum zeigt das Lag-Panel unter Last negative Werte?** → Leader und Replica werden zu verschiedenen Zeitpunkten gescrapt; unter Last läuft das WAL in der Zwischenzeit weiter. Lösung: beide Werte aus einer Abfrage auf dem Leader (`pg_stat_replication`).
+- **Warum fällt die Cache-Hit-Ratio unter pgbench-Last?** → Zufallszugriffe passen nicht in `shared_buffers` (128 MiB Werkseinstellung).
