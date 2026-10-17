@@ -2902,6 +2902,135 @@ Beim Reload ist ein ungültiger Wert harmlos: PostgreSQL meldet einen Fehler im 
 
 **Verifiziert 02.10.2026.**
 
+### 17.12 Eigenes HA-Dashboard: Leader-Status
+
+Die importierten Dashboards (1860, 9628) zeigen Knoten und Datenbanken einzeln. Für einen HA-Cluster braucht man vor allem die Antwort auf die Frage, ob **genau ein** Leader da ist. Das beantwortet ein eigenes Dashboard `PostgreSQL HA-Cluster`.
+
+#### Panel 1: Anzahl Primaries
+
+Patroni liefert auf jedem Knoten `patroni_primary` (1 = Leader, 0 = Replica). Die Summe über alle Knoten ist die eigentliche Gesundheitsaussage:
+
+```promql
+sum(patroni_primary)
+```
+
+| Wert | Bedeutung | Farbe | Value Mapping |
+|---|---|---|---|
+| 0 | kein Leader (Lücke während Failover, TTL in etcd läuft ab) | rot | `KEIN LEADER` |
+| 1 | gesund | grün | `OK` |
+| ≥ 2 | Split-Brain, zwei Primaries schreiben auseinander | rot | `SPLIT-BRAIN` |
+| keine Daten | kein Knoten antwortet dem Scrape | rot | `KEINE DATEN` |
+
+Visualisierung **Stat**, Thresholds: Base rot, 1 grün, 2 rot.
+
+> **Merksatz:** Ein ausgefallener Knoten meldet nicht 0, sondern gar nichts — seine Zeitreihe fehlt. Die Summe bleibt trotzdem aussagekräftig, solange mindestens ein Knoten antwortet. Deshalb braucht das Panel zusätzlich ein Mapping für „keine Daten“.
+
+#### Panel 2: Wer ist Leader?
+
+```promql
+patroni_primary == 1
+```
+
+Display name `{{name}}` — das Label `name` trägt den Patroni-Knotennamen (`ph-node2`), `instance` nur IP und Port. Nach einem Failover wechselt der angezeigte Name automatisch.
+
+#### PromQL-Spickzettel für Explore
+
+In Grafana unter **Explore** (Datenquelle Prometheus, Ansicht **Table**) lassen sich Abfragen ausprobieren, bevor sie in ein Panel wandern.
+
+| Abfrage | Was sie zeigt | Erwartung im Lab |
+|---|---|---|
+| `up` | Ist jeder Exporter erreichbar? (1/0 je Target) | 11 Zeilen, alle 1 |
+| `up == 0` | Nur die Targets, die gerade ausgefallen sind | leer |
+| `pg_up` | Kann der postgres_exporter die Datenbank erreichen? | 3 Zeilen, alle 1 |
+| `patroni_primary` | Rolle je Knoten | 0 / 1 / 0 |
+| `patroni_primary == 1` | Nur der aktuelle Leader (Filter) | 1 Zeile, z. B. `ph-node2` |
+| `sum(patroni_primary)` | Anzahl Leader im Cluster | 1 |
+| `count(up{job="patroni"} == 1)` | Wie viele Patroni-Knoten antworten | 3 |
+| `sum by (name) (patroni_primary)` | Summe gruppiert nach Label | eine Zeile je Knoten |
+| `changes(patroni_primary[24h])` | Wie oft hat sich die Rolle je Knoten in 24 h geändert | > 0 nach einem Wechsel |
+
+Bausteine, die in den Abfragen stecken:
+
+| Baustein | Bedeutung |
+|---|---|
+| `metrik{label="wert"}` | Auf Label filtern (z. B. `{job="patroni"}`) |
+| `== 1`, `> 0` | Vergleich als Filter: nur passende Zeitreihen bleiben übrig |
+| `sum(...)`, `count(...)` | Über alle Zeitreihen zusammenfassen |
+| `sum by (label) (...)` | Zusammenfassen, aber je Label-Wert getrennt |
+| `[24h]` | Zeitfenster (Range Vector) statt aktuellem Wert |
+| `changes(...)`, `rate(...)` | Funktionen über ein Zeitfenster: Anzahl Änderungen bzw. Zuwachs pro Sekunde |
+
+> Der Job-Name (`job="patroni"`) hängt von der eigenen `prometheus.yml` ab; mit `up` in Explore sieht man, wie die Jobs heißen.
+
+#### Query für Query
+
+**1. `up` — sind alle Targets da?**
+
+`up` liefert kein Exporter, Prometheus erzeugt die Metrik bei jedem Scrape selbst: `1` = Target hat geantwortet, `0` = nicht erreichbar (Timeout, Dienst gestoppt, VM aus). Deshalb meldet `up` auch dann noch etwas, wenn der Exporter selbst tot ist — genau das macht es zur ersten Anlaufstelle.
+
+Erwartung im Lab: **11 Zeilen**, alle `1`.
+
+| Wo | Targets | Anzahl |
+|---|---|---|
+| ph-node1..3 | node_exporter (9100), postgres_exporter (9187), Patroni-REST-API (8008) | 3 × 3 = 9 |
+| ph-monitor | Prometheus selbst (9090), node_exporter (9100) | 2 |
+| **Summe** | | **11** |
+
+Lesen der Tabelle: Die Labels `job` und `instance` sagen, *welcher* Dienst auf *welchem* Rechner gemeint ist. Eine `0` bei `job="postgres"` auf einem Knoten heißt: Exporter weg — nicht zwingend die Datenbank. Ob die Datenbank selbst läuft, verrät erst `pg_up`.
+
+> **Merksatz:** `up` prüft den Draht zum Exporter, nicht den Dienst dahinter. Erst `up` ansehen, dann die Fachmetrik.
+
+**Verifiziert 17.10.2026:** alle Targets `1`.
+
+**2. `up == 0` — nur die Ausfälle**
+
+`== 0` ist in PromQL kein Ja/Nein-Test, sondern ein **Filter**: Von allen Zeitreihen bleiben nur die mit Wert 0 übrig. Im gesunden Zustand ist das Ergebnis deshalb **leer** („No data“).
+
+Genau das macht die Abfrage ideal für Alarme: leer = alles gut, jede Zeile = ein Problem, und die Labels `job` und `instance` der Zeile sagen sofort, *welcher* Dienst auf *welchem* Rechner fehlt. Alertmanager-Regeln (Roadmap Punkt 1) funktionieren nach demselben Prinzip.
+
+> **Merksatz:** Vergleichsoperatoren filtern. Eine gute Alarm-Abfrage ist im Normalbetrieb leer.
+
+**Verifiziert 17.10.2026:** Ergebnis leer, alle Targets erreichbar.
+
+**3. `pg_up` — läuft die Datenbank hinter dem Exporter?**
+
+`pg_up` liefert der postgres_exporter selbst: Er versucht bei jedem Scrape eine Verbindung zu PostgreSQL. Typ **gauge** (Grafana zeigt das im Tooltip beim Eintippen der Metrik).
+
+Zusammen mit `up` lassen sich drei Fälle sauber trennen:
+
+| Situation | `up{job="postgres"}` | `pg_up` | Diagnose |
+|---|---|---|---|
+| alles läuft | 1 | 1 | gesund |
+| nur PostgreSQL gestoppt | 1 | **0** | Datenbank-Problem |
+| nur Exporter gestoppt | **0** | *keine Daten* | Monitoring-Problem, DB evtl. gesund |
+
+Im dritten Fall fehlt `pg_up` ganz, weil ohne erfolgreichen Scrape auch keine Exporter-Metrik ankommt — nur `up` meldet sich noch, denn das erzeugt Prometheus selbst.
+
+> **Merksatz:** `up` = Draht zum Exporter, `pg_up` = Draht vom Exporter zur Datenbank. Erst beide zusammen sagen, wo die Kette reißt.
+
+**Metriktypen:** Ein **Gauge** ist ein Momentwert, der steigen und fallen darf (Thermometer: `pg_up`, `patroni_primary`, Anzahl Verbindungen). Ein **Counter** zählt nur hoch und springt nur beim Neustart auf 0 (z. B. `pg_stat_database_xact_commit`). Auf Counter wendet man `rate()` an, um „pro Sekunde“ zu bekommen; auf Gauges nicht.
+
+**Tipp:** Der Schalter **Explain** im Query-Editor zerlegt jede PromQL-Abfrage in ihre Bausteine und erklärt sie in Worten — gut zum Lernen.
+
+**4. `count by (job) (up)` — Targets je Dienst zählen**
+
+`count(...)` zählt Zeitreihen, `by (job)` trennt das Ergebnis je Wert des Labels `job`. Erwartet: eine Zeile je Job, die Zahlen ergeben zusammen 11.
+
+#### Stolperstein: Label-Wert statt Label-Name in `by (...)`
+
+`count by (postgres) (up)` liefert **eine** Zeile mit leeren Labels `{}` und dem Wert 11 — ohne Fehlermeldung. Ein Label namens `postgres` gibt es nicht, also landen alle Zeitreihen in derselben Gruppe.
+
+```promql
+up{job="postgres"}      # Filter:     Label-NAME = Label-WERT
+count by (job) (up)     # Gruppieren: nur der Label-NAME
+```
+
+> **Merksatz:** In `by (...)` steht der Name des Labels, nie sein Wert. Ein Ergebnis mit `{}` heißt: Die Gruppierung hat nichts gefunden.
+
+Bestätigt im Lab: `up{job="postgres"}` liefert drei Zeilen (eine je Knoten-IP), alle `1`.
+
+**Panel 1 und 2 verifiziert 17.10.2026** (Leader ph-node2, Anzeige `OK`).
+
 #### Schnell-Referenz (zum Abfragen)
 
 - **Pull oder Push bei Prometheus?** → Pull: Prometheus holt die Werte selbst ab.
@@ -2934,3 +3063,10 @@ Beim Reload ist ein ungültiger Wert harmlos: PostgreSQL meldet einen Fehler im 
 - **Verteilt `timedatectl` die Zeitzone im Cluster?** → Nein, jede VM einzeln.
 - **Muss `edit-config` auf dem Leader laufen?** → Nein, es schreibt nach etcd, jeder Patroni liest selbst.
 - **Wann fällt ein Tippfehler in einem Reload-Parameter auf?** → Erst beim nächsten Neustart, dann startet PostgreSQL nicht.
+- **Was ergibt `sum(patroni_primary)` im gesunden Cluster?** → 1. Bei 0 fehlt der Leader, bei 2 droht Split-Brain.
+- **Meldet ein ausgefallener Knoten `patroni_primary 0`?** → Nein, seine Zeitreihe fehlt ganz; Panel braucht ein Mapping für „keine Daten“.
+- **Welches Label zeigt den Knotennamen?** → `name` (Patroni), nicht `instance` (IP:Port).
+- **Was liefert `up == 0` im gesunden Cluster?** → Nichts. Vergleiche filtern; jede Zeile wäre ein ausgefallenes Target.
+- **`up` = 1, `pg_up` = 0 — wo liegt das Problem?** → Exporter läuft, Datenbank nicht erreichbar.
+- **Gauge vs. Counter?** → Momentwert (rauf und runter) vs. nur steigend; `rate()` nur auf Counter.
+- **`count by (postgres) (up)` liefert `{}` und 11 — warum?** → In `by (...)` gehört der Label-Name (`job`), nicht der Wert; ein unbekanntes Label gruppiert alles zusammen.
