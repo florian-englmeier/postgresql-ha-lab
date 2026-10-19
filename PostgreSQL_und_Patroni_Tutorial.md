@@ -3430,6 +3430,52 @@ Fällt der Proxmox-Host mit allen drei etcd-Mitgliedern aus, wird eine Replica a
 
 Hilfsmittel, um Werte an einem bestimmten Zeitpunkt abzulesen: Zeitbereich so wählen, dass er genau am gesuchten Moment endet, Query-Typ **Instant**, Ansicht **Table**.
 
+#### Laststufen-Test mit dem Dashboard (19.10.2026)
+
+Ablauf: von **ph-node1** über die VIP, vier Stufen à 60 s mit Pausen, pro Stufe ändert sich nur `-c`:
+
+```bash
+pgbench -h 192.168.178.200 -p 5000 -U postgres -c <10|25|50|75> -j 2 -T 60 pgbench_test
+```
+
+Vorab Platz-Check (`df -h /`, `du -sh /var/lib/postgresql/wal_archive`): genug Reserve, siehe Betriebslog.
+
+| Clients | TPS | Latenz Ø | Zuwachs TPS | Zuwachs Latenz | Fehler |
+|---|---|---|---|---|---|
+| 10 | 1 056 | 9,5 ms | – | – | 0 |
+| 25 | 2 124 | 11,8 ms | +101 % | +24 % | 0 |
+| 50 | 2 977 | 16,8 ms | +40 % | +43 % | 0 |
+| 75 | 3 038 | 24,7 ms | **+2 %** | **+47 %** | 0 |
+
+![Laststufen-Test im eigenen Dashboard](images/grafana-laststufen-dashboard.png)
+
+**Sättigung ab ~50 Clients:** Von 50 auf 75 Clients steigt der Durchsatz nur noch um 2 %, die Latenz um 47 %. Bestätigt Teil 14 (Peak ~50), jetzt mit Live-Bild. Im Dashboard: Connections 14 → 29 → 54 → 79 (Clients + 4 Dauergäste) — bei 75 Clients knapp unter der 80er-Warnlinie; CPU ph-node2 bei 75 Clients ~85 %; Lag flach (Replicas halten auch bei 3 000 TPS mit); Cache-Hit-Ratio 93–95 % auf allen Knoten.
+
+**Little'sches Gesetz** (Warteschlangentheorie): Clients = Durchsatz × Latenz, also TPS = Clients ÷ Latenz. Check: 10 ÷ 0,00947 s = 1 056; 75 ÷ 0,02469 s = 3 038 — exakt die pgbench-Werte. Wenn der Durchsatz gesättigt ist, *muss* jede weitere Verbindung die Latenz erhöhen: ein Supermarkt mit fester Kassenleistung.
+
+#### Der Engpass wandert: von der Platte zur CPU
+
+CPU-Modi des Leaders ph-node2 über alle Stufen (Darstellung *Lines*):
+
+```promql
+avg by (instance, mode) (rate(node_cpu_seconds_total{mode!="idle", instance=~".*202:9100"}[1m])) * 100
+```
+
+![CPU-Modi von ph-node2 über die vier Laststufen](images/grafana-laststufen-cpu-modi-node2.png)
+
+| Stufe | iowait | user | system | Engpass |
+|---|---|---|---|---|
+| 10 Clients | ~42 % | ~12 % | ~8 % | Platte |
+| 25 Clients | ~33 % | ~24 % | ~13 % | Platte |
+| 50 Clients | ~24 % | ~35 % | ~18 % | CPU übernimmt |
+| 75 Clients | ~18 % | ~42 % | ~19 % | CPU |
+
+Vorhersage war „die Platte macht dicht“ — stimmt nur für wenig Last. Am Sättigungspunkt ist die CPU (2 vCPU) der Engpass.
+
+Erklärung: **Group Commit.** Bei jedem `COMMIT` muss das WAL per `fsync` sicher auf der Platte liegen, bevor PostgreSQL „fertig“ meldet. Bei wenigen Clients kommt fast jeder Commit allein — ein teures `fsync` pro Transaktion, die CPU wartet. Bei vielen Clients warten mehrere Commits gleichzeitig, ein `fsync` schreibt die WAL-Einträge mehrerer Transaktionen. Bild: Sammeltaxi statt Einzelfahrten — die Fahrt kostet gleich viel, transportiert aber mehr. Das Warten pro Transaktion sinkt, die CPU wird zum Flaschenhals.
+
+> **Merksatz:** Der Engpass wandert mit der Last. Wenig Last: Platte (fsync pro Commit). Viel Last: CPU, weil Group Commit die Platte entlastet. Ein Lasttest misst deshalb nie „die“ Grenze, sondern die Grenze bei einer bestimmten Last — und auf diesem Lab einen gemeinsamen Proxmox-Host (CPU und Platte geteilt).
+
 #### Das fertige Dashboard
 
 ![Eigenes Dashboard PostgreSQL HA-Cluster mit allen sechs Panels](images/grafana-ha-dashboard.png)
@@ -3568,3 +3614,6 @@ Ergebnis: **~125 KB je Replica** — rund 1/130 der Warnlinie. Die −128 MiB vo
 - **Was bedeutet `iowait`?** → Die CPU ist untätig und wartet auf Platten-I/O; zählt in „alles außer idle“ trotzdem als Auslastung.
 - **Wann ist *Stacked lines* richtig?** → Wenn die Kurven Teile eines Ganzen sind (z. B. CPU-Modi); für Vergleiche *Lines*.
 - **Warum reichen zwei Rechenzentren für automatischen Failover nicht?** → Eines hält zwangsläufig die etcd-Mehrheit; fällt es aus, kann das andere keinen Leader wählen. Man braucht drei Failure Domains (ggf. einen reinen Schiedsrichter).
+- **Was besagt das Little'sche Gesetz für pgbench?** → TPS = Clients ÷ Latenz; ist der Durchsatz gesättigt, steigt mit jedem Client die Latenz.
+- **Warum sinkt iowait bei mehr Clients?** → Group Commit: Ein `fsync` schreibt die WAL-Einträge mehrerer gleichzeitiger Commits.
+- **Woran erkennt man Sättigung?** → TPS stagniert (+2 %), Latenz steigt stark (+47 %).
