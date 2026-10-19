@@ -195,6 +195,7 @@ Dieses Lab ist ein lebendes Projekt — der Cluster steht, die Grundlagen sind d
 | 6 | **Switchover vs. Failover** | `patronictl switchover` (kontrolliert) vs. automatischer Failover — Unterschied live demonstrieren |
 | 7 | **pg_upgrade** | Versionswechsel (z.B. PostgreSQL 16 → 17) im laufenden Cluster dokumentieren |
 | 8 | **CloudNativePG** | PostgreSQL-HA auf Kubernetes (on-prem) als Gegenstück zum Patroni-Ansatz |
+| 9 | **Failure Domains** | Alle drei Knoten teilen sich einen Proxmox-Host und eine Platte (Befund 19.10.2026: ~50 % `iowait` auf einer Replica unter Last). Ausbau: PostgreSQL-Knoten auf separater x86-Hardware (i7), per Skript in den laufenden Cluster aufgenommen. Für echten automatischen Failover über Hardware-Grenzen müssen die **etcd-Stimmen** auf drei Geräte verteilt werden (Proxmox, i7, Raspberry Pi als Schiedsrichter) — kein Gerät darf allein die Mehrheit halten |
 
 ---
 

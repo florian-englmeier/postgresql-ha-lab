@@ -3167,7 +3167,9 @@ In PostgreSQL zeigt `SHOW` nur Konfigurationsparameter. Die MySQL-Befehle haben 
 
 #### Panel 2 im Dashboard
 
-- Query: Lag-Query von oben, Visualisierung **Time series**, Titel `Replikations-Lag (Bytes)`
+> **Update 19.10.2026:** Die Query unten (Differenz zweier Patroni-Metriken) liefert unter Last falsche, sogar negative Werte. Das Panel nutzt jetzt `pg_stat_replication_pg_wal_lsn_diff` — Begründung und Umbau im Abschnitt *„Lösung: ein Foto mit beiden Autos“* weiter unten.
+
+- Query (ursprünglich): Lag-Query von oben, Visualisierung **Time series**, Titel `Replikations-Lag (Bytes)`
 - Legend: Custom `{{name}}`
 - Unit: `Data → bytes(IEC)` (zeigt `0 B`, `16 MiB` statt Rohzahlen)
 - Thresholds: Basis grün, rot ab `16777216` (16 MiB = ein WAL-Segment), *Show thresholds: As lines*
@@ -3343,6 +3345,91 @@ Visualisierung **Stat**, Legend **Custom** `{{name}}` (Patroni liefert das Label
 
 **Verifiziert 17.10.2026:** zeigt `ph-node2`.
 
+#### Panel 7: CPU-Auslastung — PromQL von innen nach außen lesen
+
+Der node_exporter zählt je CPU-Kern, wie viele Sekunden er in jedem Modus verbracht hat (`idle`, `user`, `system`, `iowait` …). Die Auslastung ist „alles außer Leerlauf“:
+
+```promql
+100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle", instance=~".*20[1-3]:9100"}[1m])))
+```
+
+Verschachtelte PromQL-Ausdrücke liest man **von innen nach außen** — wie eine mathematische Formel mit Klammern:
+
+| Schritt | Ausdruck | Ergebnis |
+|---|---|---|
+| 1 | `node_cpu_seconds_total{mode="idle", instance=~".*20[1-3]:9100"}` | Counter: Leerlauf-Sekunden je Kern, nur für ph-node1–3 (`=~` = Regex-Filter, ph-monitor bleibt draußen) |
+| 2 | `rate(…[1m])` | Anteil Leerlauf pro Sekunde, je Kern zwischen 0 und 1 (1 = völlig untätig) |
+| 3 | `avg by (instance) (…)` | Mittelwert über alle Kerne eines Knotens (hier je 2 vCPU) → eine Zeile pro Knoten |
+| 4 | `1 - …` | aus Leerlauf wird Auslastung (0 = untätig, 1 = voll) |
+| 5 | `100 * …` | in Prozent |
+
+| Label-Filter | Bedeutung |
+|---|---|
+| `{label="wert"}` | exakt gleich |
+| `{label!="wert"}` | ungleich |
+| `{label=~"regex"}` | passt auf regulären Ausdruck |
+| `{label!~"regex"}` | passt nicht auf regulären Ausdruck |
+
+> **Merksatz:** PromQL von innen nach außen lesen: erst *was* (Metrik + Filter), dann *wie schnell* (`rate`), dann *zusammenfassen* (`avg/sum by`), zuletzt *umrechnen* (`1 -`, `100 *`).
+
+Panel-Einstellungen: Time series, Legend Custom `{{instance}}` + Regex-Transformation (Port **9100** statt 9187: `.*\.20(\d):9100.*` → `ph-node$1`), Unit *Percent (0-100)*, Soft max 100, Thresholds Base grün / 80 orange / 90 rot als Linien.
+
+**Stolperstein: Werte über 100 %.** In Explore stand die Darstellung noch auf *Stacked lines* — die Achse reichte bis 200. Eine Auslastung über 100 % ist ein sicheres Zeichen für gestapelte Kurven.
+
+Erwartung bei pgbench (Generator auf ph-node1, Leader ph-node2): ph-node2 am höchsten (Transaktionen, WAL), ph-node1 deutlich (pgbench + Replay), ph-node3 gering (nur Replay).
+
+**Messung 19.10.2026 (zwei pgbench-Läufe, `-c 10 -T 60`):**
+
+| Knoten | Vorhersage | Spitzen | |
+|---|---|---|---|
+| ph-node2 (Leader) | am höchsten | ~74 % / ~67 % | ✅ |
+| ph-node1 (pgbench + Replay) | deutlich | ~64 % / ~60 % | ✅ |
+| ph-node3 (nur Replay) | gering | ~55 % / ~58 % | ❌ Überraschung |
+
+#### Befund: ph-node3 wartet auf die Platte — `iowait`
+
+Aufschlüsselung nach CPU-Modus (Darstellung *Stacked lines* ist hier richtig, weil die Modi Teile eines Ganzen sind):
+
+```promql
+avg by (instance, mode) (rate(node_cpu_seconds_total{mode!="idle", instance=~".*203:9100"}[1m])) * 100
+```
+
+| Modus | Spitze 08:22 | Spitze 08:27 | Bedeutung |
+|---|---|---|---|
+| **iowait** | **46,1 %** | **52,7 %** | CPU untätig, wartet auf Platten-I/O |
+| system | 4,5 % | 2,3 % | Kernel-Arbeit |
+| user | ~2 % | ~2 % | PostgreSQL rechnet |
+
+Rund 90 % der „Auslastung“ von ph-node3 sind Warten. Bild: ein Handwerker, der auf eine Lieferung wartet, wird als „arbeitet“ gezählt. Ursache: Alle drei VMs schreiben auf **dieselbe physische Platte des Proxmox-Hosts** — der Leader WAL und Daten, beide Replicas spielen dasselbe WAL ein und schreiben dieselben Datenblöcke. Drei Schreiber an einer Kasse.
+
+Konsequenzen:
+
+- **Flaschenhals ist die Platte, nicht die CPU.** Im Laststufen-Test ist zu erwarten, dass I/O vor der CPU sättigt.
+- **Das CPU-Panel übertreibt**, weil „alles außer `idle`“ auch `iowait` zählt. Ehrlicher: echte Rechenarbeit `mode!~"idle|iowait"` und `iowait` getrennt zeigen.
+- **Lab-Einschränkung:** Drei HA-Knoten auf einem Host mit einer Platte teilen sich Ressourcen. In Produktion stehen die Knoten auf getrennter Hardware (und getrennten Storage-Pfaden); im Lab ist das bewusst vereinfacht.
+
+> **Merksatz:** Hohe CPU-„Auslastung“ ist nicht gleich Rechenarbeit — erst nach Modus aufschlüsseln. `iowait` heißt: Die CPU wartet auf die Platte.
+
+#### Ausblick: Failure Domains — warum ein vierter Knoten allein nicht reicht
+
+Ein PostgreSQL-Knoten auf eigener Hardware (z. B. i7) wäre der Gegenversuch zum `iowait`-Befund. Für Ausfallsicherheit über Hardware-Grenzen kommt es aber auf **etcd** an, nicht auf die Zahl der Datenknoten:
+
+| Rolle | Wer | ungerade Zahl nötig? |
+|---|---|---|
+| Stimmberechtigte (Gemeinderat) | etcd-Mitglieder | ja |
+| Datenknoten (Bürger, können Bürgermeister werden) | PostgreSQL + Patroni | nein |
+
+Fällt der Proxmox-Host mit allen drei etcd-Mitgliedern aus, wird eine Replica auf dem i7 **nicht** Leader — ohne Rat kein Leader-Schlüssel. Absicht: Der i7 kann einen toten Host nicht von einem gezogenen Netzwerkkabel unterscheiden. **Lieber kein Leader als zwei.**
+
+| Variante | Proxmox fällt aus | Ergebnis |
+|---|---|---|
+| 3 etcd auf Proxmox + i7 + Pi (5 Stimmen) | 2 von 5 übrig | keine Mehrheit, kein Leader |
+| je 1 etcd auf Proxmox, i7, Pi (3 Stimmen) | 2 von 3 übrig | neuer Leader auf dem i7 |
+
+> **Merksatz:** Kein einzelnes Gerät darf die Mehrheit der etcd-Stimmen halten. Ungerade Zahl allein reicht nicht — die Verteilung entscheidet. Deshalb haben Rechenzentren oft drei Verfügbarkeitszonen.
+
+Hilfsmittel, um Werte an einem bestimmten Zeitpunkt abzulesen: Zeitbereich so wählen, dass er genau am gesuchten Moment endet, Query-Typ **Instant**, Ansicht **Table**.
+
 #### Das fertige Dashboard
 
 ![Eigenes Dashboard PostgreSQL HA-Cluster mit allen sechs Panels](images/grafana-ha-dashboard.png)
@@ -3371,7 +3458,42 @@ Bild: Zwei Autos auf der Autobahn, von zwei Fotografen zu verschiedenen Zeitpunk
 
 > **Merksatz:** Eine Differenz ist nur so gut wie die Gleichzeitigkeit ihrer beiden Messwerte.
 
-Lösung (nächster Schritt): beide Positionen im selben Moment am selben Ort messen. Der Leader kennt in `pg_stat_replication` je Replica seine eigene Position und die eingespielte Position der Replica — in einer Abfrage, ein Foto mit beiden Autos. Das Lag-Panel wird auf die entsprechende postgres_exporter-Metrik umgebaut.
+#### Lösung: ein Foto mit beiden Autos (umgesetzt 19.10.2026)
+
+Zur Erinnerung, was die Zahlen sind: Das WAL ist ein Tonband, die **WAL-Position (LSN)** ist ein Byte-Zähler — wie weit der Schreibkopf des Leaders bzw. der Lesekopf der Replica auf dem Band steht. Der **Lag in Bytes** ist der Abstand zwischen beiden Köpfen.
+
+Das Problem der alten Query, im Bild: Leader und Replica fahren als zwei Autos hintereinander auf der Autobahn. Fotograf A fotografiert den **Leader** um 19:48:00 bei Kilometerstein 100. Fotograf B fotografiert die **Replica** erst Sekunden später — inzwischen ist sie bei Kilometerstein 108. Rechnung `100 − 108 = −8`: Die Replica scheint *vor* dem Leader zu fahren. In Wahrheit liegen nur die Fotos zeitlich auseinander. Im Stillstand (keine Schreiblast) fällt das nicht auf, weil beide Autos stehen; unter Last laufen sie mit mehreren MB/s, und wenige Sekunden Versatz ergeben Dutzende MiB „Fake-Lag“ — positiv **oder negativ**.
+
+| | alte Query | neue Query |
+|---|---|---|
+| PromQL | `scalar(max(patroni_xlog_location)) - (patroni_xlog_replayed_location > 0)` | `pg_stat_replication_pg_wal_lsn_diff` |
+| Quelle | zwei Scrapes, zwei Knoten, zwei Zeitpunkte | **eine** Abfrage auf dem Leader (`pg_stat_replication`) |
+| Bild | zwei Fotos zu verschiedenen Zeiten | **ein Foto mit beiden Autos** |
+| unter Last | Messartefakt bis −128 MiB | konsistent, nie negativ |
+
+Der Leader kennt in `pg_stat_replication` je Replica seine eigene WAL-Position und die eingespielte Position der Replica und berechnet die Differenz in derselben Abfrage. Der postgres_exporter stellt das als `pg_stat_replication_pg_wal_lsn_diff` bereit („Lag in bytes between master and slave“ in der Metrikbeschreibung; daneben `pg_stat_replication_pg_current_wal_lsn_bytes` und `pg_stat_replication_reply_time`).
+
+Eigenschaften der neuen Metrik:
+
+- Sie existiert **nur auf dem Leader** — nur dort laufen WAL-Sender. Im Lab: zwei Zeilen, `instance` 192.168.178.202.
+- Das Label `application_name` nennt die Replica: `ph-node1`, `ph-node3`. Weitere Labels: `client_addr` (IP der Replica), `slot_name`, `state="streaming"`.
+- Nach einem Failover kommt sie automatisch vom neuen Leader; die Replica-Namen in der Legende bleiben aussagekräftig.
+
+Panel-Umbau: Query ersetzen, Legend **Custom** `{{application_name}}`, Unit/Warnlinie/Soft max unverändert.
+
+**Verifiziert 19.10.2026** mit demselben Lauf wie am 17.10. (`-c 10 -j 2 -T 60`, zweimal): keine negativen Werte mehr; das Panel bleibt auf der 20-MiB-Achse flach. Den echten Spitzenwert zeigt Explore:
+
+```promql
+max_over_time(pg_stat_replication_pg_wal_lsn_diff[10m])
+```
+
+Ergebnis: **~125 KB je Replica** — rund 1/130 der Warnlinie. Die −128 MiB vom 17.10. waren reines Messartefakt. Ein flaches Lag-Panel unter Last ist ein gutes Lag-Panel.
+
+**Stolperstein: Stacked lines.** In Explore war die Darstellung *Stacked lines* aktiv — die Kurven werden aufeinandergestapelt, die Achse zeigt die Summe (250 K), nicht den Einzelwert. Für Vergleiche *Lines* wählen. Wie die abgeschnittene Achse: Die Darstellung kann täuschen, auch wenn die Daten stimmen.
+
+**Nebenbefund:** Die Cache-Hit-Ratio fiel während des Tests auch auf den Replicas (bis 90,8 %), obwohl dort nicht geschrieben wird — beim Einspielen des WAL werden dieselben Datenblöcke angefasst wie auf dem Leader. Nach dem Test erholten sich die Replicas schnell auf 99,6 %.
+
+> **Merksatz:** Eine Differenz ist nur so gut wie die Gleichzeitigkeit ihrer beiden Messwerte. Lag deshalb dort messen, wo beide Positionen im selben Moment bekannt sind — auf dem Leader in `pg_stat_replication`.
 
 #### Schnell-Referenz (zum Abfragen)
 
@@ -3438,3 +3560,11 @@ Lösung (nächster Schritt): beide Positionen im selben Moment am selben Ort mes
 - **Stat-Kachel zeigt die ganze Label-Liste statt eines Namens?** → Legend auf Custom `{{label}}` setzen; Text mode allein reicht nicht.
 - **Warum zeigt das Lag-Panel unter Last negative Werte?** → Leader und Replica werden zu verschiedenen Zeitpunkten gescrapt; unter Last läuft das WAL in der Zwischenzeit weiter. Lösung: beide Werte aus einer Abfrage auf dem Leader (`pg_stat_replication`).
 - **Warum fällt die Cache-Hit-Ratio unter pgbench-Last?** → Zufallszugriffe passen nicht in `shared_buffers` (128 MiB Werkseinstellung).
+- **Welche Metrik misst den Replikations-Lag ohne Scrape-Versatz?** → `pg_stat_replication_pg_wal_lsn_diff` vom postgres_exporter, berechnet in einer Abfrage auf dem Leader.
+- **Wie sieht man den Spitzenwert einer Metrik im Zeitfenster?** → `max_over_time(metrik[10m])` — wie ein Schleppzeiger.
+- **In welcher Reihenfolge liest man verschachteltes PromQL?** → Von innen nach außen: Metrik/Filter → `rate` → `avg/sum by` → Umrechnung.
+- **Was bedeutet `=~` im Label-Filter?** → Regex-Vergleich (z. B. `instance=~".*20[1-3]:9100"`).
+- **CPU-Kurve zeigt mehr als 100 %?** → Darstellung steht auf *Stacked lines*.
+- **Was bedeutet `iowait`?** → Die CPU ist untätig und wartet auf Platten-I/O; zählt in „alles außer idle“ trotzdem als Auslastung.
+- **Wann ist *Stacked lines* richtig?** → Wenn die Kurven Teile eines Ganzen sind (z. B. CPU-Modi); für Vergleiche *Lines*.
+- **Warum reichen zwei Rechenzentren für automatischen Failover nicht?** → Eines hält zwangsläufig die etcd-Mehrheit; fällt es aus, kann das andere keinen Leader wählen. Man braucht drei Failure Domains (ggf. einen reinen Schiedsrichter).
