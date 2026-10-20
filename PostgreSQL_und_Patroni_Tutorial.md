@@ -4494,6 +4494,60 @@ df -h /                                                                         
 - **Warum ein zentrales Archiv?** → Lokale Archive liegen auf der DB-Platte, sind über die Knoten verstreut, sterben mit dem Knoten und haben keine Retention.
 - **Was darf man im Notfall nie von Hand löschen?** → `pg_wal` im Datenverzeichnis.
 
+
+**Exkurs: Wie machen das die Großen (z. B. Meta)? Man kann doch nicht alles wegwerfen?**
+
+Gelöscht wurde nicht der Inhalt der Datenbank, sondern das **Änderungsprotokoll** (WAL). *Bild: Bankkonto* — der Kontostand ist die Datenbank (bleibt), die Buchungszeilen sind das WAL, der Monatsabschluss ist die Basissicherung. Nach einem sauberen Abschluss braucht man die älteren Buchungszeilen nicht mehr, um den Stand zu rekonstruieren.
+
+> **Merksatz:** Daten behält man. Änderungsprotokolle behält man nur so lange, wie man sie zum Wiederherstellen seit der letzten Sicherung braucht.
+
+Prinzipien großer Plattformen:
+- **Heiß / warm / kalt** (Schreibtisch / Büroregal / Lagerhalle): häufig gelesene Daten auf schnellen SSDs mit Cache nahe beim Nutzer, selten gelesene auf günstigeren Platten, Archive und Backups auf sehr günstigen Medien (z. B. Band). Meta hat dazu eigene Systeme beschrieben (Haystack für heiße, f4 für warme Fotos).
+- **Erasure Coding statt voller Kopien**: Daten in Stücke plus berechnete Prüfstücke; fehlende Stücke werden zurückgerechnet. *Bild: Sudoku* — fehlende Zahlen ergeben sich aus den anderen. Im Kleinen: RAID 5/6.
+- **Sharding**: statt einer Riesen-Datenbank Tausende überschaubare Cluster, je einer für einen Teil der Nutzer — jeder ähnlich wie das Lab (Primary, Replicas, Failover). *Bild:* eine Stadtteil-Bücherei statt einer Riesenbibliothek. Meta nutzt dafür historisch stark MySQL.
+
+Das Lab macht im Kleinen dasselbe: Replikation (Verfügbarkeit), Archiv + Basissicherung (Wiederherstellbarkeit), Retention (Protokolle nur so lange wie nötig). Der Unterschied ist Maßstab und Automatisierung, nicht das Prinzip.
+
+
+#### Punkt 4 — Panel „Plattenbelegung / (%)“: der Bau
+
+Query wie oben (vorher in Explore getestet). Einstellungen:
+
+| Einstellung | Wert | Warum |
+|---|---|---|
+| Visualisierung | **Bar gauge**, Display mode **Retro LCD** | ein Balken je Rechner wie eine Tankanzeige; die leeren Segmente zeigen schon, wo Gelb und Rot beginnen (Pegelanzeige am Hi-Fi-Verstärker) |
+| Query type | **Instant** | Wert *jetzt*, keine Geister |
+| Legend | Custom `{{instance}}` | fester Feldname für die Umbenennung |
+| Transformation 1 | Rename by regex `.*\.20(\d):9100.*` → `ph-node$1` | Rezept vom CPU-Panel |
+| Transformation 2 | Rename by regex `localhost:9100` → `ph-monitor` | Prometheus fragt seinen eigenen node_exporter als „localhost“ ab |
+| Unit / Min / Max | Percent (0–100), **0**, **100** | siehe Falle 1 |
+| Thresholds | Base grün, **70 gelb, 80 rot** | ein Lasttest füllte ph-node2 um 13–17 Punkte → zwischen Rot und 100 % bleibt genau ein Lasttest Puffer (Reservelampe: geht an, wenn man noch bis zur Tankstelle kommt) |
+| Color scheme | **From thresholds (by value)** | siehe Falle 3 |
+| Titel | „Plattenbelegung / (%)“ | „Füllstand“ klingt nach Bier — bei 93 % freut man sich dann eher. „Belegung“ ist auch das Wort von `df` (*Use%*) |
+
+**Drei Fallen unterwegs:**
+1. **Min/Max „auto“:** Grafana nimmt den kleinsten und größten Wert *der Daten* als Skala — 40 % sah leer aus, 56 % randvoll. *Bild:* Tankanzeige, die sich nach dem leersten und vollsten Auto auf dem Parkplatz richtet statt nach dem Tankvolumen. Für Prozentwerte immer 0 und 100 festlegen.
+2. **Value Mappings statt Thresholds:** Texte ersetzten die Zahl — bei einer Tankanzeige ist die Zahl die wichtigste Information. Einzelwerte wie `85` greifen nur bei genau 85,0; ein Wert von 93,1 fiele durch. Für fortlaufende Werte: **Thresholds**; Mappings für wenige diskrete Zustände (wie 0/1/2 bei „Replicas streamen“).
+3. **Farbverlauf (*Green-Yellow-Red by value*):** schon bei 40 % gelblich, bei 56 % fast orange. *Bild:* Tankanzeige, die bei halb voll nervös gelb leuchtet — nach einer Woche schaut keiner mehr hin. Klare Stufen per „From thresholds“.
+
+**Der Prüfstein: Hätte das Panel den echten Fehler gefunden?** Weil das Panel *Instant* nutzt, zeigt es den Wert **am Ende des Zeitfensters**. Ende auf 17:21 gesetzt (Zeitreise) → ph-node2 **93,1 %, rot**. *Bild:* Rauchmelder nicht nur eingebaut, sondern mit dem Rauch von heute Nachmittag getestet — er hat gepiept. Danach Zeitfenster zurück auf „Last 15 minutes“, bevor gespeichert wird (sonst festgeschraubtes Fernglas auf eine Uhrzeit).
+
+![Test gegen den echten Vorfall: Zeitfenster-Ende 17:21, ph-node2 bei 93,1 % rot](images/grafana-plattenbelegung-zeitreise-1721.png)
+
+![Panel „Plattenbelegung / (%)“ fertig](images/grafana-plattenbelegung.png)
+
+**Reihenfolge der Transformationen:** hier egal, weil sich die Muster nicht überschneiden (zwei Briefträger mit getrennten Bezirken). Heikel erst, wenn ein Muster das Ergebnis des anderen trifft — dann gilt wie bei Shell-Pipes: von oben nach unten, jede Stufe arbeitet mit dem Ergebnis der vorherigen.
+
+**Offen (Notiz):** Target in `prometheus.yml` von `localhost:9100` auf `192.168.178.204:9100` umstellen — dann passt das Namensschema überall ohne Extra-Regex. Achtung: neues `instance`-Label = neue Zeitreihe, alte Historie bleibt unter dem alten Namen. Alarm (Alerting) auf ≥ 80 % folgt mit dem Thema Alerting.
+
+> **Merksatz:** Ein Monitoring ist erst fertig, wenn es den letzten echten Vorfall erkannt hätte.
+
+**Kontrollfragen**
+- **Warum Min 0 / Max 100 statt auto?** → Auto skaliert nach dem Datenbereich; die Balken lügen dann über den echten Füllstand.
+- **Thresholds oder Value Mappings für Prozentwerte?** → Thresholds; Mappings für wenige diskrete Zustände.
+- **Was zeigt ein Instant-Panel bei verschobenem Zeitfenster?** → Den Wert am Ende des Fensters — so lässt sich ein vergangener Vorfall nachprüfen.
+- **Warum ph-monitor mit überwachen?** → Läuft der Überwacher voll, fällt die ganze Überwachung aus — unbemerkt.
+
 ---
 
 ## Anhang — Metaphern-Spickzettel (für Gespräch und Wiederholung)
@@ -4572,3 +4626,13 @@ Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Ge
 | History-Dateinamen in Hex | **Hausnummern in einem anderen Zahlensystem** | „`00000014.history` ist Timeline 20.“ |
 | lokales vs. zentrales Archiv | **Familienchronik im eigenen Keller vs. Bankschließfach** | „Das Archiv muss den Ausfall des Knotens überleben.“ |
 | Hausmeister ohne eigenen Tank-Check | **prüft alle Heizöltanks, nur nicht den im eigenen Keller** | „Auch der Monitoring-Server braucht Überwachung.“ |
+| WAL vs. Daten | **Buchungszeilen vs. Kontostand, Basissicherung = Monatsabschluss** | „Daten behält man, Protokolle nur bis zur nächsten Sicherung.“ |
+| Speicherstufen | **Schreibtisch / Büroregal / Lagerhalle** (heiß / warm / kalt) | „Je seltener gelesen, desto günstiger der Speicher.“ |
+| Erasure Coding | **Sudoku** — Fehlendes wird zurückgerechnet | „Absichern ohne alles doppelt zu speichern.“ |
+| Sharding | **Stadtteil-Büchereien statt einer Riesenbibliothek** | „Viele kleine Cluster statt einer Riesen-Datenbank.“ |
+| Min/Max „auto“ | **Tankanzeige nach dem leersten und vollsten Auto auf dem Parkplatz** | „Prozent-Skalen immer 0 bis 100.“ |
+| Farbverlauf statt Stufen | **Tankanzeige, die bei halb voll gelb leuchtet** | „Klare Schwellen statt hübscher Verläufe — sonst schaut keiner mehr hin.“ |
+| Schwellen mit Puffer | **Reservelampe geht an, wenn man noch bis zur Tankstelle kommt** | „Rot muss noch Zeit zum Handeln lassen.“ |
+| Instant-Panel + Zeitfenster-Ende | **Zeitreise / Rauchmelder mit echtem Rauch testen** | „Ein Monitoring ist erst fertig, wenn es den letzten echten Vorfall erkannt hätte.“ |
+| Retro-LCD-Bar-gauge | **Pegelanzeige am Hi-Fi-Verstärker** | „Man sieht nicht nur wie voll, sondern wie weit bis Rot.“ |
+| „Füllstand“ vs. „Belegung“ | **Bierglas** | „Panel-Titel so wählen, dass niemand ans Bier denkt.“ |
