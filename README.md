@@ -171,6 +171,8 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 ![HA-Dashboard auf einer Seite](./images/grafana-dashboard-eine-seite.png)
 
+- [x] Generalprobe unter Volllast (20.10.2026): 75 Clients, Leader-Ausfall + Replica-Ausfall unter Last — Failover auf ph-node3, 1 345 350 Transaktionen mit 0 Fehlern, Replica beide Male ohne `reinit` zurück (Replication Slot); neuer Leader lief durch Slot + lokales Archiv auf 94,6 % — Cockpit hat es rot gezeigt
+
 ### 🔜 Als Nächstes
 
 - [ ] Zentrales WAL-Archiv mit Aufbewahrungsregel (pgBackRest) und `restore_command` — Befund 20.10.2026: lokales Archiv lief auf dem Leader zweimal fast voll; PITR bis dahin bewusst ausgesetzt (nur Testdaten)

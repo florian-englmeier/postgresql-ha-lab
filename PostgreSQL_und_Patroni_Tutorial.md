@@ -4795,11 +4795,77 @@ sudo patronictl -c /etc/patroni.yml list   # unverändert: ph-node2 Leader, TL 2
 | 8 | Standardcluster `16/main` | auf allen Knoten entfernt (schlafendes Port-Risiko) |
 | 9 | Repo-Altlasten | sauber, `git gc`; Übungsrest `backup_test` gelöscht |
 
-**Offene Beobachtungen (ohne Eile):** Plattenstufe auf ph-node2 um ~12:27 ohne Logeintrag; ph-node1 mit ~10 % CPU bis ~17:45, danach ~0 — Ursache unbekannt.
+**Offene Beobachtungen (ohne Eile):** Plattenstufe auf ph-node2 um ~12:27 ohne Logeintrag; ph-node1 mit ~10 % CPU bis ~17:45, danach ~0 — **aufgeklärt:** Ein `watch patronictl list` (alle 2 s ein Python-Start plus etcd-Abfrage) lief dort und wurde um ~17:45 geschlossen. *Bild:* Bahnhofs-Anzeigetafel, die alle 2 Sekunden neu druckt — praktisch, aber nicht gratis. Live-Anzeigen nach dem Test beenden.
 
 **Als Nächstes:** zentrales WAL-Archiv mit pgBackRest (Bankschließfach statt Keller, Retention), danach Alerting zusammen mit dem Exporter-Upgrade.
 
 > **Merksatz des Tages:** Aufräumen ist keine Kosmetik. Drei der neun „Kleinigkeiten“ waren schlafende Risiken (volle Platte, etcd reißt Patroni mit, fremder Cluster auf Port 5432).
+
+
+### 17.16 Generalprobe unter Volllast: zwei Ausfälle, ein Cockpit
+
+**Ziel:** Abschlusstest des Tages — reagiert alles, was in 17.15 gebaut und geändert wurde, im echten Ernstfall richtig? Nicht Zeitreise, sondern echter Vorfall. *Bild:* Feueralarm-Übung im Rathaus während der Hauptsprechzeit.
+
+**Aufbau:** Last mit **75 Clients** (jenseits der Sättigung) über die VIP von ph-monitor:
+
+```bash
+pgbench -h 192.168.178.200 -p 5000 -U postgres -c 75 -j 2 -T 420 -P 10 pgbench_test
+```
+
+Stromausfälle auf dem Proxmox-Host, immer mit Zeitstempel in einer Zeile: `date; qm stop 202`. Kein `watch patronictl` dieses Mal (kostet ~10 % CPU, siehe 17.15) — das Cockpit zeigt alles.
+
+![Vorher: ph-node2 Leader, alles grün](images/generalprobe-1-vorher.png)
+
+#### Ablauf
+
+| Uhrzeit | Ereignis | Cockpit |
+|---|---|---|
+| ~21:15 | pgbench 75 Clients auf ph-node2 (Leader) | TPS ~2 600, Connections ~80 |
+| **21:17:25** | `qm stop 202` — **Leader weg** | pgbench: „backend died … aborted“, **0 failed**; Leader-Status mit kurzer Delle in der Kurve |
+| ~21:18 | **ph-node3 wird Leader**, TL 20 → 21 | „Aktueller Leader: ph-node3“ |
+| 21:18:05 | `qm start 202` — ph-node2 kommt als Replica zurück | „2 – voll abgesichert“ |
+| ~21:19:30 | pgbench neu — Last landet über die VIP auf ph-node3 | TPS 3 000–4 100, CPU ph-node3 ~90 % |
+| **21:22:52** | `qm stop 202` — **Replica unter Volllast weg** | Lag ph-node2 steigt auf ~1,25 GiB, dann **„1 – ohne Reserve“ (gelb)**; „Plattenbelegung“ nur noch 3 Balken |
+| 21:23–21:25 | Last auf Leader + 1 Replica | Platte ph-node3: 62 → 76 → 89 % |
+| **21:24:49** | `qm start 202` | Lag-Spitze ~1,75 GiB, in ~1 min aufgeholt → **„2 – voll abgesichert“**; Cache ph-node2 98,6 % (orange) |
+| ~21:26 | Ende Lauf 2 | ph-node3 **94,6 % (rot)** |
+
+![pgbench-Abbruch beim Leader-Ausfall: 0 failed](images/generalprobe-2-pgbench-abbruch-leaderausfall.png)
+
+![Nach dem Failover: ph-node3 Leader, ph-node2 zurück](images/generalprobe-3-node3-leader.png)
+
+![Replica unter Last ausgefallen: 1 – ohne Reserve, ph-node2 fehlt im Plattenpanel](images/generalprobe-4-replica-aus-ohne-reserve.png)
+
+![ph-node2 zurück, voll abgesichert — Leader ph-node3 bei 94,6 %](images/generalprobe-5-node2-zurueck-node3-94prozent.png)
+
+**Ergebnis pgbench:** Lauf 1 (Leader-Ausfall) 131 614 Transaktionen, 0 failed, Clients abgebrochen. Lauf 2 (Replica-Ausfall mittendrin) **1 345 350 Transaktionen, 0 failed, 3 204 TPS, Ø 23,4 ms**.
+
+![Lauf 2 komplett, 0 failed](images/generalprobe-6-ergebnis-pgbench.png)
+
+#### Fünf Erkenntnisse
+
+1. **Failover funktioniert unter Volllast.** ph-node3 übernahm, keine einzige fehlerhafte Transaktion; nur laufende Verbindungen brachen ab (pgbench verbindet nicht neu — eine Anwendung muss das selbst können).
+2. **ph-node2 kam beide Male ohne `reinit` zurück** — mit ~1,75 GiB Rückstand, also mehr als `wal_keep_size` (1 GB). Der Grund: Patroni hält für jede Replica einen **Replication Slot**; der Leader wirft kein WAL weg, das die Replica noch braucht. *Bild:* reservierter Stapel Durchschläge mit Namensschild — der Meister wirft ihn nicht weg, egal wie hoch er wird.
+3. **Genau deshalb lief die Platte des Leaders voll:** Slot-Rückhalt + lokales Archiv unter Volllast → 94,6 %. Sobald ph-node2 aufgeholt hatte, gab der Slot frei → 85 % ohne Zutun. Der Rest war Archiv → geleert → 40 %. Drittes Mal an einem Tag: Das lokale Archiv ist das Hauptrisiko des Labs. Und: Die Slot-Metrik auf dem Leader (Punkt 7) ist die Frühwarnung genau für diesen Fall.
+4. **Ein toter Knoten verschwindet stumm aus dem Plattenpanel** — drei statt vier Balken, nichts wird rot. „Replicas streamen“ mit fester Soll-Zahl hat den Ausfall dagegen erkannt (1 – ohne Reserve). Die Schulklasse in Aktion: Wer fehlt, meldet sich nicht — nur die Soll-Zahl von außen bemerkt es.
+5. **Erkennung mit Verzögerung:** Nach dem Stopp der Replica stieg ihr Lag zunächst weiter, erst dann verschwand sie aus `pg_stat_replication`. Der Leader merkt den Ausfall erst nach `wal_sender_timeout` (Standard 60 s). *Bild:* Er redet noch eine Minute ins tote Telefon.
+
+**Nebenbei:** Cache-Hit ph-node2 nach dem Neustart 98,6 % (orange) — kalter Cache, füllt sich wieder. Connections am Leader ~80 = Warnlinie (75 Clients + Exporter + Replikation, `max_connections = 100`).
+
+**Aufräumen danach** (ph-node3, nur Testdaten): `sudo find /var/lib/postgresql/wal_archive -type f ! -name '*.history' -delete` → 85 % → 40 %.
+
+![Nach dem Aufräumen: alle Knoten grün](images/generalprobe-7-nach-aufraeumen.png)
+
+> **Merksatz:** Ein HA-Cluster überlebt den Ausfall — aber jeder Ausfall verschiebt die Last woandershin: auf den neuen Leader, auf seine Platte, auf seine Slots. Die Generalprobe zeigt nicht nur, *ob* er übernimmt, sondern *was es ihn kostet*.
+
+**Offen daraus:** zentrales Archiv mit Retention (pgBackRest), Alarm auf Plattenbelegung und Slot-Rückhalt, Panel/Alarm „erwartete Knoten melden sich“ (fehlender Balken soll auffallen), optional `max_slot_wal_keep_size` als Obergrenze für den Slot-Rückhalt prüfen.
+
+**Kontrollfragen**
+- **Warum kam ph-node2 trotz 1,75 GiB Rückstand ohne `reinit` zurück?** → Der Replication Slot hielt das benötigte WAL auf dem Leader zurück.
+- **Warum lief die Platte des neuen Leaders voll?** → Slot-Rückhalt für die ausgefallene Replica plus lokales WAL-Archiv unter Volllast.
+- **Warum sank die Belegung von 94,6 auf 85 % ohne Eingriff?** → Nach dem Aufholen der Replica gab der Slot das WAL frei, `pg_wal` wurde recycelt.
+- **Warum zeigte „Plattenbelegung“ den Ausfall nicht an?** → Ein toter Knoten liefert keine Werte, sein Balken verschwindet still.
+- **Warum merkt der Leader den Ausfall einer Replica erst verzögert?** → `wal_sender_timeout` (Standard 60 s).
 
 ---
 
@@ -4911,3 +4977,6 @@ Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Ge
 | Ganzen Cluster neu aufsetzen statt einen Ordner entfernen | **Haus abreißen, um ein Zimmer zu räumen** | „Die kleinste Maßnahme, die das Problem löst.“ |
 | `git gc` | **lose Zettel werden ein Ordner im Regal** | „Git räumt auf, wenn man es lässt.“ |
 | idempotenter Befehl | **Lichtschalter auf „aus“ drücken, wenn das Licht schon aus ist** | „Gefahrlos wiederholbar — Grundlage für Automatisierung.“ |
+| Replication Slot | **reservierter Stapel Durchschläge mit Namensschild** | „Der Slot rettet die Replica — und füllt dafür die Platte des Leaders.“ |
+| `wal_sender_timeout` | **noch eine Minute ins tote Telefon reden** | „Der Leader merkt den Replica-Ausfall erst nach dem Timeout.“ |
+| Generalprobe unter Last | **Feueralarm-Übung zur Hauptsprechzeit** | „Nicht nur ob er übernimmt, sondern was es ihn kostet.“ |
