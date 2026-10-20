@@ -4286,6 +4286,137 @@ Bild: Man räumt alles Werkzeug vom Nebenzimmer auf die Werkbank. Die Statistik 
 - **Warum sinkt iowait bei mehr Clients?** → Group Commit: Ein `fsync` schreibt die WAL-Einträge mehrerer gleichzeitiger Commits.
 - **Woran erkennt man Sättigung?** → TPS stagniert (+2 %), Latenz steigt stark (+47 %).
 
+
+### 17.15 Aufräumliste nach dem Lasttest-Marathon
+
+Nach Lasttest, Failover unter Last und Tuning (17.12–17.14) blieben kleine Baustellen liegen. Sie werden einzeln abgearbeitet, jede mit Prüfung **vor** der Änderung und einer Zeile im Betriebslog.
+
+Stand zu Beginn (20.10.2026): Leader ph-node2, TL 20, `shared_buffers` 1 GB, `wal_keep_size` 1 GB.
+
+#### Punkt 1 — Das doppelte Grafana-Dashboard
+
+**Bild:** Ein Dashboard ist ein **Bilderrahmen**, die Messwerte sind die **Fotos im Archiv** (Prometheus). Einen Rahmen abzuhängen löscht keine Fotos — die Zeitreihen in Prometheus bleiben unberührt, nur die Ansicht verschwindet. Zwei Rahmen mit demselben Schild („PostgreSQL HA-Cluster“) unterscheidet man nicht am Schild, sondern an der **Seriennummer auf der Rückseite: der UID**.
+
+Was passiert ist — drei Lehrstücke in zehn Minuten:
+
+1. **Prüfregel veraltet.** Die Erkennungsregel „das gültige Dashboard hat 6 Panels“ stammte vom 17.10. Seitdem war das CPU-Panel dazugekommen; das geöffnete Dashboard hatte 7 Panels und sah verdächtig aktuell aus. Erst die URL klärte es: `/d/adv645n` — das gültige. *Lehre:* Gelöscht wird nach **eindeutiger Kennung**, nie nach Titel, Aussehen oder Erinnerung. Gleiches Prinzip wie `patronictl list` vor jedem Switchover.
+2. **Falsches Negativ.** Der erste Aufruf des Duplikats lieferte „**Page** not found“ — die URL enthielt `/d//ad5pq6d` (doppelter Schrägstrich). Mit korrekter URL kam „**Dashboard** not found“: Grafana hat die UID verstanden und gesucht. *Bild:* Wer bei Hausnummer „1 2“ statt „12“ klingelt und keine Antwort bekommt, weiß nicht, ob der Nachbar ausgezogen ist. *Lehre:* Ein Negativbefund zählt nur, wenn der Test selbst korrekt war (Health-Check mit falschem Port, `pg_isready` gegen falschen Host …). Der **genaue Fehlertext** verrät, wie weit der Test gekommen ist.
+3. **„Not found“ ≠ „gibt es nicht“.** In Grafana heißt „not found“ auch „du darfst es nicht sehen“ (Ordnerrechte, anderer Benutzer). Erst mit dem Wissen „angemeldet als `admin`“ — sieht alle Dashboards der Organisation — ist der Befund eindeutig: Das Duplikat war **schon gelöscht**, Zeitpunkt unbekannt.
+
+**Ergebnis:** `ad5pq6d` existiert nicht mehr; gültig ist `adv645n`. Im Betriebslog steht ehrlich „Zeitpunkt unbekannt, nicht dokumentiert“ — eine offen zugegebene Lücke ist mehr wert als ein nachträglich geglättetes Log. Nebenbefund: Der Stern an `adv645n` fehlte und wird neu gesetzt.
+
+> **Merksatz:** Löschen nach Kennung, nicht nach Namen. Und bevor man „ist weg“ meldet: prüfen, ob man an der richtigen Tür geklingelt hat.
+
+**Kontrollfragen**
+- **Was passiert mit den Messwerten, wenn man ein Grafana-Dashboard löscht?** → Nichts — die Daten liegen in Prometheus, gelöscht wird nur die Ansicht.
+- **Woran erkennt man zwei Dashboards gleichen Namens sicher?** → An der UID in der URL (`/d/<uid>/…`).
+- **„Page not found“ vs. „Dashboard not found“?** → Ersteres: URL nicht verstanden (Tippfehler). Letzteres: UID verstanden, aber kein Dashboard gefunden — oder keine Berechtigung.
+- **Was ist ein falsches Negativ im Betrieb?** → Ein Test meldet „nicht vorhanden/nicht erreichbar“, obwohl nur der Test falsch war.
+
+
+#### Punkt 2 — VM-Name `ph-monitorr` → `ph-monitor`
+
+```bash
+# auf dem Proxmox-Host
+qm set 204 --name ph-monitor
+qm config 204 | grep ^name      # → name: ph-monitor
+# in der VM
+hostname                        # → ph-monitor (war schon richtig)
+```
+
+**Bild: Briefkasten und Telefon.** Ein Rechner hat zwei Namen, die nichts voneinander wissen:
+
+| Ebene | Wo steht der Name? | Wer sieht ihn? |
+|---|---|---|
+| **Briefkastenschild** (Hypervisor) | `/etc/pve/qemu-server/204.conf` → `name:` | Proxmox-UI, `qm list` |
+| **Wie sich der Bewohner am Telefon meldet** (Gast-OS) | `/etc/hostname` | `hostname`, Prompt, Logs, node_exporter (`node_uname_info{nodename=…}`) |
+
+`qm set --name` tauscht nur das Schild — **kein Neustart**, der Gast merkt nichts. Hier lag der Tippfehler nur auf dem Schild; `hostname` war schon korrekt. Prometheus kennt Targets über **IP:Port** aus `prometheus.yml` und ist vom Proxmox-Namen unabhängig. Ein falscher *Gast*-Hostname würde dagegen im Monitoring auffallen: im Label `nodename` von `node_uname_info`, z. B. in der Host-Auswahl des Dashboards *Node Exporter Full*.
+
+**Reihenfolge-Regel:** Harmlose, umkehrbare Änderung → *ändern, dann prüfen*. Nicht umkehrbare Änderung (Löschen, `reinit`) → *erst prüfen, dann ändern*. Bild: Ein Briefkastenschild tauscht man und schaut, ob es gerade hängt; bevor man den Briefkasten abschraubt, schaut man, ob noch Post drin ist.
+
+**Kontrollfragen**
+- **Ändert `qm set <id> --name` den Hostnamen im Gast?** → Nein, nur den Anzeigenamen in Proxmox. Der Gast-Hostname steht in `/etc/hostname`.
+- **Braucht die Umbenennung einen Neustart?** → Nein.
+- **Wo fiele ein falscher Gast-Hostname im Monitoring auf?** → Im Label `nodename` von `node_uname_info` (node_exporter), z. B. in der Host-Auswahl von *Node Exporter Full*.
+
+
+#### Punkt 3 — Panel „Replicas streaming“: Überlegungen vor dem Bauen
+
+**Warum ein neues Panel?** Beim Failover-Test am 19.10. stand „Leader-Status: OK“, während eine Replica wegen einer WAL-Lücke nicht mehr streamte. `sum(patroni_primary)` zählt nur Leader — eine hängende Replica hat wie eine gesunde `patroni_primary = 0`. *Bild:* Das Schild am Rathaus sagt „Bürgermeister im Dienst“, nicht ob seine Stellvertreter krank im Bett liegen. Das Lag-Panel hilft auch nicht zuverlässig: Eine Replica, die nicht mehr streamt, verschwindet aus `pg_stat_replication` — ihre Linie wird nicht rot, sie ist einfach **weg**.
+
+| Panel | Frage | bemerkt hängende Replica? |
+|---|---|---|
+| Leader-Status `sum(patroni_primary)` | Gibt es genau einen Leader? (immer 1, unabhängig von der Knotenzahl) | nein |
+| Replikations-Lag | Wie weit hinken streamende Replicas hinterher? | nur, wenn man die *fehlende* Linie bemerkt |
+| **Replicas streaming** | Wie viele Stellvertreter sind einsatzbereit? | ja — Zahl fällt |
+
+**Wer weiß es?** Der **Leader**: `pg_stat_replication` listet, an wen er gerade WAL sendet. An sich selbst sendet er nicht — bei 3 Knoten also höchstens **2** Zeilen.
+
+**Ampel:** 2 = grün, 1 = gelb (läuft, aber ohne Reserve), 0 = rot (beim nächsten Leader-Ausfall kann niemand übernehmen). Eine Ampel „grün bei 3“ wäre dauerhaft gelb — der Chef, der sich selbst als Stellvertreter mitzählt, wird nie vollzählig. Eine Ampel, die immer dieselbe Farbe zeigt, ist Tapete. (Ein *anderes* Panel, „wie viele Knoten leben“, `count(up{job="patroni"} == 1)`, soll dagegen 3 zeigen — man muss wissen, *was* man zählt.)
+
+**Feste Soll-Zahl oder „Soll aus Meldungen ableiten“?** Verlockend wäre: *Knoten mit `patroni_primary == 0` minus streamende Replicas = fehlende Replicas* — skaliert automatisch mit der Clustergröße. Aber: Ist ph-node3 **komplett aus**, meldet er gar kein `patroni_primary` mehr. Soll = 1, Ist = 1, fehlend = 0 → **grün**, obwohl ein Knoten fehlt.
+
+**Bild: die Schulklasse.** Die Lehrerin weiß, dass ihre Klasse 25 Kinder hat, zählt 24 → eins fehlt (Weg A). Fragt sie stattdessen „Wer fehlt heute? Bitte melden!“, meldet sich niemand — das fehlende Kind sitzt ja nicht im Raum (Weg B).
+
+> **Merksatz:** Wer ausgefallen ist, kann sich nicht krankmelden. Die Soll-Zahl muss von außen kommen.
+
+**Entscheidung:** feste Schwelle (grün bei 2). Preis: Beim Einbinden eines vierten Knotens die Schwelle auf 3 anheben — gehört auf die Checkliste „neuen Knoten einbinden“.
+
+**Kontrollfragen**
+- **Warum erkennt `sum(patroni_primary)` keine hängende Replica?** → Es zählt nur Leader; eine hängende Replica hat wie eine gesunde den Wert 0.
+- **Warum zeigt `pg_stat_replication` bei 3 Knoten höchstens 2 Zeilen?** → Der Leader listet nur die Empfänger seines WAL, nicht sich selbst.
+- **Warum kann man das Soll nicht aus den Meldungen der Knoten ableiten?** → Ein ausgefallener Knoten meldet nichts mehr und fällt so aus Soll *und* Ist heraus — die Differenz bleibt 0.
+
+
+#### Punkt 3 — Panel „Replicas streamen“: der Bau
+
+**Erst die Birne testen, dann in die Lampe schrauben:** Query zuerst in **Explore** ausführen (Ergebnis: 2). Zeigt Explore schon „No data“, liegt der Fehler in der Query, nicht in Panel-Einstellungen.
+
+```promql
+count(pg_stat_replication_pg_wal_lsn_diff{state="streaming"}) or vector(0)
+```
+
+| Teil | Wirkung | Bild |
+|---|---|---|
+| `pg_stat_replication_pg_wal_lsn_diff` | eine Zeile je Replica, an die der Leader sendet (dieselbe Metrik wie das Lag-Panel) | die Liste des Chefs: „an diese Stellvertreter schicke ich Post“ |
+| `{state="streaming"}` | nur Replicas, die wirklich streamen (nicht `catchup`) | nur wer am Platz sitzt und arbeitet |
+| `count(…)` | Anzahl → 2 | die Lehrerin zählt durch |
+| `or vector(0)` | keine Zeile → 0 statt „No data“ | leeres Klassenzimmer: „Wenn keiner antwortet, schreib 0 an die Tafel“ |
+
+Ohne `or vector(0)` liefert `count()` über eine leere Menge **gar nichts** — das Panel wäre grau statt rot, genau im schlimmsten Fall.
+
+**Einstellungen im Panel (Grafana 13):**
+- Edit → „+“ → Visualization → Typ **Stat** (*Tankanzeige* statt *Fahrtenbuch* Time series — gefragt ist der Wert *jetzt*)
+- Query-Options: **Type: Instant** (sonst Geister-Werte, siehe Aktueller Leader)
+- **Value mappings** statt nackter Zahl, Zahl im Text mitführen:
+
+| Wert | Text | Farbe |
+|---|---|---|
+| 0 | `0 – keine Reserve!` | rot |
+| 1 | `1 – ohne Reserve` | gelb |
+| 2–99 | `2 – voll abgesichert` | grün |
+| null + NaN | `Keine Daten` | rot (fängt ab, dass Prometheus selbst nicht antwortet — da hilft auch `or vector(0)` nicht) |
+
+- Texte kurz halten, Begründung in die Panel-Beschreibung (ⓘ). Jedes Wort muss stimmen: „mehr als 2 streamen“ wäre falsch gewesen — eine Tankanzeige mit „mehr als voll“ glaubt man beim nächsten Mal weniger.
+- Speichern mit aussagekräftiger Message (*was* + *warum*), wie `git commit -m`. Grafana führt eine eigene Versionsgeschichte (*Settings → Versions*). *Bild:* Zettel an der Gefriertüte — „Gulasch, 20.10., 4 Portionen“ statt „Essen“. Edit = `BEGIN`, Save = `COMMIT`, Discard = `ROLLBACK`; andere sehen Änderungen erst nach dem Speichern.
+
+![Dashboard mit neuem Panel „Replicas streamen“](images/grafana-replicas-streamen.png)
+
+Das Panel steht direkt unter dem Leader-Status: oben „Gibt es einen Bürgermeister?“, darunter „Sind seine Stellvertreter einsatzbereit?“
+
+**Checkliste „neuen Knoten einbinden“ (Ergänzung):** Ampel in „Replicas streamen“ anheben (bei 4 Knoten: grün ab 3, gelb 1–2, rot 0). Sonst zeigt das Panel bei 2 von 3 Replicas grün — die Lehrerin weiß nicht, dass die Klasse gewachsen ist.
+
+**Nebenfrage: Ist ein vierter Knoten nicht schlecht, weil gerade?** Nein. Ungerade muss der **Gemeinderat** sein (etcd, stimmt ab); Patroni-/PostgreSQL-Knoten sind **Bürger**, die sich nur bewerben. Ein 4. Datenknoten (z. B. auf dem i7, eigene Failure Domain) bleibt Client des 3er-etcd-Clusters.
+
+> **Merksatz:** Ungerade muss der Rat sein (etcd), nicht die Zahl der Bürger (Datenknoten).
+
+**Kontrollfragen**
+- **Warum `or vector(0)`?** → `count()` über eine leere Menge liefert keine Daten statt 0; das Panel würde grau statt rot.
+- **Warum zusätzlich ein Mapping für null/NaN?** → Antwortet Prometheus selbst nicht, hilft `or vector(0)` nicht; „Keine Daten“ muss rot sein.
+- **Warum Stat und nicht Time series?** → Gefragt ist der aktuelle Zustand (Tankanzeige), nicht der Verlauf (Fahrtenbuch).
+- **Muss die Zahl der PostgreSQL-Knoten ungerade sein?** → Nein, nur die der etcd-Mitglieder (Abstimmende).
+
 ---
 
 ## Anhang — Metaphern-Spickzettel (für Gespräch und Wiederholung)
@@ -4343,3 +4474,17 @@ Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Ge
 | immer grünes Dashboard | **Tapete** | „Lücken im Monitoring findet man, indem man etwas kaputt macht.“ |
 | in der Legende isolierte Serie, mitgespeichert | **festgeschraubtes Fernglas** auf ein Haus — zieht der Bewohner um, sieht man nichts | „Leeres Panel heißt nicht immer keine Daten — manchmal ist die Linie nur ausgeblendet.“ |
 | Grafana / patronictl / Log | **Rauchmelder / Blick in den Raum / Brandursachen-Ermittlung** | „Dashboards zum Bemerken, Logs zum Verstehen.“ |
+| zwei Dashboards gleichen Titels | **Zwillinge** — man erkennt sie an der Narbe am Knie (UID), nicht am Namen | „Gelöscht wird nach Kennung, nie nach Titel.“ |
+| falsches Negativ (Tippfehler im Test) | **an der falschen Hausnummer klingeln** — keiner öffnet, der Nachbar wohnt trotzdem noch da | „Ein Negativbefund zählt nur, wenn der Test selbst stimmt.“ |
+| Dashboard löschen | **Bilderrahmen abhängen** — die Fotos (Prometheus) bleiben im Archiv | „Ein Dashboard ist nur die Ansicht, nicht die Daten.“ |
+| Proxmox-VM-Name vs. Hostname | **Briefkastenschild vs. wie sich der Bewohner am Telefon meldet** | „`qm set --name` ändert das Schild, nicht den Hostnamen im Gast.“ |
+| umkehrbar vs. nicht umkehrbar | **Schild tauschen vs. Briefkasten abschrauben** | „Umkehrbares: ändern, dann prüfen. Unumkehrbares: erst prüfen, dann ändern.“ |
+| Leader-Panel vs. Replica-Panel | **Schild „Bürgermeister im Dienst“** sagt nichts über kranke Stellvertreter | „Ein Leader allein ist noch keine Hochverfügbarkeit — die Reserve muss streamen.“ |
+| Soll aus Selbstmeldungen ableiten | **Schulklasse: „Wer fehlt, bitte melden!“** — das fehlende Kind kann sich nicht melden | „Wer ausgefallen ist, kann sich nicht krankmelden. Die Soll-Zahl muss von außen kommen.“ |
+| Ampel „grün bei 3“ für Replicas | **Chef zählt sich selbst als Stellvertreter mit** — nie vollzählig | „Erst klären, *was* man zählt: Knoten oder streamende Replicas.“ |
+| `or vector(0)` | **leeres Klassenzimmer** — keiner antwortet, also „0“ an die Tafel | „Fehlende Daten in einen echten Alarm verwandeln.“ |
+| Stat vs. Time series | **Tankanzeige vs. Fahrtenbuch** | „Für den Zustand jetzt: Stat. Für den Verlauf: Time series.“ |
+| Query erst in Explore testen | **Glühbirne in der Hand testen**, bevor man sie in die Lampe schraubt | „Erst die Messung prüfen, dann den Rahmen bauen.“ |
+| Dashboard-Edit / Save / Discard | **BEGIN / COMMIT / ROLLBACK** | „Andere sehen meine Änderung erst nach dem Speichern.“ |
+| Save-Message | **Zettel an der Gefriertüte** | „Eine Message sagt *was* und *warum* — wie ein Commit.“ |
+| etcd ungerade, Datenknoten egal | **Gemeinderat vs. Bürger** | „Ungerade muss der Rat sein, nicht die Zahl der Bürger.“ |
