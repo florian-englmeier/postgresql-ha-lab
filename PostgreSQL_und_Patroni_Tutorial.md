@@ -4417,6 +4417,83 @@ Das Panel steht direkt unter dem Leader-Status: oben „Gibt es einen Bürgermei
 - **Warum Stat und nicht Time series?** → Gefragt ist der aktuelle Zustand (Tankanzeige), nicht der Verlauf (Fahrtenbuch).
 - **Muss die Zahl der PostgreSQL-Knoten ungerade sein?** → Nein, nur die der etcd-Mitglieder (Abstimmende).
 
+
+#### Punkt 4 — Plattenfüllstand: Der Test fand den Ernstfall
+
+Geplant war nur ein Panel. Der Query-Test in Explore fand vorher den Notfall:
+
+```promql
+100 * (1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"})
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `node_filesystem_avail_bytes` | freier Platz, den normale Benutzer nutzen dürfen |
+| `node_filesystem_size_bytes` | Gesamtgröße |
+| `1 - avail/size`, `100 *` | belegter Anteil in Prozent |
+
+Ergebnis (17:21): ph-node1 46 %, **ph-node2 93 %**, ph-node3 46 %, ph-monitor (`localhost:9100`) 56 %. Vier Zeilen — auch der Monitoring-Server wird überwacht (sonst: der Hausmeister, der alle Heizöltanks prüft, nur nicht den im eigenen Keller).
+
+**Bild: Tankanzeige.** Wir wollten sie gerade einbauen — und die Reservelampe leuchtete schon. Erst tanken, dann weiterbauen.
+
+**Den Graphen lesen (Explore, 6 h, Lines):** Bei jedem Lasttest wachsen alle drei Knoten kurz (Spitze), aber nur der Leader behält den Zuwachs (Stufe). Seit ~12:30 flach → wächst nicht weiter, aber mit 7 % Rest reicht ein Lasttest bis 100 %.
+
+> **Merksatz:** Was auf allen Knoten kurz wächst, ist `pg_wal` (wird recycelt). Was nur auf dem Leader wächst und bleibt, ist das lokale WAL-Archiv.
+
+*Bild:* Nach jeder Party gibt es in allen Wohnungen kurz Müll; der Leader legt von jedem Müllsack eine Kopie in den Keller — und den Keller räumt niemand auf.
+
+**Plausibilitätsrechnung:** (93 % − 46 %) × 18 GB ≈ 8,5 GB. Gemessen: `du -sh wal_archive` → 9,1 G, 581 Dateien × 16 MB ≈ 9,3 GB. Passt.
+
+**Falsche Tür, schon wieder:** `du` auf `/var/lib/postgresql/16/main/pg_wal` zeigte 17 MB — das ist der ungenutzte Ubuntu-Standardcluster. Patroni arbeitet in `data_dir` aus `patroni.yml`: `/var/lib/postgresql/16/patroni`.
+
+**Ist das Archiv etwas wert?** PITR braucht Basissicherung **plus lückenlos alle WAL seitdem**. Letzte Basissicherung: Übungen in Teil 13; WAL vor dem 20.10. wurde um 11:18 gelöscht → Kette gerissen, Archiv für PITR wertlos. *Bild:* Tagebuchseiten 300–900 ohne Band 1.
+
+| Weg | Inhalt |
+|---|---|
+| A | Archiv leeren — sofort Platz, keine PITR |
+| B | Neue Basissicherung, dann `pg_archivecleanup` — aber Basissicherung auf derselben fast vollen Platte = Rettungsboot am sinkenden Schiff festgebunden |
+| **C (gewählt)** | jetzt leeren (nur Testdaten), PITR bewusst und dokumentiert ausgesetzt, zentrales Archiv mit pgBackRest als nächstes Projekt |
+
+Man darf auf eine Absicherung verzichten — man muss es nur **wissen und aufschreiben**.
+
+**Was gelöscht wird — und was nie:**
+
+| Was | Löschen? |
+|---|---|
+| Segmente im WAL-Archiv | ja |
+| `.history`-Dateien im Archiv | nein — wenige Bytes, Stammbaum der Timelines |
+| `pg_wal` im Datenverzeichnis | **niemals von Hand** — das laufende Tagebuch |
+| Tabellen in der Datenbank | nein — auf allen Knoten gleich, nicht das Problem |
+
+```bash
+# Probelauf: zählen
+sudo find /var/lib/postgresql/wal_archive -type f ! -name '*.history' | wc -l   # 578
+sudo find /var/lib/postgresql/wal_archive -type f -name '*.history'             # 3 Dateien
+# Löschen — der Ausschlussfilter ! -name '*.history' schützt den Stammbaum
+sudo find /var/lib/postgresql/wal_archive -type f ! -name '*.history' -delete
+df -h /                                                                          # 93 % → 40 %
+```
+
+**Hex-Falle bei History-Dateien:** Timeline-Nummern stehen hexadezimal im Namen. `00000014.history` = Timeline **20**, `00000010` = 16, `00000012` = 18. *Bild:* Hausnummern in einem anderen Zahlensystem — das Schild „14“ hängt am 20. Haus. Auf ph-node2 lagen nur 16/18/20 — die Timelines, die **er** als neuer Leader gestartet hat; 17 und 19 liegen in den Archiven von node1/node3. Ältere History-Dateien hatte der Aufräumbefehl von 11:18 (`! -newermt`, ohne Ausschlussfilter) mitgelöscht.
+
+**Die Lehre: ein zentrales Archiv, unabhängig von den Datenknoten.** *Bild:* Familienchronik im eigenen Keller vs. **Bankschließfach** — brennt ein Haus, überlebt das Schließfach.
+
+| Problem lokales Archiv | erlebt |
+|---|---|
+| liegt auf derselben Platte wie DB und etcd | Incident 20.10. 11:08: 100 %, etcd tot |
+| über die Knoten verstreut (wandert mit dem Leader) | Stammbaum über drei Keller verteilt |
+| stirbt mit dem Knoten | (Ernstfall, noch nicht erlebt) |
+| keine Aufbewahrungsregel | zweimal an einem Tag fast voll |
+
+**3-2-1-Regel:** 3 Kopien, 2 Medien, 1 außer Haus. Lösung im Lab: pgBackRest-Repository auf ph-monitor oder NAS mit `repo1-retention-full=2` — der Keller räumt sich selbst auf.
+
+**Kontrollfragen**
+- **Warum wächst nur der Leader dauerhaft?** → Nur der Leader archiviert WAL (`archive_command`); `pg_wal` wird auf allen Knoten recycelt.
+- **Wann ist ein WAL-Archiv für PITR wertlos?** → Wenn keine Basissicherung existiert, ab der alle WAL lückenlos vorliegen.
+- **Was bedeutet `00000014.history`?** → History-Datei der Timeline 20 (hex 14).
+- **Warum ein zentrales Archiv?** → Lokale Archive liegen auf der DB-Platte, sind über die Knoten verstreut, sterben mit dem Knoten und haben keine Retention.
+- **Was darf man im Notfall nie von Hand löschen?** → `pg_wal` im Datenverzeichnis.
+
 ---
 
 ## Anhang — Metaphern-Spickzettel (für Gespräch und Wiederholung)
@@ -4488,3 +4565,10 @@ Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Ge
 | Dashboard-Edit / Save / Discard | **BEGIN / COMMIT / ROLLBACK** | „Andere sehen meine Änderung erst nach dem Speichern.“ |
 | Save-Message | **Zettel an der Gefriertüte** | „Eine Message sagt *was* und *warum* — wie ein Commit.“ |
 | etcd ungerade, Datenknoten egal | **Gemeinderat vs. Bürger** | „Ungerade muss der Rat sein, nicht die Zahl der Bürger.“ |
+| Plattenfüllstand-Panel | **Tankanzeige** — beim Einbau leuchtete schon die Reservelampe | „Monitoring zeigt Probleme, bevor der Motor stottert.“ |
+| `pg_wal` vs. lokales Archiv | **Party-Müll in jeder Wohnung vs. Kopie jedes Müllsacks im Keller des Leaders** | „Kurz überall: `pg_wal`. Dauerhaft nur beim Leader: das Archiv.“ |
+| WAL ohne Basissicherung | **Tagebuchseiten 300–900 ohne Band 1** | „Ohne Basissicherung ist das Archiv für PITR wertlos.“ |
+| Basissicherung auf voller Platte | **Rettungsboot am sinkenden Schiff festgebunden** | „Backups gehören nicht auf die Platte, die sie retten sollen.“ |
+| History-Dateinamen in Hex | **Hausnummern in einem anderen Zahlensystem** | „`00000014.history` ist Timeline 20.“ |
+| lokales vs. zentrales Archiv | **Familienchronik im eigenen Keller vs. Bankschließfach** | „Das Archiv muss den Ausfall des Knotens überleben.“ |
+| Hausmeister ohne eigenen Tank-Check | **prüft alle Heizöltanks, nur nicht den im eigenen Keller** | „Auch der Monitoring-Server braucht Überwachung.“ |
