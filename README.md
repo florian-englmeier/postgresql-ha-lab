@@ -167,10 +167,14 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 > Details zu den drei Bugs beim Aufsetzen von keepalived (VRRP-`weight`-Logik, `enable_script_security`, Dateiberechtigungen) stehen in [Teil 12 des Tutorials](./PostgreSQL_und_Patroni_Tutorial.md#teil-12--der-echte-failover-test-und-drei-bugs-unterwegs).
 
+- [x] Aufräumliste (20.10.2026): Panels „Replicas streamen“ und „Plattenbelegung“ (fand beim Test einen zweiten drohenden Plattenvoll-Fall auf dem Leader), Dashboard auf einer Seite, Grafana ohne Plugin-Auto-Update, `patroni.service` mit `Wants=` statt `Requires=` etcd (etcd-Neustart ohne Leader-Wechsel nachgewiesen), ungenutzter Standardcluster `16/main` entfernt (`start.conf auto` auf Port 5432 — schlafendes Risiko)
+
+![HA-Dashboard auf einer Seite](./images/grafana-dashboard-eine-seite.png)
+
 ### 🔜 Als Nächstes
 
-- [ ] Zentrales WAL-Archiv mit Aufbewahrungsregel (pgBackRest) und `restore_command` — Befund 20.10.2026: lokales Archiv lief auf dem Leader voll
-- [ ] Panel „Replicas streaming“ und Alarm auf Plattenfüllstand
+- [ ] Zentrales WAL-Archiv mit Aufbewahrungsregel (pgBackRest) und `restore_command` — Befund 20.10.2026: lokales Archiv lief auf dem Leader zweimal fast voll; PITR bis dahin bewusst ausgesetzt (nur Testdaten)
+- [ ] Alerting: Plattenbelegung ≥ 80 %, Replicas streamen < 2, Slot-Retention — zusammen mit Upgrade des postgres_exporter (0.15 → aktuell, Metrik-Umbenennungen beachten)
 
 ---
 
@@ -185,6 +189,8 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 - **Ein Failover ist erst fertig, wenn die Reserve wieder streamt.** Der Cluster lief nach dem Ausfall grün weiter, während eine Replica wegen einer WAL-Lücke festhing — Ursache ein Checkpoint drei Stunden vorher, mitten im Lasttest. Ausfalltests prüfen deshalb auch den Wiederanlauf und das Monitoring selbst: Zwei Panels zeigten „Geister“ (letzter Wert eines toten Knotens), eines war per gespeicherter Legenden-Auswahl blind. Lösung: Instant-Queries für „Wer ist jetzt …?“, `wal_keep_size` als Reserve, zentrales WAL-Archiv als nächster Schritt.
 - **Tuning trifft nur, wenn es den Engpass trifft.** `shared_buffers` hob die Cache-Hit-Ratio von 94 auf 99 %, der Durchsatz blieb gleich: Die Fehlgriffe kamen aus dem RAM des Betriebssystems, und die CPU war am Anschlag. Vorher-Messung, Aufwärm-Lauf und nur eine geänderte Variable machen den Vergleich erst aussagekräftig.
 - **Ein offener Punkt im Betriebslog ist eine Zeitbombe.** „Archiv ohne Aufbewahrungsregel“ war notiert — einen Tag später stand der Leader mit voller Platte da, und etcd auf demselben Datenträger fiel mit.
+- **Ein Monitoring ist erst fertig, wenn es den letzten echten Vorfall erkannt hätte.** Schon der Test der Abfrage für das neue Plattenpanel fand den Leader wieder bei 93 % — das lokale WAL-Archiv war nach dem Aufräumen am Vormittag durch zwei Lasttests erneut gewachsen. Das fertige Panel wurde per Zeitfenster auf genau diesen Moment zurückgestellt und zeigte ihn rot.
+- **Nicht jeder Fehler muss sofort behoben werden — er muss verstanden, bewertet und dokumentiert werden.** Der Exporter-Fehler „recovery is in progress“ auf den Replicas ist bekannt, harmlos und begründet zurückgestellt; ein hastiger Fix hätte zwei Panels die Datenquelle genommen.
 
 ---
 

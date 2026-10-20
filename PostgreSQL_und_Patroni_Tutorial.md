@@ -4773,6 +4773,34 @@ sudo patronictl -c /etc/patroni.yml list   # unverändert: ph-node2 Leader, TL 2
 - **Löscht `pg_dropcluster 16 main` die PostgreSQL-Programme?** → Nein, nur Daten, Config und Log dieses Clusters.
 - **Warum ist `16/patroni` auf dem Leader größer?** → `wal_keep_size` hält dort zusätzliches WAL in `pg_wal` vor.
 
+
+#### Punkt 9 — Repo-Altlasten und Übungsreste
+
+- `backup_test` (Übungsrest aus Teil 13) auf ph-node1 gelöscht: `sudo rm -rf /var/lib/postgresql/16/backup_test`. Regel: Übungsreste werden entfernt; neue Übungen werden bei Bedarf neu angelegt.
+- `.git`: keine Lock- oder stale-Dateien mehr, kein `_to_delete`, Branch synchron mit `origin/main`.
+- `git count-objects -vH` zeigte 389 lose Objekte, 0 Packs — die automatische Wartung war nie gelaufen (vermutlich früher durch die Lock-Datei blockiert). `git gc` → 0 lose, 1 Pack, 17,6 MiB statt 22,1 MiB. Dass `gc` durchlief, ist zugleich der Beweis, dass kein Lock mehr stört. *Bild:* 389 lose Zettel auf dem Schreibtisch werden ein Ordner im Regal.
+- Befehle, die man gefahrlos wiederholen kann (`pg_dropcluster` auf einen schon entfernten Cluster meldet nur „does not exist“), heißen **idempotent** — Grundprinzip für Automatisierung (Ansible).
+
+#### Ergebnis der Aufräumliste (20.10.2026)
+
+| # | Punkt | Ergebnis |
+|---|---|---|
+| 1 | Doppeltes Dashboard `ad5pq6d` | war schon gelöscht (Zeitpunkt unbekannt); Stern an `adv645n` neu |
+| 2 | VM-Name `ph-monitorr` | → `ph-monitor` (nur Proxmox-Name, Hostname war richtig) |
+| 3 | Panel „Replicas streamen“ | neu, Ampel 2/1/0, feste Soll-Zahl |
+| 4 | Plattenbelegung | Test fand ph-node2 bei 93 % → Archiv geleert (PITR bis pgBackRest ausgesetzt); Panel neu, gegen Vorfall 17:21 geprüft |
+| 5 | Grafana-Plugin-Auto-Update | `preinstall_disabled = true`; Dashboard auf einer Seite |
+| 6 | `Requires=` → `Wants=` | etcd-Neustart ohne Patroni-Neustart nachgewiesen (PID gleich) |
+| 7 | `recovery is in progress` | Ursache verstanden, bewusst akzeptiert, Fix mit Exporter-Upgrade |
+| 8 | Standardcluster `16/main` | auf allen Knoten entfernt (schlafendes Port-Risiko) |
+| 9 | Repo-Altlasten | sauber, `git gc`; Übungsrest `backup_test` gelöscht |
+
+**Offene Beobachtungen (ohne Eile):** Plattenstufe auf ph-node2 um ~12:27 ohne Logeintrag; ph-node1 mit ~10 % CPU bis ~17:45, danach ~0 — Ursache unbekannt.
+
+**Als Nächstes:** zentrales WAL-Archiv mit pgBackRest (Bankschließfach statt Keller, Retention), danach Alerting zusammen mit dem Exporter-Upgrade.
+
+> **Merksatz des Tages:** Aufräumen ist keine Kosmetik. Drei der neun „Kleinigkeiten“ waren schlafende Risiken (volle Platte, etcd reißt Patroni mit, fremder Cluster auf Port 5432).
+
 ---
 
 ## Anhang — Metaphern-Spickzettel (für Gespräch und Wiederholung)
@@ -4881,3 +4909,5 @@ Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Ge
 | ungenutzter Standardcluster | **möbliertes Musterzimmer mit Klingelschild** | „Was nicht genutzt wird, verwirrt — und kann stören.“ |
 | `start.conf = auto` + gleicher Port | **Wecker auf 6 Uhr im Musterzimmer, gleiche Hausnummer, Flursicherung zufällig aus** | „Glück ist kein Design.“ |
 | Ganzen Cluster neu aufsetzen statt einen Ordner entfernen | **Haus abreißen, um ein Zimmer zu räumen** | „Die kleinste Maßnahme, die das Problem löst.“ |
+| `git gc` | **lose Zettel werden ein Ordner im Regal** | „Git räumt auf, wenn man es lässt.“ |
+| idempotenter Befehl | **Lichtschalter auf „aus“ drücken, wenn das Licht schon aus ist** | „Gefahrlos wiederholbar — Grundlage für Automatisierung.“ |
