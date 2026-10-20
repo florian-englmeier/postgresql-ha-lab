@@ -151,6 +151,8 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 - [x] Rollierendes Patchen aller drei Knoten mit zwei geplanten Switchovers (Timeline 7 → 8 → 9), Kernel-Drift durch Phased Updates erkannt und behoben, `needrestart`-Falle am Leader dokumentiert
 - [x] **Failover unter Last** (pgbench, 50 Clients, Stromausfall des Leaders per `qm stop`): **≈ 35 s ohne Leader** (aus `ttl` 30 s + Wahl, im Patroni-Log gemessen), Ampel live „KEIN LEADER“, kein bestätigter Commit verloren; pgbench-Clients brechen ab — Wiederverbinden ist Aufgabe der Anwendung
 - [x] Befund beim Wiederanlauf: Replica blieb nach `pg_rewind` mit fehlendem WAL hängen (Checkpoint mitten im Lasttest, `wal_keep_size` 0, Archiv nur lokal) → `patronictl reinit`; Schutzschicht `wal_keep_size` 1GB eingeführt und mit einem zweiten Ausfall unter Last nachgewiesen (880 MB Lücke, Rückkehr ohne Eingriff)
+- [x] **`shared_buffers` 128 MB → 1 GB** per `edit-config`, rollierender Restart (Replicas, dann Switchover); Vorher/Nachher mit Aufwärm-Lauf: Cache-Hit-Ratio Leader 94 % → 99 %, TPS unverändert (CPU ist der Engpass, Fehlgriffe kamen vorher aus dem OS-Page-Cache)
+- [x] Incident: Leader-Platte 100 % voll durch lokales WAL-Archiv ohne Aufbewahrung (11 GB nach zwei Tagen Lasttests), etcd auf demselben Knoten beendet sich; gezielt im Archiv aufgeräumt; der etcd-Neustart löste über `Requires=etcd.service` einen Leader-Wechsel aus
 
 **Monitoring**
 - [x] Eigene Monitoring-VM `ph-monitor`, getrennt vom Cluster
@@ -167,7 +169,8 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 ### 🔜 Als Nächstes
 
-- [ ] Basis-Tuning (`shared_buffers` u. a.) per `patronictl edit-config` und rollierendem Restart
+- [ ] Zentrales WAL-Archiv mit Aufbewahrungsregel (pgBackRest) und `restore_command` — Befund 20.10.2026: lokales Archiv lief auf dem Leader voll
+- [ ] Panel „Replicas streaming“ und Alarm auf Plattenfüllstand
 
 ---
 
@@ -180,6 +183,8 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 - **Ein Dashboard beantwortet die Frage seiner Zielgruppe.** Der Bereitschaftsdienst braucht in zwei Sekunden eine Ampel, nicht fünfzig Panels. Grafanas Standard-Schwellen (Base grün, 80 rot) hätten „kein Leader“ und „Split-Brain“ grün gefärbt — Thresholds werden deshalb bewusst gesetzt und gegen den Rohwert verglichen, nicht gegen die formatierte Anzeige.
 - **Monitoring misst jeden Knoten direkt.** Anwendungen gehen über die VIP, Exporter nicht, sonst wird nur der Leader gemessen. Alarme sitzen auf Symptomen (kein oder zwei Leader, `pg_up == 0`, WAL-Archiv scheitert) und haben eine Wartezeit, weil Scrape-Intervalle kurze Ereignisse verzerren. Für den genauen Ablauf eines Failovers sind `patronictl history` und die Logs maßgeblich.
 - **Ein Failover ist erst fertig, wenn die Reserve wieder streamt.** Der Cluster lief nach dem Ausfall grün weiter, während eine Replica wegen einer WAL-Lücke festhing — Ursache ein Checkpoint drei Stunden vorher, mitten im Lasttest. Ausfalltests prüfen deshalb auch den Wiederanlauf und das Monitoring selbst: Zwei Panels zeigten „Geister“ (letzter Wert eines toten Knotens), eines war per gespeicherter Legenden-Auswahl blind. Lösung: Instant-Queries für „Wer ist jetzt …?“, `wal_keep_size` als Reserve, zentrales WAL-Archiv als nächster Schritt.
+- **Tuning trifft nur, wenn es den Engpass trifft.** `shared_buffers` hob die Cache-Hit-Ratio von 94 auf 99 %, der Durchsatz blieb gleich: Die Fehlgriffe kamen aus dem RAM des Betriebssystems, und die CPU war am Anschlag. Vorher-Messung, Aufwärm-Lauf und nur eine geänderte Variable machen den Vergleich erst aussagekräftig.
+- **Ein offener Punkt im Betriebslog ist eine Zeitbombe.** „Archiv ohne Aufbewahrungsregel“ war notiert — einen Tag später stand der Leader mit voller Platte da, und etcd auf demselben Datenträger fiel mit.
 
 ---
 

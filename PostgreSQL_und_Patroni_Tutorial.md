@@ -3960,6 +3960,247 @@ Bild: Gestern hat der Bürgermeister im Krankenhaus sein Tagebuch zu Ende gelese
 
 > **Merksatz:** `wal_keep_size` schützt nicht nur Replicas beim Leader, sondern auch den zurückkehrenden Knoten vor sich selbst: Er wirft nach der Crash-Recovery das Band nicht weg, das `pg_rewind` gleich wieder braucht. Die Reserve muss größer sein als das WAL zwischen zwei Checkpoints unter Last.
 
+#### Werkzeug: Logs gezielt durchsuchen — wie man auf so einen Befehl kommt
+
+```bash
+sudo journalctl -u patroni --since "09:47" --no-pager | grep -iE "REDO location|Time of latest checkpoint|diverged|rewind|started streaming|removed" | head -20
+```
+
+Der Befehl entsteht nicht aus dem Nichts, sondern in fünf Denkschritten — wie eine **Fahndung mit Phantombild**:
+
+| Schritt | Frage | Antwort hier |
+|---|---|---|
+| 1. Was will ich wissen? | Die *Behauptung* „wal_keep_size hat geholfen“ prüfen | Ab wo musste ph-node3 nachlesen, und woher kam das Band? |
+| 2. Wo steht es? | Welches Protokoll? | Patroni startet PostgreSQL als Kindprozess — **beide** schreiben ins Journal der Unit `patroni` (gestern sichtbar: `patroni[1207]: … LOG: …`) |
+| 3. Wann? | Zeitfenster | ab `qm start 203` um 09:47:31 → `--since "09:47"` |
+| 4. Wonach suchen? | Fahndungsbegriffe | die **wörtlichen Meldungen vom Vortag** — das Phantombild |
+| 5. Wie viel? | Ausgabe begrenzen | `head -20` |
+
+**Die Fahndungsliste — jeder Begriff stammt aus dem Fall vom 19.10.:**
+
+| Suchbegriff | gestern gesehen als | beantwortet |
+|---|---|---|
+| `REDO location` | `Latest checkpoint's REDO location: 1/CE006958` (Steckbrief `pg_controldata`) | Ab wo muss nachgelesen werden? |
+| `Time of latest checkpoint` | `… Mon Oct 19 10:27:06` | Wann wurde das Lesezeichen gesetzt? |
+| `diverged` | `servers diverged at WAL location 1/DF33E0B8` | Wo trennten sich die Wege? |
+| `rewind` | `running pg_rewind from ph-node1` … `Done!` | Lief das Zurückspulen, erfolgreich? |
+| `started streaming` | `started streaming WAL from primary at 1/CE000000` | **Ab wo** wurde beim Leader angefordert — der Schlüsselbeweis |
+| `removed` | `requested WAL segment … has already been removed` | Fehlte Band? (Hoffnung: kein Treffer) |
+
+**Lehre aus dem ersten Versuch am Vortag:** Damals stand `checkpoint` in der Liste — das passt auf **jede** Zeile der Steckbriefe (`Latest checkpoint location`, `…NextXID`, `…oldestXID` …), und `head -30` war nach den Steckbriefen voll; die wichtigen Zeilen fielen hinten heraus. Deshalb jetzt **präzise** Begriffe (`REDO location`, `Time of latest checkpoint`) statt eines Allerweltsworts.
+
+**Die Bausteine:**
+
+| Teil | Bedeutung |
+|---|---|
+| `sudo` | das Journal fremder Dienste lesen nur Admins (oder Gruppe `systemd-journal`) |
+| `journalctl -u patroni` | nur die Meldungen der Unit `patroni.service` |
+| `--since "09:47"` | ab heute 09:47 (ohne Datum = heute); auch `"2026-10-20 09:47"` oder `"10 min ago"` |
+| `--no-pager` | alles direkt ausgeben statt im Blätterprogramm `less` — nötig, damit die Pipe es bekommt |
+| `\|` (Pipe) | Ausgabe des einen Programms wird Eingabe des nächsten — ein Fließband |
+| `grep -i` | Groß-/Kleinschreibung egal (`Rewind`, `rewind`, `REWIND`) |
+| `grep -E` | erweiterte Regex: `\|` zwischen den Begriffen heißt **ODER** |
+| `head -20` | nur die ersten 20 Treffer — schützt vor Bildschirmfluten |
+
+Python-Analogie: `[z for z in journal if re.search(r"REDO location|diverged|…", z, re.I)][:20]`
+
+**Alternative ohne grep:** `journalctl` kann selbst filtern: `sudo journalctl -u patroni -S "09:47" -g "REDO location|diverged|rewind" --no-pager` (`-S` = `--since`, `-g` = `--grep`, Regex, ohne Großbuchstaben im Muster automatisch case-insensitive).
+
+> **Merksatz:** Logs durchsucht man nicht, man **befragt** sie: erst die Frage, dann Ort und Zeitfenster, dann die wörtlichen Meldungen als Fahndungsbegriffe — am besten die, die man beim letzten Fall schon gesehen hat. Je präziser der Begriff, desto weniger Rauschen.
+
+### 17.14 Basis-Tuning: `shared_buffers` — die Werkbank vergrößern
+
+`shared_buffers` ist die **Werkbank** von PostgreSQL: der RAM-Bereich, in dem Datenblöcke griffbereit liegen. Werkseinstellung 128 MB — die pgbench-Datenbank (Scale 50) ist aber ~750 MB groß. Unter Last lag die Cache-Hit-Ratio des Leaders deshalb bei ~94 % (rot).
+
+#### Bestandsaufnahme (20.10.2026)
+
+```bash
+free -h
+psql -h 192.168.178.200 -p 5000 -U postgres -c "SHOW shared_buffers;"   # → 128MB
+```
+
+| Spalte `free -h` | Wert | Bedeutung | Bild |
+|---|---|---|---|
+| total | 3,8 GiB | RAM der VM (4 GB in Proxmox) | die ganze Werkstatt |
+| used | 633 MiB | von Programmen belegt | |
+| shared | 141 MiB | gemeinsamer Speicher — im Wesentlichen `shared_buffers` (128 MB) plus Verwaltung | die **Werkbank** 🔧 |
+| buff/cache | 2,3 GiB | Linux-Page-Cache | das **Nebenzimmer** 🚪 |
+| available | 3,2 GiB | sofort verfügbar (Cache wird bei Bedarf freigegeben) | |
+| Swap | **0 B** | keine Auslagerung — wird der RAM knapp, beendet der **OOM-Killer** einen Prozess, im schlimmsten Fall PostgreSQL | kein Notausgang ⚠️ |
+
+**Befund:** Das Nebenzimmer (2,3 GiB) fasst die ganze Datenbank. Die „Fehlgriffe“ (`blks_read`) der 94 % kamen also aus dem RAM des Betriebssystems, nicht von der Platte — die Vermutung aus 17.12 ist bestätigt.
+
+**Zielwert:** Faustregel ~25 % des RAM → 3,8 GiB × 0,25 ≈ **1 GB**. Die Datenbank passt dann komplett auf die Werkbank, für alles andere bleiben ~2,8 GB. Nicht mehr, weil Blöcke oft **doppelt** im RAM liegen (Werkbank *und* Nebenzimmer, *Double Buffering*) — eine größere Werkbank verkleinert das Nebenzimmer — und weil ohne Swap kein Puffer gegen Speichermangel existiert.
+
+#### Hypothesen vorher
+
+| | Florian | Jacky |
+|---|---|---|
+| TPS | steigen nur gering (Nebenzimmer war schon RAM) | steigen nur gering — zusätzlich ist bei 50 Clients die CPU der Engpass |
+| Cache-Hit-Ratio | ändert sich gering | **springt** von ~94 % auf ~99,9 %: die Kennzahl zählt nur Werkbank-Treffer, jeder Griff ins Nebenzimmer gilt als Fehlgriff |
+
+#### Vorher-Messung (128 MB, Leader ph-node2)
+
+```bash
+pgbench -h 192.168.178.200 -p 5000 -U postgres -c 50 -j 2 -T 120 pgbench_test
+```
+
+| Messgröße | Wert |
+|---|---|
+| TPS | **2 954** |
+| Latenz Ø | **16,9 ms** |
+| Transaktionen | 354 147, 0 failed |
+| Cache-Hit-Ratio Leader ph-node2 | **94,0 %** (identisch zum Vortag — reproduzierbar) |
+| Cache-Hit-Ratio Replicas | 94,6 % |
+| CPU ph-node2 | ~88 % — CPU am Anschlag |
+
+![Vorher: pgbench mit shared_buffers 128 MB](images/shared-buffers-vorher-pgbench.png)
+
+![Vorher: Dashboard mit shared_buffers 128 MB](images/shared-buffers-vorher-dashboard.png)
+
+#### Incident während der Nachher-Messung: Platte voll auf dem Leader (20.10.2026, 11:08)
+
+Mitten im Mess-Lauf (Leader ph-node2, `shared_buffers` bereits 1 GB) brachen alle pgbench-Clients ab:
+
+```
+ERROR:  could not extend file "base/16422/32891": No space left on device
+HINT:  Check free disk space.
+```
+
+Der Lauf ist als Messung **ungültig** (2 882 TPS, „Run was aborted“). `0 failed`: Was bestätigt war, blieb sicher — PostgreSQL lehnt lieber ab, als halb zu schreiben.
+
+**Lagebild auf ph-node2:**
+
+| Verzeichnis | Größe |
+|---|---|
+| `/` gesamt | 18 G, **100 %**, 0 frei |
+| **`wal_archive`** | **11 G** — 13 × so groß wie die Datenbank |
+| `pg_wal` | 1,6 G (davon 1 GB `wal_keep_size`) |
+| `base` (Daten) | 817 M |
+
+Archiv nach Tagen (`sudo find … -printf '%TY-%Tm-%Td\n' | sort | uniq -c`, je Datei 16 MB):
+
+| Tage | Dateien | ≈ Größe |
+|---|---|---|
+| 22.09.–17.10. | 96 | 1,5 GB |
+| **19.10.** (Laststufen-Test) | **313** | **5 GB** |
+| **20.10.** (Failover-Tests, Messungen) | **252** | **4 GB** |
+
+Ursache: der seit 19.10. als offen notierte Punkt — **lokales Archiv ohne Aufbewahrungsregel**. Jede Lasttest-Minute erzeugt ~270 MB WAL, `archive_command` bewahrt jedes Segment auf. Bild: Jeder Span der Säge wandert in einen Karton, und keiner wird je weggeworfen. 📦
+
+**Dominoeffekt — etcd auf demselben Knoten:**
+
+```
+11:08:58 etcd: cannot commit tx (write /var/lib/etcd/default.etcd/member/snap/db: no space left on device)
+11:08:58 systemd: etcd.service: Failed with result 'exit-code'.
+```
+
+Ein Ratsmitglied, das nichts mehr protokollieren kann, beendet sich selbst — der Rat hatte nur noch 2 von 3 Stimmen, ohne Reserve. PostgreSQL und etcd teilen sich eine Platte: ein voller Schuhkarton legt Bürgermeister **und** Ratsmitglied lahm (Failure Domain im Kleinen). ph-node2 blieb trotzdem Leader — Patroni kennt alle drei etcd-Endpunkte und verlängerte die Schärpe beim Nachbarn; nur `patronictl` auf ph-node2 fragte das lokale etcd und bekam `Connection refused`.
+
+**Aufräumen — nur im Archiv, nie in `pg_wal`:**
+
+| Verzeichnis | Wer braucht es? | Von Hand löschen? |
+|---|---|---|
+| `pg_wal` | PostgreSQL selbst, jetzt (Recovery, Replicas, `wal_keep_size`) | **niemals** — Seiten aus dem Tagebuch reißen, während man schreibt |
+| `wal_archive` | nur Point-in-Time-Recovery; ohne `restore_command` liest es kein laufender Prozess | alte Dateien ja — kostet nur Zeitreise-Reichweite (und das Archiv war auf drei Knoten verstreut, also ohnehin lückenhaft) |
+
+```bash
+# Probelauf: zählen, was gelöscht würde (erwartet 410 laut Tagestabelle)
+sudo find /var/lib/postgresql/wal_archive -type f ! -newermt "2026-10-20" | wc -l   # → 409
+# erst dann löschen
+sudo find /var/lib/postgresql/wal_archive -type f ! -newermt "2026-10-20" -delete
+df -h /   # → 6,4 G frei, 63 %
+```
+
+409 statt 410: eine Datei auf der Datumsgrenze, Abweichung in die sichere Richtung (es wird weniger gelöscht, nicht mehr). Wäre die Zahl größer gewesen als erwartet, hätte man gestoppt. Danach `sudo systemctl restart etcd` → `etcdctl … endpoint health`: alle drei `healthy`.
+
+**Nachbeben: ein Leader-Wechsel durch den etcd-Neustart.** Um 11:20:17 übernahm ph-node3 (TL 18 → 19), ohne dass ein Switchover befohlen war. Das Patroni-Log von ph-node2 zeigt den Täter an der **Prozessnummer**:
+
+| Zeit | Prozess | Meldung |
+|---|---|---|
+| 11:20:08 | `patroni[876]` | `I am (ph-node2), the leader with the lock` |
+| **11:20:17** | – | etcd neu gestartet (`systemctl show etcd -p ActiveEnterTimestamp`) |
+| 11:20:18 | `patroni[10501]` | `Lock owner: ph-node3; I am ph-node2` |
+| 11:20:19 | `patroni[10501]` | `a secondary, and following a leader (ph-node3)` |
+
+Neue PID = **Patroni selbst wurde neu gestartet**. Der Grund steht in der Unit:
+
+```bash
+$ systemctl cat patroni | grep -iE "requires|bindsto|partof|wants|after"
+After=network.target etcd.service
+Requires=etcd.service
+```
+
+`Requires=` heißt für systemd: Wird etcd **ausdrücklich** gestoppt oder neu gestartet, geschieht dasselbe mit Patroni. Ein sauber beendetes Patroni fährt PostgreSQL herunter und gibt die Schärpe **freiwillig** ab — daher kein 30-s-Warten, sondern ein Wechsel wie beim Switchover. Feines Detail: Beim **Absturz** von etcd um 11:08 blieb Patroni stehen (ein gescheiterter Dienst ist kein ausdrücklicher Stopp) — erst der **Neustart** zog es mit. Bild: Man weckt das Ratsmitglied, und der Bürgermeister zieht sich mit an. 🏛️
+
+Gleiches Muster wie die `needrestart`-Falle (TL 6, 9–11): **Ein harmloser Neustart eines Nachbardienstes startet Patroni neu — auf dem Leader ist das ein Leader-Wechsel.** Optionen: auf dem Leader vor Wartung an etcd erst `switchover`; oder `Wants=` statt `Requires=` (Patroni erreicht die anderen etcd-Mitglieder ohnehin) — offen, Entscheidung später.
+
+**Nebenbefund:** Auf der neuen Replica ph-node2 erscheint alle 15 s `ERROR: recovery is in progress` — im Takt des Scrape-Intervalls, vermutlich eine Exporter-Abfrage, die nur auf dem Primary funktioniert. Harmlos, offen.
+
+| Lehre | Maßnahme |
+|---|---|
+| Archiv ohne Aufbewahrung läuft voll, Lasttests beschleunigen das massiv | Aufbewahrungsregel / zentrales Archiv (pgBackRest mit Retention), bis dahin vor Lasttests `df -h` auf allen Knoten |
+| Ein voller Datenträger trifft alle Dienste darauf, auch etcd | Alarm auf Plattenfüllstand (z. B. > 80 %), langfristig etcd-Daten getrennt |
+| `Requires=etcd.service` koppelt Patroni an etcd-Neustarts | vor etcd-Wartung auf dem Leader switchovern; `Wants=` prüfen |
+
+> **Merksatz:** Ein offener Punkt im Betriebslog ist eine Zeitbombe mit unbekanntem Zünder. Hier: „Archiv ohne Aufbewahrungsregel“ — notiert am 19.10., explodiert am 20.10. um 11:08.
+
+#### Umstellung und Nachher-Messung (1 GB)
+
+**Ablauf der Umstellung:**
+
+```bash
+sudo patronictl -c /etc/patroni.yml edit-config -p shared_buffers=1GB   # Diff: genau eine Zeile +shared_buffers: 1GB
+sudo patronictl -c /etc/patroni.yml list                                 # nach ~10 s: Spalten "Pending restart" *
+sudo patronictl -c /etc/patroni.yml restart postgres-ha ph-node1         # Replicas zuerst
+sudo patronictl -c /etc/patroni.yml restart postgres-ha ph-node3
+sudo patronictl -c /etc/patroni.yml switchover postgres-ha               # Leader zuletzt
+```
+
+![Pending restart nach edit-config](images/shared-buffers-pending-restart.png)
+
+| Beobachtung | Erklärung |
+|---|---|
+| Direkt nach `edit-config` noch keine Änderung in `list` | Der Bauplan steht sofort in etcd, aber jeder Patroni liest ihn erst bei seiner nächsten Runde (`loop_wait` 10 s) — Aushang am Schwarzen Brett 📋 |
+| Danach neue Spalten **Pending restart** `*` und **Pending restart reason** `shared_buffers: 128MB->1GB` | `patronictl list` zeigt diese Spalten nur, wenn mindestens ein Knoten etwas zu melden hat (wie eine Anlage zur Steuererklärung). Quelle: PostgreSQL selbst, `pg_settings.pending_restart`, von Patroni in seinen Member-Eintrag in etcd geschrieben |
+| Warum Neustart? | Die Werkbank wird beim Start **einmal am Stück** als gemeinsamer Speicher reserviert — eine festgeschraubte Werkbank verlängert man nicht im Betrieb. `wal_keep_size` ist dagegen nur eine Regel (Reload genügt) |
+| Nach dem Switchover war der `*` beim alten Leader weg — ohne eigenen `restart` | Ein Primary kann sich nicht im Betrieb in eine Replica verwandeln: Der Switchover fährt PostgreSQL herunter und startet es als Replica neu (Zwischenzustand `Replica / stopped` sichtbar). Der Bürgermeister geht auf dem Heimweg direkt beim Friseur vorbei 💇 |
+
+**Faire Messung:** Für den Vergleich wieder ph-node2 als Leader (Switchover zurück — nur eine Variable ändern), dann ein **Aufwärm-Lauf** (60 s, nicht gewertet): Nach dem Neustart ist die Werkbank leer (kalter Cache), die Vorher-Messung lief mit warmer Werkbank. Bild: Ein Sprinter wird nicht direkt aus dem Bett gemessen. Für Produktion lädt `pg_prewarm` nach einem Neustart die vorherigen Blöcke automatisch.
+
+| Messgröße | Vorher (128 MB) | Nachher (1 GB) | Änderung |
+|---|---|---|---|
+| TPS | 2 954 | **2 844** | −3,7 % (im Rauschen: Läufe der letzten Tage 2 831–2 977) |
+| Latenz Ø | 16,9 ms | **17,6 ms** | +0,7 ms (im Rauschen) |
+| Transaktionen / Fehler | 354 147 / 0 | 340 965 / 0 | – |
+| Cache-Hit-Ratio Leader | **94,0 %** 🔴 | **99,2 %** 🟢 (5-min-Fenster, enthält noch Reste des Kaltstarts) | **+5,2 Punkte** |
+| Cache-Hit-Ratio Replicas | 94,6 % | **100 %** | +5,4 Punkte |
+| CPU Leader | ~88 % | ~85 % | unverändert am Anschlag |
+
+![Nachher: pgbench mit shared_buffers 1 GB](images/shared-buffers-nachher-pgbench.png)
+
+![Nachher: Dashboard mit shared_buffers 1 GB](images/shared-buffers-nachher-dashboard.png)
+
+**CPU im Mess-Lauf (Zoom 11:38–11:43):** zwei gleich hohe Berge (Aufwärm- und Mess-Lauf → reproduzierbar). Plateau: ph-node2 (Leader) **~87 %**, ph-node1 (Replica + VIP/HAProxy) **~73 %**, ph-node3 (nur Replica) **~53 %**. Der Leader rechnet am Anschlag — der Engpass ist die CPU. Zwischen den beiden Replicas liegen ~20 Punkte, einziger Unterschied ist die VIP: der Pförtner zahlt bei ~2 800 TPS spürbar mit.
+
+**Auswertung der Hypothesen:**
+
+| | Florian | Jacky | Ergebnis |
+|---|---|---|---|
+| TPS steigen nur gering | ✅ | ✅ | unverändert (−3,7 %, im Rauschen) |
+| Cache-Hit-Ratio | ändert sich gering ❌ | springt ✅ | 94 % → 99–100 % |
+
+**Warum die Kennzahl springt, der Durchsatz aber nicht:**
+
+1. Die Cache-Hit-Ratio zählt nur **Werkbank-Treffer**. Jeder Griff ins Nebenzimmer (Linux-Page-Cache) zählt als Fehlgriff — auch wenn er aus dem RAM kommt und kaum Zeit kostet. Vorher lagen ~6 % der Griffe im Nebenzimmer, nachher passt die ganze Datenbank auf die Werkbank.
+2. Bei 50 Clients ist die **CPU** der Engpass (Group Commit, siehe 17.12), nicht das Lesen. Eine größere Werkbank verkürzt Wege, schafft aber keine Rechenleistung.
+
+Bild: Man räumt alles Werkzeug vom Nebenzimmer auf die Werkbank. Die Statistik „Griffe auf die Werkbank“ springt auf 100 % — der Schreiner baut deshalb nicht schneller, weil er ohnehin schon mit beiden Händen am Anschlag sägt. 🪚
+
+**Wann hilft `shared_buffers` wirklich?** Wenn die Daten **nicht** ins Nebenzimmer passen (Datenbank größer als der RAM) und Fehlgriffe echte Plattenzugriffe sind — dann sinken iowait und Latenz deutlich. In diesem Lab (750 MB Daten, 2,3 GB Page-Cache) ist der Gewinn eine gesunde Kennzahl und Reserve für Wachstum, kein Durchsatz.
+
+> **Merksatz:** Eine Kennzahl kann sich stark verbessern, während der Nutzen klein bleibt. Erst messen, was der Engpass ist — dann tunen, was den Engpass trifft. Und Tuning immer mit Vorher-Messung, Aufwärmen und nur einer geänderten Variable.
+
 #### Schnell-Referenz (zum Abfragen)
 
 - **Pull oder Push bei Prometheus?** → Pull: Prometheus holt die Werte selbst ab.
