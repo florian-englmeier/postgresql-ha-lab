@@ -10,6 +10,7 @@ Neueste Einträge oben. Zeiten in UTC, wo sie aus Systemausgaben stammen. Detail
 
 | Datum | Knoten | Aktion | Grund | Ergebnis | Doku |
 |---|---|---|---|---|---|
+| 20.10.2026 12:19–12:22 | ph-monitor | Grafana aufgeräumt: Override „Hide in area“ im Lag-Panel gelöscht, Cache-Hit-Ratio auf Instant-Query | Panel nach Leader-Wechsel leer bzw. Geister-Werte toter Knoten | Lag-Panel zeigt beide Replicas (0 B), Cache-Kacheln nur aktuelle Werte | Teil 17.13 |
 | 20.10.2026 11:38–11:43 | ph-monitor → VIP | Nachher-Messung `shared_buffers` 1 GB: Switchover zurück auf ph-node2 (TL 20), Aufwärm-Lauf 60 s, Mess-Lauf `-c 50 -T 120` | Vergleich mit Vorher-Messung (128 MB) | 2 844 TPS, 17,6 ms, 0 Fehler (vorher 2 954 / 16,9 ms — im Rauschen); Cache-Hit-Ratio Leader 94,0 % → 99,2 %, Replicas → 100 %. CPU bleibt Engpass | Teil 17.14 |
 | 20.10.2026 11:20:17 | ph-node2 → ph-node3 | **Ungeplanter Leader-Wechsel** durch `systemctl restart etcd` | Unit `patroni.service` hat `Requires=etcd.service`: Neustart von etcd startet Patroni mit (PID 876 → 10501), Patroni gibt den Lock ab | TL 18 → 19, ph-node3 Leader, ph-node2 sofort `streaming`. Lehre wie `needrestart`: vor etcd-Wartung auf dem Leader erst Switchover; `Wants=` statt `Requires=` prüfen (offen) | Teil 17.14 |
 | 20.10.2026 ~11:19 | ph-node2 | `systemctl restart etcd` | etcd war 11:08:58 gestorben: `cannot commit tx … no space left on device` | `endpoint health`: alle drei healthy | Teil 17.14 |

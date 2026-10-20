@@ -3358,6 +3358,8 @@ Ergebnis: Das Panel zeigt nur noch `ph-node2`.
 
 Warum stand es auf Range? **Range ist Grafanas Standard** für jede neue Query, weil die meisten Panels Zeitreihen zeigen. Beim Bauen am 17.10. gab es im Zeitfenster keinen Leader-Wechsel, Range und Instant lieferten dasselbe — der Unterschied zeigt sich erst, wenn sich *innerhalb* des Zeitfensters etwas ändert. Das Leader-Status-Panel (`sum(patroni_primary)`) bleibt bewusst auf Range: Die Summe wird je Zeitpunkt gebildet, ist also immer aktuell, und die Hintergrund-Sparkline zeigt den Einbruch beim Failover.
 
+**20.10.2026:** Auch die **Cache-Hit-Ratio-Kacheln** auf Instant umgestellt — vorher zeigte die Kachel eines toten Knotens weiter seinen letzten Wert (94 % bzw. „100 %“). Preis: Ein Stat-Panel mit Instant-Query hat keine Hintergrund-Sparkline mehr; für den Verlauf gibt es Explore.
+
 > **Merksatz:** Standardwerte passen zum Normalfall. Ob ein Panel stimmt, zeigt erst der Sonderfall — deshalb Failover-Tests auch für das Monitoring.
 
 #### Panel 7: CPU-Auslastung — PromQL von innen nach außen lesen
@@ -3681,6 +3683,8 @@ Geplant war der Test unter Last — im Eifer mit drei Fenstern lief pgbench beim
 ![Override „ph-node3 › Hide in area“ im TPS-Panel](images/grafana-override-legend-isolation.png)
 
 Gefunden unter Panel → *Edit* → ganz unten *Overrides*: `ph-node3 › Hide in area` (vormittags stand dort ph-node2). Gelöscht mit dem Mülleimer, danach zeigt das TPS-Panel wieder alle drei Linien: **ph-node1 (Leader) ~3,2 ops/s**, die Replicas je ~2 ops/s — auch im Leerlauf zählt der Leader mehr Transaktionen (Patroni-Heartbeat, Autovacuum), die Replicas nur die Abfragen des Exporters. Gleiches Muster im Lag-Panel.
+
+Am 20.10.2026 im **Lag-Panel** ebenso entfernt: danach beide Replicas (ph-node1, ph-node3) in der Legende, beide bei 0 B — die grüne Linie liegt deckungsgleich unter der gelben.
 
 > **Merksatz:** Graue Legenden-Einträge heißen „ausgeblendet“, nicht „keine Daten“. Vor dem Speichern eines Dashboards einmal auf die Legende schauen.
 
