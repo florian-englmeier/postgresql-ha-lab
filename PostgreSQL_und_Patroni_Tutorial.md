@@ -4724,6 +4724,55 @@ Plan: Exporter-Upgrade zusammen mit **Alerting** (Slot-Retention, Plattenbelegun
 - **Was ist Alarm-Müdigkeit?** → Dauernde harmlose Meldungen führen dazu, dass echte übersehen werden.
 - **Wann darf man einen Fehler bewusst stehen lassen?** → Wenn er verstanden, als harmlos bewertet und mit Begründung und Plan dokumentiert ist.
 
+
+#### Punkt 8 — Den ungenutzten Standardcluster „16 main“ entfernen
+
+**Herkunft:** Bei `apt install postgresql-16` legt Ubuntu automatisch einen Cluster `16/main` an (Daten `/var/lib/postgresql/16/main`, Config `/etc/postgresql/16/main`). Patroni nutzt ihn nicht. *Bild:* möbliertes Musterzimmer des Bauträgers neben der eigenen Wohnung — es steht leer, hat aber ein Klingelschild, und Besucher klingeln dort (die „falsche Tür“ bei `du …/16/main/pg_wal`).
+
+**Erst prüfen (Löschen ist unumkehrbar):**
+
+```bash
+pg_lsclusters                                   # 16 main 5432 down
+sudo grep -n -E "data_dir|config_dir|bin_dir|16/main|/etc/postgresql" /etc/patroni.yml
+#   data_dir: /var/lib/postgresql/16/patroni    ← nicht main
+#   bin_dir:  /usr/lib/postgresql/16/bin        ← Programme des Pakets, nicht des Clusters
+cat /etc/postgresql/16/main/start.conf | grep -v "^#"   # auto (!)
+systemctl is-enabled postgresql@16-main          # enabled-runtime
+systemctl is-active  postgresql@16-main          # inactive
+```
+
+**Das schlafende Risiko:** `auto` + Port **5432** (derselbe wie Patroni). `enabled-runtime` heißt: nicht per `systemctl enable` eingeschaltet, sondern bei jedem Boot von einem **systemd-Generator** aus `start.conf` erzeugt. Gestartet wurde er nur nicht, weil der übergeordnete `postgresql.service` nicht läuft — der Schutz hing an einer einzigen Stelle. Startet der alte Cluster beim Boot zuerst, findet Patronis PostgreSQL den Port belegt und scheitert. *Bild:* Das Musterzimmer hat einen Wecker auf 6 Uhr gestellt und dieselbe Hausnummer; er klingelt nur nicht, weil zufällig die Flursicherung aus ist. Glück ist kein Design.
+
+| Option | Inhalt |
+|---|---|
+| A | `start.conf` → `disabled` (umkehrbar, Musterzimmer bleibt) |
+| **B (gewählt)** | `sudo pg_dropcluster 16 main` — entfernt Daten (leere Grund-DB), `/etc/postgresql/16/main`, Log; Programme und `16/patroni` bleiben |
+
+Eine Fehlkonfiguration, die nur durch Zufall ruhig ist, entfernt man besser ganz, statt sie zu verwalten.
+
+**Nicht verwechseln:** „16 main“ ist **nicht** die Datenbank mit den Lab-Daten (`titanic`, `pgbench` …) — die liegen im Patroni-Cluster und bleiben unberührt. Den ganzen Cluster neu aufzusetzen wäre Stunden Arbeit für dasselbe Ergebnis — um ein leeres Musterzimmer loszuwerden, reißt man nicht das Haus ab. Test-Datenbanken im Patroni-Cluster entfernt man bei Bedarf mit `DROP DATABASE`, neue legt man mit `CREATE DATABASE` an.
+
+```bash
+sudo pg_dropcluster 16 main      # ph-node1, ph-node3, dann ph-node2 (Leader zuletzt)
+pg_lsclusters                     # nur Kopfzeile
+sudo du -sh /var/lib/postgresql/16/*
+sudo patronictl -c /etc/patroni.yml list   # unverändert: ph-node2 Leader, TL 20
+```
+
+**Beobachtungen:**
+- `16/patroni`: Replicas 1,9 G, Leader 2,4 G — die Differenz ist die `wal_keep_size`-Reserve (1 GB) in `pg_wal` auf dem Leader. Die beiden Replicas sind gleich groß: Replikation, wie sie sein soll.
+- `backup_test` (5,4 M) nur auf ph-node1: von Hand angelegt (Teil 13). Replikation kopiert nur, was **im** Datenverzeichnis passiert, nicht, was daneben liegt.
+- Tippfehler `udo` statt `sudo` und der richtige Befehl im falschen Fenster: harmlos, aber ein Grund für benannte Terminal-Tabs und farbige Prompts.
+
+> **Merksatz:** Eine Fehlkonfiguration, die nur durch Glück ruhig ist, ist ein Risiko mit Verzögerung. Prüfen, was sie auslösen könnte — dann entfernen statt verwalten.
+
+**Kontrollfragen**
+- **Woher kommt der Cluster `16 main`?** → Das Ubuntu-Paket legt ihn bei der Installation automatisch an.
+- **Warum war er gefährlich, obwohl er „down“ war?** → `start.conf = auto` und Port 5432 — beim Boot hätte er Patroni den Port wegnehmen können.
+- **Was bedeutet `enabled-runtime`?** → Zur Laufzeit von einem systemd-Generator erzeugt (hier aus `start.conf`), nicht per `systemctl enable`.
+- **Löscht `pg_dropcluster 16 main` die PostgreSQL-Programme?** → Nein, nur Daten, Config und Log dieses Clusters.
+- **Warum ist `16/patroni` auf dem Leader größer?** → `wal_keep_size` hält dort zusätzliches WAL in `pg_wal` vor.
+
 ---
 
 ## Anhang — Metaphern-Spickzettel (für Gespräch und Wiederholung)
@@ -4829,3 +4878,6 @@ Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Ge
 | PostgreSQL-Log im Journal | **zentrales Hausbuch statt Tagebuch in der Schublade** | „Bei Patroni steht das Log in `journalctl -u patroni`.“ |
 | Log-Rauschen | **Rauchmelder mit leerer Batterie, piept alle 15 s** — Alarm-Müdigkeit | „Wer dauernd harmlose Fehler sieht, übersieht den echten.“ |
 | bewusst akzeptierter Fehler | **bekannte Macke im Fahrtenbuch notiert** statt Motor auf dem Parkplatz zerlegen | „Nicht jeder Fehler muss sofort behoben werden — er muss verstanden, bewertet und dokumentiert werden.“ |
+| ungenutzter Standardcluster | **möbliertes Musterzimmer mit Klingelschild** | „Was nicht genutzt wird, verwirrt — und kann stören.“ |
+| `start.conf = auto` + gleicher Port | **Wecker auf 6 Uhr im Musterzimmer, gleiche Hausnummer, Flursicherung zufällig aus** | „Glück ist kein Design.“ |
+| Ganzen Cluster neu aufsetzen statt einen Ordner entfernen | **Haus abreißen, um ein Zimmer zu räumen** | „Die kleinste Maßnahme, die das Problem löst.“ |
