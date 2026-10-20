@@ -4671,6 +4671,59 @@ Die **PID** ist die Personalnummer eines Prozesses: Wer nur in der Kaffeeküche 
 - **Startet `systemctl daemon-reload` Dienste neu?** → Nein.
 - **Wie beweist man, dass ein Dienst nicht neu gestartet wurde?** → Gleiche `MainPID` vorher und nachher.
 
+
+#### Punkt 7 — `ERROR: recovery is in progress` auf den Replicas
+
+**Befund:** Alle **15 Sekunden** (= Scrape-Intervall) auf jeder Replica:
+
+```
+ERROR:  recovery is in progress
+HINT:   WAL control functions cannot be executed during recovery.
+STATEMENT:  SELECT slot_name, database, active, pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
+            FROM pg_replication_slots
+```
+
+**Wo steht das Log?** Nicht in einem eigenen `log/`-Ordner — PostgreSQL schreibt bei diesem Setup über Patroni ins systemd-Journal. *Bild:* Der Abschreiber führt kein eigenes Tagebuch, er diktiert dem Vorgesetzten (Patroni), der ins zentrale Hausbuch (Journal) einträgt.
+
+```bash
+sudo journalctl -u patroni --since "-2min" --no-pager | grep -A12 "recovery is in progress" | head -16
+```
+
+Die `STATEMENT:`-Zeile ist mehrzeilig — mit `-A2` fehlt genau die Abfrage (Krimi ohne letzte Seite); `-A12` zeigt sie. Im Journal schreiben zwei Prozesse: das PostgreSQL-Backend der Exporter-Verbindung (meldet den Fehler) und Patroni selbst („no action. I am ph-node1, a secondary …“).
+
+**Warum scheitert die Abfrage?** „Recovery“ ist der Dauerzustand einer Replica: Sie spielt WAL vom Leader ein.
+
+| Funktion | auf Replica | Bedeutung |
+|---|---|---|
+| `pg_current_wal_lsn()` | verboten | Wo **schreibe** ich mein WAL? — die Replica schreibt keins |
+| `pg_last_wal_replay_lsn()` | nur dort sinnvoll | Bis wohin habe ich abgeschrieben? |
+| `pg_is_in_recovery()` | überall | Bin ich Abschreiber oder Meister? |
+
+*Bild:* Man fragt den Abschreiber, auf welcher Seite er sein **eigenes** Buch schreibt — er kopiert nur das des Meisters.
+
+**Herkunft:** postgres_exporter **0.15.0** (Ubuntu-Paket, `ARGS=""`), älterer eingebauter Abfrage-Satz. Der Exporter fängt den Fehler still ab (seit 0.2.1: „Ignore functions that cannot be executed during replication recovery“), PostgreSQL protokolliert ihn trotzdem — der Fragesteller zuckt mit den Schultern, der Abschreiber notiert jedes Mal „schon wieder Unsinniges gefragt“. `/etc/default/prometheus-postgres-exporter` nur mit `sudo` lesbar (Passwort der Monitoring-Rolle, `chmod 600` aus 17.5).
+
+**Schlimm?** Für den Betrieb nein. Für das Log ja: ≈ 5 760 Fehler pro Tag und Replica — darin geht ein echter Fehler unter. *Bild:* Rauchmelder, der wegen leerer Batterie alle 15 s piept — nach einem Tag hört man ihn nicht mehr, auch nicht, wenn es brennt (**Alarm-Müdigkeit**).
+
+**Was das Abschalten kosten würde:** Auf dem **Leader** zeigt genau diese Abfrage, wie viel WAL ein Replication Slot zurückhält. Patroni legt für jede Replica einen Slot an; ist eine Replica lange weg, hält der Slot WAL unbegrenzt fest → Platte voll (wie heute Nachmittag, nur über einen anderen Weg).
+
+| Option | Inhalt | Bewertung |
+|---|---|---|
+| **A (gewählt)** | dokumentieren, bewusst akzeptieren; Fix später mit Exporter-Upgrade | kein Risiko, Ursache verstanden |
+| B | jetzt auf postgres_exporter 0.20.x | Breaking Changes (`pg_replication_slot_*` → `pg_replication_slots_*` u. a.) — Lag-Panel und „Replicas streamen“ könnten leer werden; eigenes Projekt |
+| C | alten Abfrage-Satz abschalten | nimmt womöglich Metriken der Panels mit |
+
+Plan: Exporter-Upgrade zusammen mit **Alerting** (Slot-Retention, Plattenbelegung) — Panels und Alarme einmal sauber auf die neuen Metriknamen umziehen.
+
+> **Merksatz:** Nicht jeder Fehler muss sofort behoben werden. Er muss **verstanden, bewertet und dokumentiert** werden. Ein bekannter, harmloser Fehler mit Begründung im Log ist besser als ein hastiger Fix, der zwei Panels zerlegt.
+
+**Kontrollfragen**
+- **Warum scheitert `pg_current_wal_lsn()` auf einer Replica?** → Sie ist in Recovery und schreibt kein eigenes WAL.
+- **Wo steht das PostgreSQL-Log in diesem Setup?** → Im Journal der Patroni-Unit (`journalctl -u patroni`).
+- **Warum den Slot-Collector nicht einfach abschalten?** → Auf dem Leader zeigt er WAL-Rückhalt durch Slots — Frühwarnung für volle Platten.
+- **Was ist Alarm-Müdigkeit?** → Dauernde harmlose Meldungen führen dazu, dass echte übersehen werden.
+- **Wann darf man einen Fehler bewusst stehen lassen?** → Wenn er verstanden, als harmlos bewertet und mit Begründung und Plan dokumentiert ist.
+
 ---
 
 ## Anhang — Metaphern-Spickzettel (für Gespräch und Wiederholung)
@@ -4772,3 +4825,7 @@ Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Ge
 | `daemon-reload` | **neue Dienstanweisung lesen, ohne die Schicht zu unterbrechen** | „daemon-reload startet nichts neu.“ |
 | PID vorher/nachher | **Personalnummer** — Kaffeeküche vs. Neueinstellung | „Gleiche PID = kein Neustart.“ |
 | Test auf der Replica | **Rauchmelder mit Streichholz testen, nicht das Haus anzünden** | „Riskante Tests zuerst dort, wo ein Fehlschlag harmlos ist.“ |
+| Replica in Recovery | **Abschreiber**, der nach seinem eigenen Buch gefragt wird | „`pg_current_wal_lsn()` gibt es nur beim Meister.“ |
+| PostgreSQL-Log im Journal | **zentrales Hausbuch statt Tagebuch in der Schublade** | „Bei Patroni steht das Log in `journalctl -u patroni`.“ |
+| Log-Rauschen | **Rauchmelder mit leerer Batterie, piept alle 15 s** — Alarm-Müdigkeit | „Wer dauernd harmlose Fehler sieht, übersieht den echten.“ |
+| bewusst akzeptierter Fehler | **bekannte Macke im Fahrtenbuch notiert** statt Motor auf dem Parkplatz zerlegen | „Nicht jeder Fehler muss sofort behoben werden — er muss verstanden, bewertet und dokumentiert werden.“ |
