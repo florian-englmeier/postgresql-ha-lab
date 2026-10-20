@@ -4548,6 +4548,129 @@ Query wie oben (vorher in Explore getestet). Einstellungen:
 - **Was zeigt ein Instant-Panel bei verschobenem Zeitfenster?** → Den Wert am Ende des Fensters — so lässt sich ein vergangener Vorfall nachprüfen.
 - **Warum ph-monitor mit überwachen?** → Läuft der Überwacher voll, fällt die ganze Überwachung aus — unbemerkt.
 
+
+#### Punkt 5 — Grafana-Plugin-Auto-Update beim Start abschalten
+
+**Hintergrund (15.10.):** Grafana stoppte beim Start das Prometheus-Plugin, um es zu aktualisieren; der Download wurde von Pi-hole blockiert → alle Dashboards „datasource not found“. *Bild:* Der Handwerker baut morgens die alte Heizung aus, bevor er geprüft hat, ob die neue geliefert wurde. Ein Monitoring-Server soll sich nicht zu einem beliebigen Zeitpunkt selbst verändern — Updates geplant, wie beim rollierenden Patchen.
+
+**Erst an der Quelle prüfen, was die eigene Version kennt** (die mitgelieferte `grafana.ini` enthält alle Optionen auskommentiert samt Beschreibung):
+
+```bash
+sudo grep -n -A2 "preinstall\|plugin_admin_enabled\|check_for_plugin_updates" /etc/grafana/grafana.ini
+# 2033:# Disables preinstall feature. It has the same effect as setting preinstall to an empty list.
+# 2034:; preinstall_disabled = false
+```
+
+- Ohne `sudo`: *Permission denied* — Absicht, in `grafana.ini` können Passwörter und Secret Keys stehen.
+- `;` am Zeilenanfang = **auskommentiert** (wie `#`): Es gilt der eingebaute Standard, der auskommentierte Wert zeigt ihn meist. *Bild:* vorgedrucktes Beispiel in grauer Schrift im Formular — gilt, bis man das Feld selbst ausfüllt.
+
+**Änderung** im Abschnitt `[plugins]`:
+
+```ini
+preinstall_disabled = true
+```
+
+Einheitlich schreiben (klein, ohne Einrückung) wie der Rest der Datei — Einheitlichkeit ist eine Form von Lesbarkeit. **Erst sichern, dann bearbeiten** (`sudo cp grafana.ini grafana.ini.bak-<datum>`) — eine Sicherung nach der Änderung ist ein Foto vom Zimmer, nachdem man schon umgeräumt hat.
+
+```bash
+sudo systemctl restart grafana-server      # grafana.ini wird nur beim Start gelesen
+systemctl status grafana-server --no-pager | head -5   # active (running)
+```
+
+**Abschalten heißt nicht deinstallieren:** *preinstall* = „beim Start installieren/aktualisieren“. Abgeschaltet wird nur das ungefragte Anfassen; installierte Plugins bleiben.
+
+**Log richtig lesen:** Nach dem Neustart standen viele Zeilen `level=error … plugin process exited … error="signal: terminated"` — alle vom **alten** Prozess (PID 101210, 17:27:04) beim Herunterfahren. Der neue Prozess (PID 144830, ab 17:27:05) registriert die Plugins ohne Preinstall. *Bild:* Schichtwechsel — die Spätschicht stempelt aus, die Stempeluhr piept rot; entscheidend ist, ob die Frühschicht vollständig antritt.
+
+> **Merksatz:** Ein Log liest man nach Zeit und Prozess, nicht nach dem Wort „error“.
+
+**Positiver Beweis statt leerer Fundstelle:** `active (running)` heißt nur „Prozess läuft“ (am 15.10. lief er auch). Erst „alle Panels liefern Daten“ beweist, dass das Prometheus-Plugin da ist.
+
+**Nebenbei:** Dashboard-Layout auf eine Seite gebracht. Nach der Zeitreise das Zeitfenster zurück auf „Last 15 minutes“ setzen, bevor gespeichert wird — sonst zeigt das Dashboard dauerhaft die Vergangenheit (Brille der Zeitmaschine noch auf).
+
+**Stand 20.10.2026, 19:54 — das ganze Cockpit auf einer Seite**, geordnet wie ein Armaturenbrett bzw. eine Zeitung (Schlagzeile → Vorspann → Artikel), von dringend zu ausführlich:
+
+| Zeile | Panels | Frage |
+|---|---|---|
+| 1 — Warnlampen | Leader-Status · Aktueller Leader · Replicas streamen · Cache-Hit-Ratio (je ¼ Breite, gleich hoch) | Ist alles gut? (1 Sekunde) |
+| 2 — Füllstände | Plattenbelegung (Retro-LCD) · Replikations-Lag · CPU | Wie voll / wie weit hinten? |
+| 3 — Verläufe | TPS · Connections | Wie entwickelt sich die Last? |
+
+Unterwegs: Plattenbelegung hatte einen Scrollbalken, ph-monitor war unsichtbar — ein Panel, in dem man für den kritischen Wert scrollen muss, verfehlt „auf einen Blick“. Senkrechte Balken (Orientation *Vertical*) ausprobiert und verworfen; die waagrechten Retro-LCD-Balken (Pegelanzeige am Mischpult) bleiben — ein Dashboard, das man gern anschaut, schaut man öfter an. Auto-Refresh auf 1 Minute (bei 15 Minuten bliebe ein Failover von ~35 s bis zu einer Viertelstunde unsichtbar — Rauchmelder, der nur alle 15 Minuten schnüffelt).
+
+![Dashboard „PostgreSQL HA-Cluster“ auf einer Seite, 20.10.2026](images/grafana-dashboard-eine-seite.png)
+
+**Kontrollfragen**
+- **Was bedeutet `;` in `grafana.ini`?** → Auskommentiert; es gilt der Standardwert.
+- **Wirkt eine Änderung an `grafana.ini` sofort?** → Nein, erst nach Neustart von `grafana-server`.
+- **Entfernt `preinstall_disabled = true` installierte Plugins?** → Nein, sie werden nur nicht mehr automatisch installiert/aktualisiert.
+- **`level=error … signal: terminated` nach einem Neustart — Problem?** → Nein, wenn es vom alten Prozess beim Herunterfahren stammt (PID und Uhrzeit prüfen).
+
+
+#### Punkt 6 — `Requires=` → `Wants=`: etcd-Wartung ohne Leader-Wechsel
+
+**Problem (20.10. 11:20):** `systemctl restart etcd` auf dem Leader ph-node2 startete Patroni mit (PID 876 → 10501), Patroni gab den Leader-Schlüssel ab → ungeplanter Wechsel TL 18 → 19. Ursache in der Unit:
+
+```ini
+After=network.target etcd.service
+Requires=etcd.service
+```
+
+Patroni braucht *dieses eine* etcd gar nicht — es kann die anderen beiden Mitglieder fragen (deshalb blieb der Leader beim Platte-voll-Incident im Amt, als etcd starb).
+
+| | `Requires=` | `Wants=` |
+|---|---|---|
+| Beim Start | startet etcd mit | startet etcd mit |
+| etcd wird gestoppt / neu gestartet | **Patroni wird mitgestoppt / mitgestartet** | Patroni läuft weiter |
+| Bild | **zwei Bergsteiger am selben Seil** | **Wanderpartner** — brechen zusammen auf, stolpert einer, geht der andere weiter |
+
+`After=` regelt nur die **Reihenfolge** beim Start, `Requires=`/`Wants=` regeln, **wie eng** die Dienste aneinanderhängen — zwei getrennte Dinge.
+
+**Wo liegt die Unit?** `systemctl cat patroni` zeigt in der ersten Zeile den Pfad:
+
+| Ordner | gehört | bei `apt upgrade` |
+|---|---|---|
+| `/lib/systemd/system/` (bzw. `/usr/lib/…`) | dem Paket | wird überschrieben → Änderungen per `systemctl edit` (Drop-in in `/etc/`) |
+| `/etc/systemd/system/` | dem Admin | bleibt |
+
+*Bild:* Einbauküche des Vermieters vs. eigene Küche. Die Patroni-Unit liegt in `/etc/` (selbst geschrieben, Patroni per pip) → direkt ändern. Die etcd-Unit liegt dagegen in `/usr/lib/` (Paket).
+
+**Änderung auf allen drei Knoten (Replicas zuerst):**
+
+```bash
+sudo cp /etc/systemd/system/patroni.service /etc/systemd/system/patroni.service.bak-20261020   # erst sichern
+sudo sed -i 's/^Requires=etcd.service/Wants=etcd.service/' /etc/systemd/system/patroni.service
+sudo systemctl daemon-reload
+systemctl show patroni -p Requires -p Wants -p After
+# Requires=system.slice sysinit.target   ← etcd raus; diese zwei fügt systemd jeder Unit hinzu
+# Wants=etcd.service
+# After=… etcd.service …
+```
+
+- `cat` zeigt, was in der Datei steht; `show` zeigt, was systemd tatsächlich verwendet (inkl. unsichtbarer Standardeinträge). *Bild:* Kochrezept vs. was im Topf ist.
+- `daemon-reload` liest Unit-Dateien neu ein, **startet aber keinen Dienst neu** — auch auf dem Leader harmlos. *Bild:* Der Mitarbeiter liest die neue Dienstanweisung, ohne seine Schicht zu unterbrechen.
+- `patronictl` braucht `sudo`: `/etc/patroni.yml` enthält Passwörter. Die Meldung „not existing **or** no read rights“ unterscheidet nicht zwischen „fehlt“ und „verboten“. Der Dienst selbst läuft dagegen als `postgres` (`User=postgres`), nicht als root.
+
+**Der Beweis mit dem Teststreichholz (auf der Replica ph-node1):**
+
+```bash
+systemctl show patroni -p MainPID      # MainPID=1958528
+sudo systemctl restart etcd
+systemctl show patroni -p MainPID      # MainPID=1958528  ← gleich: Patroni lief durch
+sudo patronictl -c /etc/patroni.yml list   # ph-node2 Leader, TL 20, beide streaming, Lag 0
+```
+
+Die **PID** ist die Personalnummer eines Prozesses: Wer nur in der Kaffeeküche war, behält sie; wer neu eingestellt wird, bekommt eine neue. Getestet auf der Replica — selbst ein Fehlschlag hätte keinen Leader-Wechsel ausgelöst (Rauchmelder testet man mit einem Streichholz, nicht durch Anzünden des Hauses).
+
+![etcd-Neustart auf ph-node1: Patroni-MainPID unverändert, TL 20](images/etcd-restart-patroni-pid-unveraendert.png)
+
+> **Merksatz:** `Requires=` koppelt das Schicksal, `Wants=` nur den Start. Für Dienste, die auf ein Cluster (etcd mit 3 Mitgliedern) zugreifen, reicht `Wants=`.
+
+**Kontrollfragen**
+- **Unterschied `Requires=` / `Wants=` / `After=`?** → Requires: Stopp/Neustart wird übertragen; Wants: nur gemeinsamer Start; After: nur Reihenfolge.
+- **Warum durfte die Patroni-Unit direkt geändert werden?** → Sie liegt in `/etc/systemd/system/` und gehört dem Admin; Paket-Units in `/lib`/`/usr/lib` ändert man per Drop-in (`systemctl edit`).
+- **Startet `systemctl daemon-reload` Dienste neu?** → Nein.
+- **Wie beweist man, dass ein Dienst nicht neu gestartet wurde?** → Gleiche `MainPID` vorher und nachher.
+
 ---
 
 ## Anhang — Metaphern-Spickzettel (für Gespräch und Wiederholung)
@@ -4636,3 +4759,16 @@ Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Ge
 | Instant-Panel + Zeitfenster-Ende | **Zeitreise / Rauchmelder mit echtem Rauch testen** | „Ein Monitoring ist erst fertig, wenn es den letzten echten Vorfall erkannt hätte.“ |
 | Retro-LCD-Bar-gauge | **Pegelanzeige am Hi-Fi-Verstärker** | „Man sieht nicht nur wie voll, sondern wie weit bis Rot.“ |
 | „Füllstand“ vs. „Belegung“ | **Bierglas** | „Panel-Titel so wählen, dass niemand ans Bier denkt.“ |
+| Plugin-Auto-Update beim Start | **Handwerker baut die alte Heizung aus, bevor die neue geliefert ist** | „Ein Monitoring-Server verändert sich nicht ungeplant selbst.“ |
+| `;` in `grafana.ini` | **vorgedrucktes graues Beispiel im Formular** | „Auskommentiert heißt: Es gilt der Standard.“ |
+| Sicherung nach der Änderung | **Foto vom Zimmer, nachdem man schon umgeräumt hat** | „Erst sichern, dann bearbeiten.“ |
+| `error … signal: terminated` beim Neustart | **Schichtwechsel, Stempeluhr piept beim Ausstempeln** | „Logs nach Zeit und Prozess lesen, nicht nach dem Wort error.“ |
+| Dashboard mit Zeitfenster in der Vergangenheit | **Brille der Zeitmaschine noch auf** | „Vor dem Speichern zurück auf Last 15 minutes.“ |
+| Dashboard-Layout | **Armaturenbrett / Zeitung**: oben Warnlampen, Mitte Anzeigen, unten Verläufe | „Von dringend zu ausführlich, von oben nach unten.“ |
+| Auto-Refresh 15 min | **Rauchmelder, der nur alle 15 Minuten schnüffelt** | „Das Refresh-Intervall muss kürzer sein als das, was man sehen will.“ |
+| `Requires=` vs. `Wants=` | **Bergsteiger am selben Seil vs. Wanderpartner** | „`Requires=` koppelt das Schicksal, `Wants=` nur den Start.“ |
+| `/lib` vs. `/etc/systemd/system` | **Einbauküche des Vermieters vs. eigene Küche** | „Paket-Units per Drop-in ändern, eigene Units direkt.“ |
+| `systemctl cat` vs. `show` | **Kochrezept vs. was im Topf ist** | „`show` zeigt, was systemd wirklich verwendet.“ |
+| `daemon-reload` | **neue Dienstanweisung lesen, ohne die Schicht zu unterbrechen** | „daemon-reload startet nichts neu.“ |
+| PID vorher/nachher | **Personalnummer** — Kaffeeküche vs. Neueinstellung | „Gleiche PID = kein Neustart.“ |
+| Test auf der Replica | **Rauchmelder mit Streichholz testen, nicht das Haus anzünden** | „Riskante Tests zuerst dort, wo ein Fehlschlag harmlos ist.“ |
