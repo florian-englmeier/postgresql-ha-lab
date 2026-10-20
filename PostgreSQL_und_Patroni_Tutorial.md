@@ -3345,6 +3345,21 @@ Visualisierung **Stat**, Legend **Custom** `{{name}}` (Patroni liefert das Label
 
 **Verifiziert 17.10.2026:** zeigt `ph-node2`.
 
+**Korrektur 19.10.2026 — Query-Typ Instant statt Range.** Beim ersten echten Leader-Wechsel zeigte das Panel **zwei** Namen (Geister-Leader, siehe 17.13). Ursache: Eine **Range**-Query liefert den Verlauf über den ganzen Zeitraum; `patroni_primary == 1` filtert jeden Zeitpunkt, an dem ein Knoten Leader war. Der alte Leader hat im Zeitraum noch Punkte, danach keine mehr — die Stat-Berechnung nimmt seinen letzten vorhandenen Wert. Lösung: Query → *Options* → **Type: Instant** — nur der aktuelle Wert.
+
+![Leader-Panel mit Type Instant](images/grafana-leader-panel-instant.png)
+
+Ergebnis: Das Panel zeigt nur noch `ph-node2`.
+
+| Query-Typ | Bild | Gut für |
+|---|---|---|
+| **Range** | Film über den Zeitraum 🎞️ | Zeitreihen (TPS, CPU, Lag) und Sparklines |
+| **Instant** | Foto vom Jetzt 📸 | „Wer ist **jetzt** …?“, aktuelle Zustände |
+
+Warum stand es auf Range? **Range ist Grafanas Standard** für jede neue Query, weil die meisten Panels Zeitreihen zeigen. Beim Bauen am 17.10. gab es im Zeitfenster keinen Leader-Wechsel, Range und Instant lieferten dasselbe — der Unterschied zeigt sich erst, wenn sich *innerhalb* des Zeitfensters etwas ändert. Das Leader-Status-Panel (`sum(patroni_primary)`) bleibt bewusst auf Range: Die Summe wird je Zeitpunkt gebildet, ist also immer aktuell, und die Hintergrund-Sparkline zeigt den Einbruch beim Failover.
+
+> **Merksatz:** Standardwerte passen zum Normalfall. Ob ein Panel stimmt, zeigt erst der Sonderfall — deshalb Failover-Tests auch für das Monitoring.
+
 #### Panel 7: CPU-Auslastung — PromQL von innen nach außen lesen
 
 Der node_exporter zählt je CPU-Kern, wie viele Sekunden er in jedem Modus verbracht hat (`idle`, `user`, `system`, `iowait` …). Die Auslastung ist „alles außer Leerlauf“:
@@ -3476,6 +3491,45 @@ Erklärung: **Group Commit.** Bei jedem `COMMIT` muss das WAL per `fsync` sicher
 
 > **Merksatz:** Der Engpass wandert mit der Last. Wenig Last: Platte (fsync pro Commit). Viel Last: CPU, weil Group Commit die Platte entlastet. Ein Lasttest misst deshalb nie „die“ Grenze, sondern die Grenze bei einer bestimmten Last — und auf diesem Lab einen gemeinsamen Proxmox-Host (CPU und Platte geteilt).
 
+#### Gegenprobe: Lastgenerator auf eigener VM (ph-monitor, 19.10.2026)
+
+Frage: Hat pgbench auf ph-node1 die Messung verfälscht, weil es dort CPU mitfrisst? Gegenprobe mit identischem Befehl, diesmal von **ph-monitor** (pgbench installiert ohne Datenbank-Cluster, siehe Betriebslog):
+
+```bash
+pgbench -h 192.168.178.200 -p 5000 -U postgres -c 50 -j 2 -T 60 pgbench_test
+```
+
+| | von ph-node1 | von ph-monitor | Unterschied |
+|---|---|---|---|
+| TPS | 2 977 | **2 831** | −5 % |
+| Latenz Ø | 16,8 ms | **17,7 ms** | +0,9 ms |
+| Transaktionen | – | 169 546 | – |
+| Fehler | 0 | **0** | – |
+
+![Lasttest von ph-monitor, 50 Clients](images/grafana-lasttest-ph-monitor.png)
+
+Little-Check: 50 ÷ 0,01766 s = 2 831 TPS. **Ergebnis:** pgbench war kein Bremsklotz — wäre es einer gewesen, müsste der Test von außen *schneller* sein. 5 % liegen im Rauschen zweier Läufe auf einem geteilten Proxmox-Host, dazu kommt ein zusätzlicher Netzwerk-Hop. Die Werte vom Laststufen-Test bleiben gültig.
+
+**Befund: Die VIP kostet CPU.** Auch ohne pgbench lag ph-node1 unter Last ~10 Punkte über ph-node3 (CPU ~62 % vs. ~52 %, Leader ph-node2 ~85 %). Ursache:
+
+```bash
+florian@ph-node1:~$ ip -br a | grep 192.168.178.200
+ens18   UP   192.168.178.201/24 192.168.178.200/24 ...
+```
+
+ph-node1 trägt die VIP (keepalived). Jedes Paket aller 50 Clients läuft über das HAProxy auf ph-node1 und wird von dort zum Leader ph-node2 weitergereicht — Hin- und Rückweg. Bild: der Pförtner am Eingang, der jedem Gast die Tür aufhält und die Taschen bis zum richtigen Büro trägt. Er arbeitet nicht in der Abteilung, ist aber trotzdem außer Atem.
+
+> **Merksatz:** VIP und Leader müssen nicht auf demselben Knoten liegen — HAProxy fragt per Patroni-REST-API (`/primary`), wer gerade schreibt, und leitet weiter. Der Preis ist ein Extra-Hop und CPU auf dem VIP-Knoten. Wer „gleiche Replicas, ungleiche CPU“ sieht, prüft zuerst, wer die VIP trägt.
+
+**Cache-Hit-Ratio unter Last:** ph-node2 ~94 % (rot), die Replicas ~97–98 % (orange), im Leerlauf wieder 100 %. Einordnung:
+
+| Beobachtung | Erklärung |
+|---|---|
+| ~94 % trotz winziger Werkbank | pgbench Scale 50 ≈ 750 MB Daten, `shared_buffers` nur 128 MiB. Die „heißen“ Zeilen (`pgbench_branches`, `pgbench_tellers`) passen trotzdem auf die Werkbank. |
+| `blks_read` ist nicht immer Platte | gezählt wird nur „nicht in `shared_buffers`“ — oft liegt der Block noch im **Linux-Page-Cache** (RAM): eher Nebenzimmer als Keller. |
+| Replicas sinken auch | Sie lesen nicht für Kunden, spielen aber das WAL nach: Um eine Änderung einzutragen, muss der Block erst auf die Werkbank — der Handwerker legt das Werkstück auf die Bank, bevor er es repariert. |
+| Richtwert OLTP > 99 % | Die ~94 % sind die **Ausgangslage vor dem Tuning** von `shared_buffers`. |
+
 #### Das fertige Dashboard
 
 ![Eigenes Dashboard PostgreSQL HA-Cluster mit allen sechs Panels](images/grafana-ha-dashboard.png)
@@ -3540,6 +3594,371 @@ Ergebnis: **~125 KB je Replica** — rund 1/130 der Warnlinie. Die −128 MiB vo
 **Nebenbefund:** Die Cache-Hit-Ratio fiel während des Tests auch auf den Replicas (bis 90,8 %), obwohl dort nicht geschrieben wird — beim Einspielen des WAL werden dieselben Datenblöcke angefasst wie auf dem Leader. Nach dem Test erholten sich die Replicas schnell auf 99,6 %.
 
 > **Merksatz:** Eine Differenz ist nur so gut wie die Gleichzeitigkeit ihrer beiden Messwerte. Lag deshalb dort messen, wo beide Positionen im selben Moment bekannt sind — auf dem Leader in `pg_stat_replication`.
+
+### 17.13 Failover unter Last
+
+Ziel: den Leader mitten unter pgbench-Last **hart abschalten** (Stromausfall) und messen, wie lange der Cluster ohne Primary ist, was die Clients merken und wie der alte Leader zurückkehrt.
+
+#### Wie ein Failover abläuft — die Gemeinderat-Metapher
+
+| Im Cluster | Im Bild |
+|---|---|
+| **etcd** (3 Mitglieder) | der **Gemeinderat**, führt das amtliche Register |
+| **Leader-Schlüssel** in etcd | die **Bürgermeister-Schärpe**, gültig nur **30 Sekunden** (`ttl`) |
+| **Patroni** auf jedem Knoten | der **Bürger**, der regelmäßig beim Rat vorbeischaut |
+| **der Leader** (beim Test ph-node2) | der amtierende **Bürgermeister** |
+
+Im Normalbetrieb läuft der Bürgermeister **alle 10 Sekunden** (`loop_wait`) zum Rat: *„Ich lebe noch, verlängert meine Schärpe um 30 Sekunden.“* Solange er das tut, bleibt er im Amt.
+
+**Was nach dem Stecker-Ziehen passiert:**
+
+| Zeit | Was passiert | Bild |
+|---|---|---|
+| **0 s** | `qm stop 202`: ph-node2 ist schlagartig weg | Der Bürgermeister fällt um ⚡ |
+| 0 bis ~30 s | Niemand verlängert den Schlüssel. Die Replicas merken, dass der WAL-Strom abgerissen ist, **dürfen aber noch nicht** übernehmen | Die Schärpe ist noch gültig — man wartet ab |
+| **~20–30 s** | Der Schlüssel **läuft ab** (je nachdem, wann er zuletzt verlängert wurde), etcd löscht ihn | Das Amt ist offiziell frei |
+| +1–2 s | Die Replicas vergleichen ihre WAL-Position: Nur wer aktuell genug ist (`maximum_lag_on_failover`), darf kandidieren | Wer hat das vollständigste Protokoll? 📜 |
+| | Beide versuchen, den Schlüssel anzulegen — etcd lässt **genau einen** gewinnen (atomare Operation) | Wer zuerst unterschreibt, ist gewählt ✍️ |
+| +2–3 s | Der Gewinner führt `promote` aus: Replica → Primary, **neue Timeline** | Vereidigung |
+| | Der Verlierer hängt sich als Replica an den neuen Leader | Der andere Bürger erkennt das Ergebnis an |
+| +einige s | **HAProxy** fragt jeden Knoten per Patroni-REST-API (`/primary`), der neue antwortet mit 200 → ab jetzt wird dorthin weitergeleitet | Der Pförtner schickt die Gäste ins neue Büro 🚪 |
+
+**Warum nicht sofort?** Der Rat weiß nicht, ob der Bürgermeister tot ist oder nur im Stau steht. Würde man sofort neu wählen und der alte käme zurück, gäbe es **zwei Bürgermeister** — Split-Brain. Die `ttl` ist der bewusst bezahlte Preis: **lieber ~30 Sekunden kein Leader als einen Moment lang zwei.**
+
+**Die Rückkehr des alten Leaders:** Fährt ph-node2 wieder hoch, schaut Patroni beim Rat vorbei, sieht *„Schärpe gehört jemand anderem“* und reiht sich als **Replica** ein. Hat er kurz vor dem Absturz noch WAL geschrieben, das die anderen nie bekommen haben, spult Patroni ihn mit **`pg_rewind`** auf die gemeinsame Geschichte zurück — er wirft seine nie verkündeten Notizen weg und übernimmt das offizielle Protokoll.
+
+**Was die Clients merken:** Ihre Verbindungen zum alten Leader **reißen ab**. Ob und wie sie sich neu verbinden, entscheidet die Anwendung, nicht der Cluster.
+
+> **Merksatz:** Ein ungeplanter Failover dauert mindestens so lange, bis der Leader-Schlüssel abläuft (`ttl`), plus Wahl, `promote` und HAProxy-Check. Ein geplanter Switchover ist schneller, weil der alte Leader die Schärpe freiwillig übergibt.
+
+#### Versuchsaufbau
+
+| Fenster | Wo | Befehl / Zweck |
+|---|---|---|
+| A | ph-node1 | `watch -n 1 sudo patronictl -c /etc/patroni.yml list` — Cluster live, jede Sekunde |
+| B | ph-monitor | `pgbench -h 192.168.178.200 -p 5000 -U postgres -c 50 -j 2 -T 180 -P 5 pgbench_test` — Last, `-P 5` meldet alle 5 s TPS und Latenz |
+| C | Proxmox-Host | `date; qm stop 202` — Stromausfall mit Zeitstempel |
+| Grafana | Browser | eigenes Dashboard, *Last 15 minutes*, Refresh 5 s |
+
+`qm stop` statt `qm shutdown`: `shutdown` fährt sauber herunter (Patroni gibt den Schlüssel freiwillig zurück), `stop` ist der Stromausfall — so wie ein echter Ausfall auch nicht vorher Bescheid sagt.
+
+Vorab-Check: `patronictl list` → ein Leader (ph-node2, TL 12), zwei Replicas `streaming`, Lag 0. VMID von ph-node2 per `qm list` bestätigt: **202**.
+
+#### Durchgang 1: Failover im Leerlauf (Nullmessung, 19.10.2026)
+
+Geplant war der Test unter Last — im Eifer mit drei Fenstern lief pgbench beim Stecker-Ziehen aber nicht (TPS-Achse nur bis 3,5 ops/s = Grundrauschen von Exporter und Autovacuum, Connections ohne Sprung). Ergebnis ist damit eine saubere **Nullmessung**: Failover ohne Last. Wie im Labor: erst ohne Probe messen, dann mit.
+
+**Ablauf:**
+
+| Uhrzeit (CEST) | Ereignis |
+|---|---|
+| 12:07:21–12:07:32 | `qm stop 202` — Stromausfall ph-node2 (Leader, TL 12). Zeitfenster statt Zeitpunkt, weil `date` und `qm stop` getrennt eingegeben wurden → Lehre: `date; qm stop 202` in **einer** Zeile |
+| ~12:08 | ph-node1 ist Leader, **TL 13**; ph-node3 folgt als Replica, `streaming`, **Lag 0** |
+| 12:09:58 | `patronictl list` zeigt nur noch ph-node1 und ph-node3 — ph-node2 ist komplett verschwunden |
+| 12:12:45 | `date; qm start 202` — Strom wieder an |
+| 12:15:15 | ph-node2 wieder im Register: `Replica`, `starting`, TL leer, LSN `unknown` |
+
+![patronictl list nach dem Failover: ph-node1 Leader, TL 13](images/failover-leerlauf-patronictl-tl13.png)
+
+**Warum ist ph-node2 ganz aus der Liste verschwunden?** Nicht nur die Schärpe (Leader-Schlüssel) hat ein Ablaufdatum: Jeder Knoten steht mit einem eigenen **Member-Eintrag** in etcd, den Patroni regelmäßig erneuert. Ein toter Knoten erneuert nichts, der Rat streicht ihn nach Ablauf aus dem **Einwohnerregister**. Beim Neustart meldet er sich neu an.
+
+#### Das Dashboard während des Failovers
+
+![Dashboard kurz nach dem Stecker-Ziehen: zwei Namen im Leader-Panel](images/failover-leerlauf-dashboard-geist.png)
+
+![Dashboard nach dem Failover: Einbruch im Leader-Status, ph-node2 bootet wieder](images/failover-leerlauf-dashboard-luecke.png)
+
+| Panel | Beobachtung | Erklärung |
+|---|---|---|
+| Leader-Status | Zahl zeigt `OK`, aber die **Hintergrundkurve bricht als „V“ auf 0 ein** | Das ist die Zeit **ohne Bürgermeister** — etwa ein bis zwei Scrape-Intervalle (je 15 s), passend zur `ttl`. Die exakte Dauer liefert das Patroni-Log, nicht die Kurve |
+| Aktueller Leader | zeigt **zwei** Namen: ph-node1 **und** ph-node2 | **Kein Split-Brain** — die Ampel daneben sagt `OK` (`sum(patroni_primary)` = 1). Das Stat-Panel zeigt pro Knoten den **letzten Wert im Zeitraum** (*Last \**). ph-node2 lieferte als letzten Wert vor dem Tod eine 1, danach nichts mehr — Grafana hält daran fest |
+| TPS | gelbe Linie (ph-node2) bricht ab | Grundrauschen verschwindet mit dem Knoten |
+| CPU | gelbe Spitze ~45 % um 12:13, dann abfallend | ph-node2 **bootet** — node_exporter liefert wieder Daten. Heißt nur „VM lebt“, nicht „Patroni spielt mit“ |
+| Replikations-Lag | **leer seit ~12:07** | **Kein Datenproblem, sondern ein Grafana-Effekt (bestätigt 15:15, siehe Kasten unten):** In TPS- und Lag-Panel war per Klick in die Legende je *eine* Serie isoliert und mit dem Dashboard gespeichert (graue Legenden-Einträge = ausgeblendet). TPS zeigte nur ph-node2 → nach dessen Ausfall leer; Lag zeigte nur die Replica „ph-node1“ → seit ph-node1 Leader ist, leer. Bild: festgeschraubtes Fernglas auf ein Haus, dessen Bewohner umgezogen ist 🔭 |
+
+**Stolperstein: das festgeschraubte Fernglas (Legenden-Isolation wird mitgespeichert).** Ein Klick auf einen Legenden-Eintrag zeigt nur noch diese Serie, die anderen werden grau. Speichert man danach das Dashboard, legt Grafana dafür still einen **Override** an:
+
+![Override „ph-node3 › Hide in area“ im TPS-Panel](images/grafana-override-legend-isolation.png)
+
+Gefunden unter Panel → *Edit* → ganz unten *Overrides*: `ph-node3 › Hide in area` (vormittags stand dort ph-node2). Gelöscht mit dem Mülleimer, danach zeigt das TPS-Panel wieder alle drei Linien: **ph-node1 (Leader) ~3,2 ops/s**, die Replicas je ~2 ops/s — auch im Leerlauf zählt der Leader mehr Transaktionen (Patroni-Heartbeat, Autovacuum), die Replicas nur die Abfragen des Exporters. Gleiches Muster im Lag-Panel.
+
+> **Merksatz:** Graue Legenden-Einträge heißen „ausgeblendet“, nicht „keine Daten“. Vor dem Speichern eines Dashboards einmal auf die Legende schauen.
+
+Bild zum Geister-Leader: ein **Foto an der Rathauswand**. Der alte Bürgermeister hängt noch da, weil niemand ein neueres Foto von ihm aufhängen kann — er ist ja nicht mehr da. 🖼️👻
+
+> **Merksatz:** Der „letzte Wert“ eines toten Knotens ist ein Geist, kein Leader. Die Ampel (Summe der *aktuellen* Werte) ist die verlässlichere Anzeige. Und: etcd vergisst Tote, Grafana hängt ihr Foto noch an die Wand.
+
+#### Die Rückkehr von ph-node2: Warum „starting“ so lange dauert
+
+![ph-node2 um 12:15:15: Replica, starting, TL leer, LSN unknown](images/failover-rueckkehr-node2-starting.png)
+
+Momentaufnahme **12:15:15**, zweieinhalb Minuten nach `qm start` (12:12:45):
+
+| Spalte | Wert | Bedeutung |
+|---|---|---|
+| **Role** | `Replica` ✅ | Er hat **akzeptiert**, dass ph-node1 jetzt Bürgermeister ist — kein Putschversuch. Patroni sah beim Rat: Schärpe gehört jemand anderem |
+| **State** | `starting` ⏳ | PostgreSQL fährt noch hoch |
+| **TL** | leer | Er weiß noch nicht, in welcher Ära er lebt |
+| **Receive/Replay LSN** | `unknown` | Er kann noch nicht sagen, wo er im Tonband steht |
+
+**Was in dieser Zeit passiert — von außen nach innen:**
+
+| Schritt | Was | Dauer (grob) |
+|---|---|---|
+| 1 | **VM bootet** (Ubuntu, Netzwerk, Dienste) | 20–40 s |
+| 2 | **Patroni startet automatisch** (`systemctl enable patroni`, repariert am 01.10.2026 — heute zahlt sich das aus) und meldet sich in etcd an → taucht in `list` auf | Sekunden |
+| 3 | **Crash-Recovery:** Der Strom wurde gezogen, die Datenbank nicht sauber beendet. PostgreSQL spielt das WAL ab dem letzten **Checkpoint** nach, damit jede bestätigte Transaktion wirklich in den Datendateien steht | abhängig von WAL-Menge seit dem Checkpoint |
+| 4 | **Abgleich mit dem neuen Leader:** Passt die eigene Geschichte (TL 12) zur offiziellen (TL 13)? Falls ph-node2 kurz vor dem Absturz noch WAL geschrieben hat, das nie bei den anderen ankam → **`pg_rewind`** | Sekunden bis Minuten |
+| 5 | Als Replica von ph-node1 starten, WAL-Strom aufnehmen → `streaming`, TL 13 | Sekunden |
+
+Bild: Der Bürgermeister wacht im **Krankenhaus** auf und liest zuerst **sein eigenes Tagebuch** bis zur letzten Seite (Crash-Recovery), bevor er das Bett verlässt. 📔🏥 Dann vergleicht er es mit dem **offiziellen Protokoll des Rats**. Was er sich nach dem letzten gemeinsamen Stand notiert hat, aber nie verkündet wurde, reißt er heraus (`pg_rewind`). Erst dann darf er wieder mitarbeiten — als einfacher Bürger.
+
+> **Merksatz:** Ein sauber beendeter Knoten kommt schnell zurück. Ein hart abgeschalteter muss erst Crash-Recovery machen und eventuell zurückgespult werden — „starting“ ist kein Fehler, sondern Aufräumarbeit. Erst bei `streaming` mit Lag 0 ist er wieder vollwertige Reserve.
+
+#### Befund: ph-node2 bleibt in „starting“ hängen — die WAL-Lücke
+
+Auch Minuten nach dem Neustart wechselte ph-node2 nicht zu `streaming`. Das Patroni-Log (`sudo journalctl -u patroni --since "12:12" --no-pager`) erzählt die Geschichte:
+
+| Zeit | Logzeile | Übersetzung |
+|---|---|---|
+| 12:12:55 | `doing crash recovery in a single user mode` | Patroni lässt ihn erst sein Tagebuch fertig lesen — allein im Zimmer, ohne Besucher |
+| 12:12:56 | `primary: history= … 12  1/DF33E0B8` | Er holt sich vom neuen Leader das Fahrtenbuch: TL 12 endete bei 1/DF33E0B8 |
+| 12:12:56 | `running pg_rewind from ph-node1` | Zurückspulen |
+| 12:12:57 | `servers diverged at WAL location 1/DF33E0B8 on timeline 12` | Hier trennten sich die Wege — exakt die Stelle aus dem Fahrtenbuch |
+| 12:12:57 | `rewinding from last common checkpoint at 1/DF33DFF0` … `Done!`, `exit code=0` | **pg_rewind erfolgreich** |
+| 12:12:57 | `starting backup recovery with redo LSN 1/CE006958, checkpoint LSN 1/DF33DFF0` | Jetzt ab dem gemeinsamen Lesezeichen neu einlesen — ab **1/CE** |
+| ab dann, alle paar s | `requested WAL segment 0000000C00000001000000CE has already been removed` → `waiting for WAL to become available` | ph-node1 hat dieses Bandstück nicht mehr — Endlosschleife |
+| parallel | `Lock owner: ph-node1; I am ph-node2` … `no action. I am (ph-node2), a secondary, and following a leader (ph-node1)` | Patroni ist zufrieden, PostgreSQL steckt fest |
+
+**Den Segmentnamen lesen:** `0000000C 00000001 000000CE` = Timeline 0x0C (**12**, hex), oberer LSN-Teil `1/`, Segment `CE`. Der Cluster stand bei 1/DF… → 0xDF − 0xCE = 17 Segmente × 16 MB ≈ **272 MB** Lücke.
+
+**Warum liegt das Lesezeichen so weit zurück?** Die Steckbriefe (`pg_controldata`, von Patroni ins Log gedruckt) zeigen: letzter Checkpoint **10:27:06** — mitten im Lasttest vom Vormittag. Ein Checkpoint wird über Minuten verteilt (`checkpoint_completion_target` 0,9 × `checkpoint_timeout` 5 min ≈ 4,5 min) und hat deshalb zwei Enden:
+
+| | Position | Zeit |
+|---|---|---|
+| **Start** (REDO) — ab hier muss nachgespielt werden | **1/CE**006958 | 10:27:06, mitten im Lasttest |
+| **Ende** (Checkpoint-Eintrag) | 1/**DF**33DFF0 | Minuten später |
+
+Danach war der Cluster fast im Leerlauf — kaum Änderungen, also kein neues Lesezeichen. Bild: Der Bürgermeister setzt ein Lesezeichen, **während ihm 272 Seiten diktiert werden**, und klappt das Buch erst nach dem Diktat zu. Nachlesen muss man ab dem Aufschlagen, nicht ab dem Zuklappen. 📖
+
+**Wo liegt das fehlende Stück?** ph-node2 war vom 15.10. bis zum Ausfall Leader und hat es selbst archiviert:
+
+```bash
+florian@ph-node2:~$ sudo ls -la /var/lib/postgresql/wal_archive/ | grep 0000000C00000001000000CE
+-rw------- 1 postgres postgres 16777216 Okt 19 10:27 0000000C00000001000000CE
+florian@ph-node2:~$ sudo grep -n "restore_command" /etc/patroni.yml
+florian@ph-node2:~$                      # keine Ausgabe
+```
+
+Die Akte liegt im Schrank, aber **der Archivar hat keinen Schlüssel**: Ohne `restore_command` schaut PostgreSQL nie ins Archiv.
+
+**Die Kette in fünf Gliedern:**
+
+1. 10:27 — Checkpoint startet mitten im Lasttest (REDO bei 1/CE), wird erst Minuten später abgeschlossen.
+2. Danach Leerlauf — kein neues Lesezeichen.
+3. 12:07 — Stromausfall; ph-node1 wird Leader und hält altes WAL nicht vor (`wal_keep_size` = 0).
+4. 12:12 — ph-node2: Crash-Recovery und `pg_rewind` klappen, danach braucht er WAL ab 1/CE.
+5. Das Stück liegt nur im **lokalen** Archiv von ph-node2 — und ohne `restore_command` liest es niemand.
+
+Ein Fehler von 12:07 mit einer Ursache von 10:27.
+
+**Was die Nutzer davon merkten — und was nicht:**
+
+| | Status |
+|---|---|
+| Datenbank erreichbar? | ✅ nach dem Failover auf ph-node1 |
+| Daten verloren? | ✅ nein, ph-node3 Lag 0 |
+| **Reserve** ph-node2 einsatzbereit? | ❌ nein — der Cluster lief grün, aber auf einem Bein 🦩 |
+
+Bild: Der Ersatzreifen ist montiert, das Auto fährt. Nur der kaputte Reifen lässt sich nicht flicken, weil das Flickzeug im falschen Kofferraum liegt. 🚗
+
+**Blinder Fleck im Dashboard:** Während ph-node2 feststeckte, zeigte das eigene Dashboard alles grün — Leader-Status `OK`, Cache ph-node2 „100 %“ (wieder ein Geist: letzter Wert eines Knotens, der keine Verbindungen annimmt). Das Dashboard beantwortet „Gibt es genau einen Leader?“, aber nicht „Sind meine Reserven einsatzbereit?“. Bild: Die Feuerwache meldet „besetzt“, aber dass ein Löschfahrzeug mit Platten in der Halle steht, steht auf keiner Tafel. 🚒 → Verbesserung: Panel „Replicas im Zustand streaming“ (Soll 2), z. B. über `patroni_postgres_streaming`.
+
+> **Merksatz:** Ein Dashboard, das immer grün ist, ist kein Monitoring, sondern Tapete. Lücken im Monitoring findet man, indem man etwas kaputt macht und schaut, ob es jemand merkt.
+
+#### Warum das passieren konnte — und welche Schutzschichten in Produktion fehlen
+
+Der Lasttest hat das Problem nicht verursacht, sondern **sichtbar gemacht**: Viel Schreiblast = viel WAL zwischen zwei Lesezeichen = große Lücke für eine zurückkehrende Replica. Im Lab 272 MB, im echten Betrieb leicht Gigabytes. Das Lab lief mit **Standardeinstellungen**, und die sind bei PostgreSQL bewusst sparsam — sie gehen davon aus, dass der DBA die Reserven selbst auslegt.
+
+| Schutzschicht | Was | Bild | Stand im Lab |
+|---|---|---|---|
+| **Zentrales WAL-Archiv** + `restore_command` auf allen Knoten | Jeder Knoten holt jedes alte Bandstück, egal wer es archiviert hat (z. B. pgBackRest auf NAS) | ein gemeinsames Stadtarchiv statt Schuhkartons in jedem Haus 🗄️ | ❌ jeder Leader archiviert lokal, niemand liest |
+| **`wal_keep_size`** | Der Leader hebt eine WAL-Reserve auf (z. B. 1–2 GB), statt sofort zu recyceln | der Rat schreddert Protokolle erst nach einem Monat | ❌ Standard 0 |
+| **Monitoring der Replicas** | Alarm, wenn eine Replica nicht `streaming` ist | Tafel in der Feuerwache | ❌ blinder Fleck, siehe oben |
+| **Runbook** „Replica kommt nicht zurück“ | Der Bereitschaftsdienst weiß: Log lesen, dann `patronictl reinit` | Notfallkarte im Handschuhfach | 🔜 |
+
+Für Physiker: Das System war auf **Nennbetrieb** ausgelegt, nicht auf **Störfall plus Vorbelastung**. Der Test hat gezeigt, dass die Sicherheitsreserve für den Wiederanlauf fehlte — kein Konstruktionsfehler von PostgreSQL, sondern fehlende Auslegung. Genau dafür macht man Belastungs- und Ausfalltests im Labor und nicht in Produktion.
+
+**Reparaturwege:**
+
+| Weg | Was | Bewertung |
+|---|---|---|
+| **A: `patronictl reinit`** | Datenverzeichnis löschen, frische Kopie vom Leader (`pg_basebackup`) | Standardweg, funktioniert immer — **gewählt** |
+| B: `restore_command` setzen | bei fehlendem WAL im Archiv nachschauen | richtig gedacht, mit lokalen Archiven aber nur zufällig wirksam → gehört zum zentralen Archiv |
+| C: Segmente von Hand nach `pg_wal` kopieren | schnell | Bastelei, in Produktion tabu |
+
+> **Merksatz:** Ein Failover ist erst fertig, wenn die Reserve wieder `streaming` ist. Bis dahin läuft der Cluster ohne Netz — und das sieht man nur, wenn man auch die Replicas überwacht.
+
+#### Reparatur: `patronictl reinit`
+
+```bash
+sudo patronictl -c /etc/patroni.yml reinit postgres-ha ph-node2   # Rückfrage mit y bestätigen
+```
+
+Patroni löscht das Datenverzeichnis von ph-node2 und zieht per `pg_basebackup` eine frische Kopie vom Leader. Ergebnis nach rund einer Minute (12:33:37): alle drei Knoten auf **TL 13**, ph-node2 und ph-node3 `streaming`, Lag 0.
+
+![Nach dem reinit: ph-node2 wieder streaming, TL 13](images/failover-reinit-node2-streaming.png)
+
+Nettes Detail im Lag-Panel: Während des `reinit` tauchte kurz ein Eintrag **`pg_basebackup`** in der Legende auf. Auch die Basissicherung ist für den Leader nur ein weiterer WAL-Empfänger in `pg_stat_replication` — mit `application_name` = `pg_basebackup`.
+
+
+#### Erste Schutzschicht: `wal_keep_size`
+
+Die cluster-weite Konfiguration in etcd zeigt `sudo patronictl -c /etc/patroni.yml show-config` — und bestätigt die Werte aus der Gemeinderat-Metapher:
+
+| Parameter | Wert | Bedeutung |
+|---|---|---|
+| `ttl` | 30 | Schärpe gilt 30 s |
+| `loop_wait` | 10 | Bürgermeister meldet sich alle 10 s |
+| `maximum_lag_on_failover` | 1048576 (1 MiB) | nur wer höchstens 1 MiB hinterher ist, darf kandidieren |
+| `use_pg_rewind` | true | deshalb lief `pg_rewind` automatisch |
+| `archive_command` | `cp %p /var/lib/postgresql/wal_archive/%f` | jeder Leader legt in seinen eigenen Schuhkarton ab |
+| `restore_command` | fehlt | Archivar ohne Schlüssel |
+| `wal_keep_size` | fehlt (= 0) | der Rat schreddert sofort |
+
+**Größe:** PostgreSQL erzwingt spätestens nach `max_wal_size` (Standard 1 GB) neues WAL einen Checkpoint — der Abstand zwischen REDO-Punkt und Ende liegt also grob in dieser Größenordnung (heute 272 MB). Hebt der Leader mindestens so viel auf, findet ein zurückkehrender Knoten das fehlende Band fast immer noch beim Leader. Platz: gut 9 GB frei je Knoten.
+
+```bash
+sudo patronictl -c /etc/patroni.yml edit-config -p wal_keep_size=1GB   # Diff prüfen, dann y
+```
+
+`-p` setzt einen Eintrag unter `postgresql.parameters`, ohne Editor — keine Einrückungsfehler möglich. `wal_keep_size` ist ein **Reload-Parameter** (Kontext `sighup`): Patroni lädt die Konfiguration auf allen Knoten neu, kein Neustart nötig. Ergebnis 19.10.2026 15:23: `show-config` zeigt `wal_keep_size: 1GB`.
+
+> **Merksatz:** `wal_keep_size` ist der Aktenschrank des Leaders: Er schreddert WAL erst, wenn diese Reserve überschritten ist. Es ersetzt kein zentrales Archiv, deckt aber den häufigsten Fall ab — eine Replica, die nach Minuten zurückkommt.
+
+#### Geplanter Switchover zurück: Leader und VIP trennen (19.10.2026, ~15:33)
+
+Nach dem ersten Failover war ph-node1 **Leader und VIP-Halter** zugleich. Ein Ausfall hätte zwei Wechsel gleichzeitig ausgelöst (keepalived verschiebt die VIP, Patroni wählt neu) — nicht mehr unterscheidbar, welcher was verursacht. Regel aus dem Labor: **immer nur eine Variable ändern.** Deshalb `sudo patronictl -c /etc/patroni.yml switchover postgres-ha` (Primary ph-node1, Candidate ph-node2, now).
+
+| | Failover 12:07 (Stecker gezogen) | Switchover 15:33 (Handschlag) 🤝 |
+|---|---|---|
+| Timeline | 12 → 13 | 13 → 14 |
+| Alter Leader danach | `starting`, Crash-Recovery, `pg_rewind`, hing fest | **sofort `streaming`, Lag 0** |
+| Warum | Tagebuch mitten im Satz abgebrochen | sauber heruntergefahren, letzter Eintrag ist ein Abschluss-Checkpoint — nichts nachzulesen, nichts zurückzuspulen |
+
+Bild: Der eine Bürgermeister fällt im Amt um und landet im Krankenhaus. Der andere übergibt bei einer Feier die Schärpe und setzt sich als Bürger in die erste Reihe. 🎩
+
+#### Durchgang 2: wieder im Leerlauf (20.10.2026)
+
+Wieder lief pgbench beim Stecker-Ziehen nicht (Befehl in Fenster B eingetippt, aber nicht mit Enter gestartet) — zweite Nullmessung, diesmal mit dem Wiederanlauf als Bonus.
+
+| Uhrzeit (CEST) | Ereignis |
+|---|---|
+| 09:35:22 | `date; qm stop 202` — Stromausfall ph-node2 (Leader, TL 14) |
+| ~09:36 | **ph-node3** Leader, **TL 15**; ph-node1 `streaming`, Lag 0. Leader-Status-Sparkline zeigt wieder das „V“, das Leader-Panel (jetzt Instant) nur `ph-node3` |
+| 09:40:41 | `date; qm start 202` |
+| ~09:41 | ph-node2 **`streaming`, TL 15, Lag 0 — ohne `reinit`** |
+
+![Dashboard beim zweiten Failover](images/failover2-leerlauf-dashboard.png)
+
+![ph-node2 nach dem Neustart wieder streaming, ohne reinit](images/failover2-node2-streaming-ohne-reinit.png)
+
+**Ehrliche Einordnung:** Das beweist `wal_keep_size` noch nicht. Seit dem Vortag lief keine Last, das letzte Lesezeichen lag nahe am Absturzpunkt, die Lücke war klein — ph-node2 wäre wahrscheinlich auch ohne Aktenschrank zurückgekommen. Prüfgewicht zu leicht. ⚖️ Aussagekräftig ist erst ein Ausfall **nach bzw. unter Schreiblast**.
+
+| Test | WAL-Lücke | Aussagekraft für `wal_keep_size` |
+|---|---|---|
+| 19.10.: Lasttest 10:27, Ausfall 12:07 | 272 MB | hoch — ohne Schutz hängengeblieben |
+| 20.10.: keine Last seit Vortag | klein | gering |
+
+**Dashboard-Beobachtung:** Fünf Minuten nach dem Ausfall standen ph-node2 noch in den Legenden und mit „100 %“ in der Cache-Kachel. Die Legende listet alle Serien **im Zeitfenster** — ph-node2 lieferte bis 09:35:22 Daten. Die CPU-Linie endet korrekt; die Cache-Kachel ist wieder ein Geist (Range-Query, letzter Wert) → ebenfalls auf **Instant** umstellen.
+
+#### Durchgang 3: Failover UNTER LAST (20.10.2026) 🔥
+
+Lage vorher: ph-node3 Leader (VMID 203, TL 15), ph-node1 VIP-Halter, ph-node2 Replica — Leader und Pförtner getrennt. Reihenfolge diesmal strikt: **erst pgbench starten und Fortschrittszeilen abwarten, dann Stecker ziehen.**
+
+![pgbench läuft: rund 2 700–3 800 TPS, 0 failed](images/failover3-last-pgbench-progress.png)
+
+| Uhrzeit (CEST) | Quelle | Ereignis |
+|---|---|---|
+| ~09:42:30 | pgbench | Last läuft, 50 Clients, ~2 700–3 800 TPS, Connections ~55 |
+| **09:43:25** | Proxmox | `date; qm stop 203` — Stromausfall des Leaders ph-node3 |
+| sofort | pgbench | alle Clients: `aborted in command … perhaps the backend died while processing` |
+| 09:43:27 … 09:43:57 | Patroni-Log ph-node2 | `no action. I am (ph-node2), a secondary, and following a leader (ph-node3)` — die Schärpe ist noch gültig, man wartet |
+| während der Lücke | Grafana | Ampel **„KEIN LEADER“** (rot) |
+| **09:44:00,751** | Patroni-Log ph-node2 | `promoted self to leader by acquiring session lock` → `server promoting` → `received promote request` |
+| 09:44:00,841 | Patroni-Log ph-node2 | `updated leader lock during promote` |
+| 09:44:01,939 | Patroni-Log ph-node2 | `no action. I am (ph-node2), the leader with the lock` |
+
+![Stecker gezogen: Ampel KEIN LEADER, pgbench bricht ab](images/failover3-last-kein-leader.png)
+
+![Patroni-Log auf ph-node2: Promote um 09:44:00,751](images/failover3-last-patroni-log-promote.png)
+
+**Gemessene Zeit ohne Leader: 09:43:25 → 09:44:00,75 ≈ 35 Sekunden.** Erwartung aus der Konfiguration: Der Leader verlängert die Schärpe alle 10 s (`loop_wait`) auf 30 s (`ttl`) — je nachdem, wann die letzte Verlängerung vor dem Ausfall lag, läuft sie 20–30 s nach dem Ausfall ab; dazu Wahl und `promote`. Gemessen und erwartet passen zusammen.
+
+**Detail:** Die regulären Runden von ph-node2 liegen auf :07, :17, :27 … — die Beförderung kam aber um **:00,75**, nicht erst in der nächsten Runde um 09:44:07. Patroni beobachtet den Leader-Schlüssel in etcd (*watch*) und reagiert sofort, wenn er verschwindet. Bild: Der Bürger wartet nicht auf seinen nächsten Rathausbesuch, sondern wird angerufen, sobald die Schärpe abläuft. 📞
+
+**Was pgbench gemeldet hat:**
+
+```
+pgbench: error: client 28 aborted in command 6 (SQL) of script 0; perhaps the backend died while processing
+...
+number of transactions actually processed: 161731
+number of failed transactions: 0 (0.000%)
+tps = 2216.731301 (without initial connection time)
+pgbench: error: Run was aborted; the above results are incomplete.
+```
+
+| Beobachtung | Bedeutung |
+|---|---|
+| alle 50 Clients `aborted` | pgbench verbindet sich **nicht neu**. Bild: 50 Bürger stehen am Schalter, der Beamte fällt um — und alle gehen nach Hause, statt auf den neuen Beamten zu warten 🚶 |
+| `0 failed` trotz Abbruch | Abgebrochene Transaktionen zählen nicht als *failed*: Was nie mit `COMMIT` bestätigt wurde, gilt als nie passiert. Die 161 731 bestätigten Transaktionen sind nach dem Failover vorhanden |
+| `tps = 2216` | unvollständig, weil der Lauf vorzeitig endete — kein Leistungswert |
+
+> **Merksatz:** Der Cluster übernimmt den Failover, die **Anwendung** das Wiederverbinden. Ohne Retry-Logik im Client endet jeder Failover beim Nutzer als Fehlermeldung — mit Retry als kurze Verzögerung. Und: Kein Client hat ein „OK“ für etwas bekommen, das verloren ging (Durability, das D in ACID).
+
+![Dashboard danach: zweites V im Leader-Status, Leader ph-node2](images/failover3-last-dashboard-danach.png)
+
+Dashboard danach: zwei Einbrüche in der Leader-Status-Sparkline (Durchgang 2 und 3), Leader-Panel zeigt `ph-node2`, Connections fallen nach dem Abbruch zurück. Die rote Cache-Kachel ph-node3 (94 %) ist wieder ein Geist — der Knoten ist tot, die Kachel zeigt seinen letzten Wert unter Last.
+
+#### Der Crashtest für den Aktenschrank: Wiederanlauf von ph-node3
+
+`date; qm start 203` um **09:47:31**. In `patronictl list` erschien ph-node3 zuerst als `Replica` / **`stopped`** — Patroni lebt und hat sich beim Rat zurückgemeldet, PostgreSQL läuft noch nicht (wach im Krankenbett, noch nicht aufgestanden). Rund zwei Minuten später: **`streaming`, TL 16, Lag 0 — ohne `reinit`.**
+
+![ph-node3 nach dem Neustart wieder streaming](images/failover3-node3-streaming-ohne-reinit.png)
+
+Dass er zurückkam, ist das Ergebnis. *Warum*, zeigt das Log (`sudo journalctl -u patroni --since "09:47" --no-pager | grep -iE "REDO location|Time of latest checkpoint|diverged|rewind|started streaming|removed"`):
+
+![Patroni-Log auf ph-node3 beim Wiederanlauf](images/failover3-node3-rewind-log.png)
+
+| Zeit | Logzeile | Bedeutung |
+|---|---|---|
+| 09:47:41 | `REDO location: 1/E2000C00`, `Time of latest checkpoint: 09:40:46` | Letztes eigenes Lesezeichen — **vor** dem Lasttest |
+| 09:47:44 | `REDO location: 2/1A000028`, `09:47:44` | Crash-Recovery im Single-User-Modus setzt ein neues Lesezeichen |
+| 09:47:44 | `running pg_rewind from ph-node2` | Zurückspulen |
+| 09:47:48 | `servers diverged at WAL location 2/191013C0 on timeline 15` | Hier trennten sich die Wege |
+| 09:47:48 | `rewinding from last common checkpoint at 1/E2000C38` … `Done!` | Zurück zum gemeinsamen Lesezeichen von 09:40 |
+| 09:47:49 | `started streaming WAL from primary at 2/19000000 on timeline 16` | **Erst ab dem Trennpunkt** vom Leader angefordert |
+
+**Der Vergleich mit gestern ist der Beweis:**
+
+| | 19.10. (`wal_keep_size` 0) | 20.10. (`wal_keep_size` 1GB) |
+|---|---|---|
+| Nachlesen ab (REDO des gemeinsamen Lesezeichens) | 1/CE006958 | 1/E2000C00 |
+| Trennpunkt | 1/DF33E0B8 | 2/191013C0 |
+| Lücke | 17 Segmente ≈ 272 MB | 0x219 − 0x1E2 = **55 Segmente ≈ 880 MB** |
+| Vom Leader angefordert ab | **1/CE000000** — also *vor* dem Trennpunkt, lokal fehlte das Band | **2/19000000** — erst ab dem Trennpunkt, alles davor lag **lokal** |
+| Ergebnis | `segment … has already been removed`, Endlosschleife, `reinit` | `streaming` nach ~2 min |
+
+**Was den Unterschied macht — der Mechanismus:** Beim Wiederanlauf setzt die Crash-Recovery ein **neues** Lesezeichen (09:47:44 bzw. gestern 12:12:56). Ein frisches Lesezeichen erlaubt PostgreSQL, alle älteren WAL-Segmente im eigenen `pg_wal` wegzuräumen. Danach spult `pg_rewind` aber auf das **alte** gemeinsame Lesezeichen zurück — und braucht genau die Seiten, die gerade weggeräumt wurden.
+
+- **Gestern** (`wal_keep_size` 0): weggeräumt. Lokal fehlte das Band ab 1/CE, der Leader hatte es auch nicht mehr → hängengeblieben.
+- **Heute** (`wal_keep_size` 1GB, gilt auf **allen** Knoten): Auch ph-node3 selbst hält 1 GB WAL zurück, die 880 MB Lücke lagen noch in der eigenen Schublade. Nur das Stück ab dem Trennpunkt kam vom Leader.
+
+Bild: Gestern hat der Bürgermeister im Krankenhaus sein Tagebuch zu Ende gelesen und die alten Seiten **sofort ins Altpapier** geworfen — dann sollte er für den Abgleich genau diese Seiten nochmal lesen. Heute bewahrt jeder Bürger die letzten 1 000 Seiten in der Schublade auf, auch nach dem Lesen. 🗄️📔
+
+**Ehrliche Grenze:** 880 MB von 1 GB — knapp. Ein längerer Lasttest zwischen zwei Lesezeichen (mehr als ~1 GB WAL) würde die Schublade wieder sprengen. `wal_keep_size` ist eine Reserve, keine Garantie; die belastbare Lösung bleibt das **zentrale WAL-Archiv mit `restore_command`**, dazu `max_wal_size` (Abstand der Lesezeichen) und `wal_keep_size` aufeinander abstimmen.
+
+> **Merksatz:** `wal_keep_size` schützt nicht nur Replicas beim Leader, sondern auch den zurückkehrenden Knoten vor sich selbst: Er wirft nach der Crash-Recovery das Band nicht weg, das `pg_rewind` gleich wieder braucht. Die Reserve muss größer sein als das WAL zwischen zwei Checkpoints unter Last.
 
 #### Schnell-Referenz (zum Abfragen)
 
@@ -3617,3 +4036,61 @@ Ergebnis: **~125 KB je Replica** — rund 1/130 der Warnlinie. Die −128 MiB vo
 - **Was besagt das Little'sche Gesetz für pgbench?** → TPS = Clients ÷ Latenz; ist der Durchsatz gesättigt, steigt mit jedem Client die Latenz.
 - **Warum sinkt iowait bei mehr Clients?** → Group Commit: Ein `fsync` schreibt die WAL-Einträge mehrerer gleichzeitiger Commits.
 - **Woran erkennt man Sättigung?** → TPS stagniert (+2 %), Latenz steigt stark (+47 %).
+
+---
+
+## Anhang — Metaphern-Spickzettel (für Gespräch und Wiederholung)
+
+Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Gespräch sagt.** Gesammelt aus dem Lab, damit sich die Zusammenhänge ohne Unterlagen rekonstruieren lassen.
+
+### HA, Wahl und Failover
+
+| Fachbegriff | Bild | Satz fürs Gespräch |
+|---|---|---|
+| etcd (3 Mitglieder, Raft) | **Gemeinderat** — stimmberechtigt, ungerade Zahl | „etcd ist der Rat, der per Mehrheit festhält, wer Leader ist.“ |
+| Patroni-Knoten | **Bürger**, die Bürgermeister werden können | „Datenknoten wählen nicht mit, sie bewerben sich.“ |
+| Leader-Schlüssel mit `ttl` 30 s | **Bürgermeister-Schärpe mit Ablaufdatum**, alle 10 s (`loop_wait`) verlängert | „Ein toter Leader verliert sein Amt erst, wenn die Schärpe abläuft.“ |
+| `ttl` statt sofortiger Neuwahl | **Lieber kein Bürgermeister als zwei** | „Die 30 Sekunden sind der bewusste Preis gegen Split-Brain.“ |
+| Member-Keys in etcd | **Einwohnerregister** — wer sich nicht meldet, wird gestrichen | „Ein toter Knoten verschwindet aus `patronictl list`.“ |
+| `patronictl history` | **Fahrtenbuch** — jede Zeile wird erst am Ende einer Fahrt geschrieben | „Zeile n = Ende von Timeline n; aktuelle TL = letzte Zeile + 1.“ |
+| VIP + HAProxy | **Pförtner** am Eingang, trägt jedem Gast die Taschen ins richtige Büro | „VIP und Leader müssen nicht zusammen liegen; der VIP-Knoten zahlt dafür CPU.“ |
+| Failure Domains | Kein Haus darf die **Ratsmehrheit** allein beherbergen | „Mit zwei Standorten hält einer immer die Mehrheit — man braucht drei.“ |
+
+### Crash, Recovery und Wiedereinstieg
+
+| Fachbegriff | Bild | Satz fürs Gespräch |
+|---|---|---|
+| WAL / LSN | **Tonband** mit Zählwerk in Bytes | „Die LSN ist die Position auf dem Band; Lag ist der Abstand zweier Positionen.“ |
+| Checkpoint | **Lesezeichen im Tagebuch**: bis hier ist alles in den Datendateien | „Nach einem Crash wird ab dem letzten Lesezeichen nachgespielt.“ |
+| verteilter Checkpoint (REDO ≠ Checkpoint-Eintrag) | **Lesezeichen setzen, während 272 Seiten diktiert werden**, zuklappen erst danach | „Nachlesen muss man ab dem Aufschlagen, nicht ab dem Zuklappen.“ |
+| Crash-Recovery | **Bürgermeister im Krankenhaus** liest erst sein eigenes Tagebuch zu Ende | „`starting` ist kein Fehler, sondern Aufräumarbeit.“ |
+| `pg_rewind` | Die **nie verkündeten Notizen herausreißen** und das offizielle Protokoll übernehmen | „Der alte Leader spult auf die gemeinsame Geschichte zurück.“ |
+| WAL-Archiv ohne `restore_command` | **Archivar ohne Schlüssel** — die Akte liegt im Schrank, niemand darf hinein | „Archivieren allein reicht nicht; der Wiederanlauf muss auch lesen dürfen.“ |
+| lokales vs. zentrales Archiv | **Schuhkartons in jedem Haus** vs. **Stadtarchiv** | „Nur ein zentrales Archiv hilft jedem Knoten.“ |
+| `wal_keep_size` | Der Rat **schreddert Protokolle erst, wenn der Schrank voll ist** | „Der Leader hält eine WAL-Reserve für Nachzügler.“ |
+| Replica kaputt, Cluster läuft | **Ersatzreifen montiert, Flickzeug im falschen Kofferraum** | „Failover ist erst fertig, wenn die Reserve wieder streamt.“ |
+| `patronictl reinit` | **Neuer Reifen statt Flicken** | „Wenn Zurückspulen nicht reicht: frische Kopie vom Leader.“ |
+
+### Performance
+
+| Fachbegriff | Bild | Satz fürs Gespräch |
+|---|---|---|
+| `shared_buffers` / Cache-Hit-Ratio | **Werkbank** (Treffer) vs. **Keller** (Lesen) | „Von 100 Griffen, wie viele lagen schon auf der Bank?“ |
+| `blks_read` aus dem OS-Cache | eher **Nebenzimmer** als Keller | „Nicht jeder Miss ist ein Plattenzugriff.“ |
+| Replica-Cache sinkt unter Last | **Handwerker legt das Werkstück auf die Bank**, bevor er es repariert | „Auch WAL-Replay holt Blöcke in den Cache.“ |
+| Counter vs. `rate()` | **Kilometerstand** vs. **aktueller Verbrauch** | „Counter nie roh vergleichen, immer als Rate.“ |
+| Group Commit | **Sammeltaxi statt Einzelfahrten** | „Mehr Clients, weniger fsync pro Transaktion — der Engpass wandert zur CPU.“ |
+| Little'sches Gesetz | **Supermarkt mit fester Kassenleistung** | „Ist der Durchsatz gesättigt, verlängert jeder neue Kunde nur die Schlange.“ |
+| `numbackends` vs. walsender | **Hotel**: nur Gäste mit Zimmer (Datenbank) werden gezählt | „Replikationsverbindungen haben keine Datenbank und fehlen in der Zahl.“ |
+
+### Monitoring und Grafana
+
+| Fachbegriff | Bild | Satz fürs Gespräch |
+|---|---|---|
+| Lag als Differenz zweier Scrapes | **Zwei Fotografen, zwei Autos** — die Fotos sind nicht gleichzeitig | „Eine Differenz ist nur so gut wie die Gleichzeitigkeit ihrer Werte.“ |
+| `pg_stat_replication_pg_wal_lsn_diff` | **Ein Foto mit beiden Autos** | „Lag dort messen, wo beide Positionen im selben Moment bekannt sind.“ |
+| Stat-Panel mit „letztem Wert“ eines toten Knotens | **Foto des alten Bürgermeisters an der Rathauswand** 👻 | „Der letzte Wert eines toten Knotens ist ein Geist, kein Leader.“ |
+| Dashboard ohne Replica-Status | **Feuerwache meldet „besetzt“**, ein Löschfahrzeug steht mit Platten in der Halle | „Wir überwachen auch, ob die Reserven einsatzbereit sind.“ |
+| immer grünes Dashboard | **Tapete** | „Lücken im Monitoring findet man, indem man etwas kaputt macht.“ |
+| in der Legende isolierte Serie, mitgespeichert | **festgeschraubtes Fernglas** auf ein Haus — zieht der Bewohner um, sieht man nichts | „Leeres Panel heißt nicht immer keine Daten — manchmal ist die Linie nur ausgeblendet.“ |
+| Grafana / patronictl / Log | **Rauchmelder / Blick in den Raum / Brandursachen-Ermittlung** | „Dashboards zum Bemerken, Logs zum Verstehen.“ |

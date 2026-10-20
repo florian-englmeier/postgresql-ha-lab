@@ -142,12 +142,15 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 **Performance & Query-Analyse**
 - [x] `pgbench`-Sättigungskurve (10/50/90 Clients), Durchsatz-Latenz-Trade-off, Lasttest über VIP mit 0 % Fehlern
+- [x] Gegenprobe vom getrennten Lastgenerator `ph-monitor`: 2 831 vs. 2 977 TPS (im Rauschen), Laststufen live im eigenen Dashboard; Befund: der VIP-Knoten zahlt die HAProxy-Weiterleitung mit ~10 Punkten CPU
 - [x] `EXPLAIN ANALYZE`: Seq Scan vs. Index Scan, Selektivität, Collation-Falle (`de_DE.UTF-8`) mit `text_pattern_ops` gelöst
 
 **Betrieb & Härtung**
 - [x] Patroni-Autostart war auf allen Knoten deaktiviert, behoben und per Neustart-Test bestätigt
 - [x] `/etc/patroni.yml` (enthält Passwörter) von weltlesbar auf `root:postgres 640`
 - [x] Rollierendes Patchen aller drei Knoten mit zwei geplanten Switchovers (Timeline 7 → 8 → 9), Kernel-Drift durch Phased Updates erkannt und behoben, `needrestart`-Falle am Leader dokumentiert
+- [x] **Failover unter Last** (pgbench, 50 Clients, Stromausfall des Leaders per `qm stop`): **≈ 35 s ohne Leader** (aus `ttl` 30 s + Wahl, im Patroni-Log gemessen), Ampel live „KEIN LEADER“, kein bestätigter Commit verloren; pgbench-Clients brechen ab — Wiederverbinden ist Aufgabe der Anwendung
+- [x] Befund beim Wiederanlauf: Replica blieb nach `pg_rewind` mit fehlendem WAL hängen (Checkpoint mitten im Lasttest, `wal_keep_size` 0, Archiv nur lokal) → `patronictl reinit`; Schutzschicht `wal_keep_size` 1GB eingeführt und mit einem zweiten Ausfall unter Last nachgewiesen (880 MB Lücke, Rückkehr ohne Eingriff)
 
 **Monitoring**
 - [x] Eigene Monitoring-VM `ph-monitor`, getrennt vom Cluster
@@ -164,8 +167,6 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 ### 🔜 Als Nächstes
 
-- [ ] Lasttest mit `pgbench` von `ph-monitor` aus (getrennter Lastgenerator), live im Dashboard
-- [ ] Failover unter Last, im Dashboard sichtbar gemacht
 - [ ] Basis-Tuning (`shared_buffers` u. a.) per `patronictl edit-config` und rollierendem Restart
 
 ---
@@ -178,6 +179,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 - **Benchmarks im HA-Cluster brauchen den Leader-Zustand.** Läuft der Lastgenerator auf dem Leader-Knoten, konkurrieren beide um dieselben CPUs und die Messung kippt. Leader-Position und Parameter werden zu jedem Lauf protokolliert, pro Schritt ändert sich nur eine Variable.
 - **Ein Dashboard beantwortet die Frage seiner Zielgruppe.** Der Bereitschaftsdienst braucht in zwei Sekunden eine Ampel, nicht fünfzig Panels. Grafanas Standard-Schwellen (Base grün, 80 rot) hätten „kein Leader“ und „Split-Brain“ grün gefärbt — Thresholds werden deshalb bewusst gesetzt und gegen den Rohwert verglichen, nicht gegen die formatierte Anzeige.
 - **Monitoring misst jeden Knoten direkt.** Anwendungen gehen über die VIP, Exporter nicht, sonst wird nur der Leader gemessen. Alarme sitzen auf Symptomen (kein oder zwei Leader, `pg_up == 0`, WAL-Archiv scheitert) und haben eine Wartezeit, weil Scrape-Intervalle kurze Ereignisse verzerren. Für den genauen Ablauf eines Failovers sind `patronictl history` und die Logs maßgeblich.
+- **Ein Failover ist erst fertig, wenn die Reserve wieder streamt.** Der Cluster lief nach dem Ausfall grün weiter, während eine Replica wegen einer WAL-Lücke festhing — Ursache ein Checkpoint drei Stunden vorher, mitten im Lasttest. Ausfalltests prüfen deshalb auch den Wiederanlauf und das Monitoring selbst: Zwei Panels zeigten „Geister“ (letzter Wert eines toten Knotens), eines war per gespeicherter Legenden-Auswahl blind. Lösung: Instant-Queries für „Wer ist jetzt …?“, `wal_keep_size` als Reserve, zentrales WAL-Archiv als nächster Schritt.
 
 ---
 
