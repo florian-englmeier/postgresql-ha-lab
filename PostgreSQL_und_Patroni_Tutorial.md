@@ -4187,6 +4187,10 @@ sudo patronictl -c /etc/patroni.yml switchover postgres-ha               # Leade
 
 **CPU im Mess-Lauf (Zoom 11:38–11:43):** zwei gleich hohe Berge (Aufwärm- und Mess-Lauf → reproduzierbar). Plateau: ph-node2 (Leader) **~87 %**, ph-node1 (Replica + VIP/HAProxy) **~73 %**, ph-node3 (nur Replica) **~53 %**. Der Leader rechnet am Anschlag — der Engpass ist die CPU. Zwischen den beiden Replicas liegen ~20 Punkte, einziger Unterschied ist die VIP: der Pförtner zahlt bei ~2 800 TPS spürbar mit.
 
+**Kontroll-Lauf mit aufgeräumtem Dashboard (12:27–12:29, warm, von ph-monitor):** 2 897 TPS, 17,3 ms, 0 Fehler. Cache-Hit-Ratio **100 % auf allen drei Knoten** (grün), Lag-Panel zeigt beide Replicas mit kleinen Zacken nahe 0 B, CPU Leader ~87 %.
+
+![Dashboard nach dem Tuning unter Last: alles grün](images/grafana-dashboard-nach-tuning-alles-gruen.png)
+
 **Auswertung der Hypothesen:**
 
 | | Florian | Jacky | Ergebnis |
