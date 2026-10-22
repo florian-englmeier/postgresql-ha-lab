@@ -177,6 +177,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 - [ ] Zentrales WAL-Archiv mit Aufbewahrungsregel (pgBackRest) und `restore_command` — Befund 20.10.2026: lokales Archiv lief auf dem Leader zweimal fast voll; PITR bis dahin bewusst ausgesetzt (nur Testdaten)
 - [ ] Alerting: Plattenbelegung ≥ 80 %, Replicas streamen < 2, Slot-Retention — zusammen mit Upgrade des postgres_exporter (0.15 → aktuell, Metrik-Umbenennungen beachten)
+- [ ] **Vierter Knoten per Shell-Skript** (Idee 22.10.2026): `ph-node4` komplett ohne Menüs aufbauen — VM per `qm clone`/Cloud-Init, Pakete (`postgresql-16` ohne Standardcluster, Patroni, Exporter), Config-Dateien (`patroni.yml`, `patroni.service` mit `Wants=etcd.service`, Exporter) per Heredoc mit **IP und Hostname als Variablen**; idempotent (`set -euo pipefail`), prüft sich am Ende selbst (`patronictl list` → `streaming`). Nur Datenknoten, **kein etcd-Mitglied** (etcd bleibt bei 3). Nacharbeit: Prometheus-Targets, HAProxy-Backend, Ampel „Replicas streamen“ auf 3. Vorstufe zur Ansible-Rolle
 
 ---
 
