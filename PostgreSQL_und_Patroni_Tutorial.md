@@ -4856,7 +4856,7 @@ Stromausfälle auf dem Proxmox-Host, immer mit Zeitstempel in einer Zeile: `date
 
 **Die ganze Generalprobe auf einem Bild** (nachträglich am 22.10.2026 per Zeitreise aufgenommen: absolutes Zeitfenster 20.10.2026 21:10–21:32). Die Warnlampen stehen auf *Instant* und zeigen deshalb den Stand **am Ende des Fensters**, nach dem Aufräumen: ph-node3 Leader, „2 – voll abgesichert“, alle Platten grün. Die Verlaufs-Panels zeigen gleichzeitig den **ganzen Test**: die Delle im Leader-Status beim ersten Stromausfall (~21:17), den Wechsel der Last von ph-node2 (gelb) zu ph-node3 (blau), die beiden Lag-Spitzen beim zweiten Ausfall (blau, bis ~1,25 GiB) und beim Wiederanlauf (orange, ~1,75 GiB) sowie die Connections an der 80er-Warnlinie. Ein Dashboard mit Instant-Kacheln und Verlaufs-Panels erzählt so Zustand **und** Geschichte in einem Bild.
 
-![Generalprobe 20.10.2026 21:10–21:32: Zustand nach dem Aufräumen und Verlauf des ganzen Tests](images/generalprobe-7-nach-aufraeumen.png)
+![Generalprobe 20.10.2026 21:10–21:32: Zustand nach dem Aufräumen und Verlauf des ganzen Tests](images/generalprobe-7-gesamtbild.png)
 
 > **Merksatz:** Ein HA-Cluster überlebt den Ausfall — aber jeder Ausfall verschiebt die Last woandershin: auf den neuen Leader, auf seine Platte, auf seine Slots. Die Generalprobe zeigt nicht nur, *ob* er übernimmt, sondern *was es ihn kostet*.
 
