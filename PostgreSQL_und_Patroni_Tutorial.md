@@ -4986,6 +4986,39 @@ Das Symptom war immer dasselbe: `Permission denied (publickey,password).` Dahint
 - **„Server accepts key“, aber trotzdem Permission denied — warum?** → Privater Schlüssel kann nicht entsperrt werden (Passphrase + BatchMode).
 - **Warum scheitert `sudo ./cluster-check.sh`?** → root hat eigene `known_hosts` und keinen Schlüssel.
 
+### 18.5 Stufe 2, Lektion 1: Anführungszeichen bei Remote-Befehlen — wer füllt aus?
+
+**Warum:** Beim Aufräumen des alten Schlosses muss der Knoten wissen, welcher Schlüssel der aktuelle ist — den Wert kennt aber nur ph-monitor. Ob eine Variable lokal oder remote ausgefüllt wird, entscheiden die Anführungszeichen.
+
+**Metapher — das Formular:** Doppelte Anführungszeichen `"…"` = ich fülle das Formular **vor** dem Abschicken aus (lokal). Einfache `'…'` = ich schicke es **leer**, der Empfänger füllt mit **seinen** Werten aus (remote).
+
+Ein `ssh`-Befehl wird **zweimal** von einer Bash gelesen: Station 1 auf ph-monitor, Station 2 auf dem Knoten. Die **äußeren** Anführungszeichen steuern Station 1, die inneren Station 2.
+
+| Befehl (auf ph-monitor) | Station 1 (ph-monitor) | kommt an | Station 2 (ph-node1) | Ausgabe |
+|---|---|---|---|---|
+| `ssh … "echo $HOSTNAME"` | füllt aus | `echo ph-monitor` | – | `ph-monitor` |
+| `ssh … 'echo $HOSTNAME'` | wörtlich | `echo $HOSTNAME` | füllt mit eigenem Wert | `ph-node1` |
+| `KEY="TESTWERT-123"`; `ssh … 'echo "remote: $KEY"'` | wörtlich | `echo "remote: $KEY"` | `$KEY` existiert dort nicht → leer | `remote: ` (!) |
+| `ssh … "echo 'remote: $KEY'"` | füllt aus | `echo 'remote: TESTWERT-123'` | nichts mehr auszufüllen | `remote: TESTWERT-123` |
+
+Lokal gilt dagegen nur eine Station: `echo '$HOSTNAME'` gibt wörtlich `$HOSTNAME` aus.
+
+**Beides in einem Befehl** (lokaler Wert + Remote-Variable): außen doppelt, und vor die Remote-Variable ein Backslash — `\$` heißt „dieses Feld lässt Station 1 frei“:
+
+```bash
+ssh florian@192.168.178.201 "echo 'Schlüssel $KEY liegt auf' \$HOSTNAME"
+# → Schlüssel TESTWERT-123 liegt auf ph-node1
+```
+
+**Stolperstein (live 25.10.2026 nachgestellt):** Eine unbekannte Variable ist in Bash standardmäßig **leerer Text, kein Fehler**. Mit einem leeren `$KEY` in einem Lösch-Befehl („lösche alles außer `$KEY`“) würde auch das gültige Schloss gelöscht — man sperrt sich selbst aus. Schutz: Werte lokal ausfüllen lassen und `set -u` (unbekannte Variable = Abbruch, folgt in Stufe 2).
+
+> **Merksatz:** Doppelt = ich fülle aus (lokal). Einfach = der Empfänger füllt aus (remote). Die **äußeren** Anführungszeichen entscheiden über Station 1.
+
+**Kontrollfragen**
+- **Was gibt `ssh node1 'echo $HOSTNAME'` aus?** → `ph-node1` — der Text reist wörtlich, die Bash auf node1 füllt aus.
+- **Warum ist `ssh node1 'echo "$KEY"'` gefährlich?** → `$KEY` gibt es nur lokal; remote wird er still zu leerem Text.
+- **Wie übergibt man einen lokalen Wert und lässt zugleich eine Remote-Variable stehen?** → außen doppelte Anführungszeichen, Remote-Variable als `\$VAR`.
+
 ---
 
 ## Anhang — Metaphern-Spickzettel (für Gespräch und Wiederholung)
@@ -5112,4 +5145,5 @@ Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Ge
 | Passphrase + BatchMode | **Schlüssel im Tresor**, Hausmeister kennt die Kombination nicht | „Server accepts key heißt nur: Schloss passt — entsperrt ist der Schlüssel damit noch nicht.“ |
 | Serverlog `journalctl -u ssh` | **Türsteher fragen** statt raten | „Der Client sagt nein, der Server sagt warum.“ |
 | `ssh-keygen -y` mehrfach | **Fieber zweimal messen** — Thermometer heilt nicht | „Testbefehl und Reparaturbefehl auseinanderhalten.“ |
-
+| `"…"` vs. `'…'` bei `ssh` | **Formular selbst ausfüllen vs. leer abschicken** — der Empfänger trägt seine Werte ein | „Die äußeren Anführungszeichen entscheiden, wer ausfüllt.“ |
+| unbekannte Variable = leer | **leeres Formularfeld, und keiner beschwert sich** | „Bash meckert bei unbekannten Variablen nicht — außer mit `set -u`.“ |
