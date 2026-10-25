@@ -4871,6 +4871,123 @@ Stromausfälle auf dem Proxmox-Host, immer mit Zeitstempel in einer Zeile: `date
 
 ---
 
+## Teil 18 — Shell-Scripting: der Hausmeister-Rundgang
+
+> Ziel des Shell-Tracks: Betriebsaufgaben am Cluster nicht mehr von Hand über drei Terminals erledigen, sondern per Skript von **ph-monitor** aus — erst prüfen (Stufe 1), dann robust mit Schwellwerten und Exit-Codes (Stufe 2), am Ende einen ganzen Knoten aufbauen (`ph-node4`, Stufe 3).
+
+### 18.1 Warum ein Rundgang-Skript?
+
+Plattenplatz war im Lab zweimal das Problem (Teil 17.14, 17.16). Die Frage „Wie voll sind die Platten?“ heißt ohne Skript: dreimal einloggen, dreimal `df -h`. Ein Skript stellt dieselbe Frage an alle Knoten — in einer Sekunde, immer gleich, wiederholbar.
+
+**Metapher — der Hausmeister-Rundgang:** Der Hausmeister hat eine Liste mit Türen (Array), geht sie der Reihe nach ab (`for`-Schleife) und schaut an jeder Tür kurz hinein (`ssh … df`). Er schließt nichts um, er schaut nur.
+
+### 18.2 Stufe 1: `scripts/cluster-check.sh`
+
+```bash
+#!/usr/bin/env bash
+SSH_USER="florian"
+KNOTEN=(192.168.178.201 192.168.178.202 192.168.178.203)
+
+for ip in "${KNOTEN[@]}"; do
+  echo "== $ip =="
+  ssh -o BatchMode=yes -o ConnectTimeout=3 "$SSH_USER@$ip" 'df -h /'
+done
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `#!/usr/bin/env bash` | Shebang: mit welchem Interpreter das Skript läuft; `env` sucht `bash` im `$PATH` |
+| `KNOTEN=( … )` | Bash-Array (kein Leerzeichen um `=`) |
+| `"${KNOTEN[@]}"` | alle Elemente, jedes als eigenes Wort; die Anführungszeichen verhindern Wortzerlegung |
+| `for ip in …; do … done` | Schleife: `ip` nimmt nacheinander jeden Wert an |
+| `-o BatchMode=yes` | ssh fragt **nie** interaktiv (kein Passwort, kein yes/no) — scheitert stattdessen sofort |
+| `-o ConnectTimeout=3` | nach 3 s ohne Verbindung aufgeben |
+| `'df -h /'` | läuft **auf dem Knoten**; einfache Anführungszeichen schützen vor der lokalen Shell; `-h` lesbare Einheiten, `/` nur Root-Dateisystem |
+
+Ausrollen und Starten:
+
+```bash
+scp scripts/cluster-check.sh florian@192.168.178.204:~/   # secure copy über SSH, Ziel = Benutzer@Host:Pfad
+chmod +x cluster-check.sh                                 # Ausführrecht
+./cluster-check.sh                                        # ./ = aus dem aktuellen Ordner
+```
+
+Syntax prüfen, ohne auszuführen: `bash -n cluster-check.sh` (`-n` = no exec).
+
+> **Merksatz:** **Timeout gegen Stille, BatchMode gegen Fragen.** Ein ausgeschalteter Knoten antwortet gar nicht → `ConnectTimeout` rettet. Ein Knoten ohne hinterlegten Schlüssel stellt eine Frage → `BatchMode` verhindert, dass das Skript auf eine Eingabe wartet, die nie kommt.
+
+> **Merke:** Ohne besondere Einstellungen macht Bash nach einem fehlgeschlagenen Befehl einfach weiter. ssh liefert bei Verbindungsproblemen Exit-Code 255, die Schleife geht trotzdem zum nächsten Knoten. (Ob das gewollt ist, entscheiden wir in Stufe 2 mit `set -euo pipefail`.)
+
+### 18.3 Voraussetzung: SSH-Schlüssel von ph-monitor zu allen Knoten
+
+**Zwei Schlüssel, zwei Richtungen:**
+
+| | Host-Key | User-Key |
+|---|---|---|
+| Bild | **Hausschild** — bin ich am richtigen Haus? | **Haustürschlüssel** — darf ich hinein? |
+| Wo | beim Client in `~/.ssh/known_hosts` | privat beim Client (`~/.ssh/id_ed25519`), Schloss beim Server (`~/.ssh/authorized_keys`) |
+| Wann | „Are you sure you want to continue connecting (yes/no)?“ beim ersten Besuch | bei jeder Anmeldung |
+
+```bash
+ssh-keygen -t ed25519 -C "florian@ph-monitor"                          # Schlüsselpaar; -t Typ, -C Kommentar; Passphrase LEER lassen
+for n in 201 202 203; do ssh-copy-id -i ~/.ssh/id_ed25519.pub florian@192.168.178.$n; done
+ssh -o BatchMode=yes florian@192.168.178.201 hostname                  # Test: muss ohne Rückfrage "ph-node1" liefern
+```
+
+`ssh-copy-id` hängt die `.pub` an `~/.ssh/authorized_keys` auf dem Ziel an und setzt die Rechte; es fragt ein letztes Mal nach dem Passwort.
+
+Ergebnis (Verifiziert 25.10.2026, von ph-monitor):
+
+```
+== 192.168.178.201 ==
+/dev/mapper/ubuntu--vg-ubuntu--lv   18G  6,5G   11G  39% /
+== 192.168.178.202 ==
+/dev/mapper/ubuntu--vg-ubuntu--lv   18G  8,1G  9,0G  48% /
+== 192.168.178.203 ==
+/dev/mapper/ubuntu--vg-ubuntu--lv   18G  6,6G   11G  39% /
+```
+
+Interpretation: alle drei Knoten deutlich unter der Warnschwelle (70 %); ph-node2 etwas voller — Restbestand aus seiner Leader-Zeit.
+
+### 18.4 Stolpersteine (live, 25.10.2026): zwei Fehler hintereinander
+
+Das Symptom war immer dasselbe: `Permission denied (publickey,password).` Dahinter steckten **zwei** Ursachen nacheinander.
+
+**Stolperstein 1 — Schloss ohne passenden Schlüssel.**
+- Ursache: Der Schlüssel auf ph-monitor wurde nach dem ersten `ssh-copy-id` neu erzeugt (`ssh-keygen` überschreibt). In `authorized_keys` auf node1 saß das alte Schloss.
+- Diagnose: Fingerabdrücke vergleichen — `ssh-keygen -lf ~/.ssh/id_ed25519.pub` (ph-monitor) vs. `ssh-keygen -lf ~/.ssh/authorized_keys` (Knoten). `-l` = Fingerabdruck, `-f` = Datei. Unterschiedlich.
+- Fehlschluss unterwegs: „beide Dateien 100 Bytes, also gleich“ — falsch: Alle ed25519-Public-Keys mit gleichem Kommentar sind gleich lang.
+- Fix: erneut `ssh-copy-id` vom (richtigen!) Rechner ph-monitor.
+
+> **Merksatz:** Schlüssel vergleicht man am Fingerabdruck, nicht am Maßband.
+
+**Stolperstein 2 — Schlüssel im Tresor (Passphrase).**
+- Beweis, dass die Serverseite stimmt: `ssh -v -o BatchMode=yes florian@192.168.178.201 true 2>&1 | grep -iE "offering|accepts"` → `Server accepts key: … SHA256:Rla3x…` — Schloss und Schlüssel passen.
+- Danach muss der Client mit dem **privaten** Schlüssel unterschreiben — dafür muss er entsperrt werden. Mit Passphrase und `BatchMode` geht das nicht → `Permission denied`.
+- Test: `ssh-keygen -y -P "" -f ~/.ssh/id_ed25519` (`-y` öffentlichen Teil aus dem privaten berechnen, `-P ""` mit leerer Passphrase versuchen) → `incorrect passphrase supplied to decrypt private key` = Passphrase vorhanden.
+- Fix: `ssh-keygen -p -f ~/.ssh/id_ed25519` (`-p` = Passphrase ändern; neue leer lassen). Der öffentliche Schlüssel bleibt identisch, die Schlösser auf den Knoten gelten weiter.
+- Alternative bei Passphrase: `eval "$(ssh-agent -s)"; ssh-add` — entsperrt einmal pro Sitzung, aber nicht für nächtliche Timer geeignet. Anti-Pattern: `sshpass -p` (Passwort in Prozessliste/History).
+
+**Weitere Lehren aus der Fehlersuche:**
+- `sudo ./cluster-check.sh` → `Host key verification failed`: root hat sein eigenes `/root/.ssh`, kennt die Hausschilder nicht und hat keinen Schlüssel. **SSH-Schlüssel gehören zum Benutzer, nicht zum Rechner.**
+- `ssh-copy-id` auf dem Zielknoten ausgeführt → „No such file“: Das Schloss baut man von außen ein, vom Rechner, der den Schlüssel besitzt.
+- Die `authorized_keys` auf ph-monitor ist das Schloss **für ph-monitor** (eingehend) — für ausgehende Verbindungen irrelevant.
+- Serverlog lesen statt raten: `sudo journalctl -u ssh --since "15 min ago" --no-pager`. `Connection closed by authenticating user … [preauth]` = Client hat aufgegeben, bevor die Anmeldung gelang. Fehlende Zeile `Authentication refused: bad ownership or modes` = Dateirechte sind nicht das Problem.
+- Bei mehreren möglichen Ursachen die Kette von beiden Enden prüfen: Was zeigt der Client vor (`ssh -v`), was hat der Server eingebaut (`authorized_keys`), was sagt der Türsteher (Log)?
+
+> **Merke:** `Permission denied (publickey,password)` sagt nur *dass*, nie *warum*. Das Warum steht im Serverlog oder in `ssh -v`.
+
+**Offen:** Auf den Knoten steht noch das alte, nutzlose Schloss in `authorized_keys` (zwei Zeilen `florian@ph-monitor`) → nächste Skript-Übung.
+
+**Kontrollfragen**
+- **Was ist der Unterschied zwischen Host-Key und User-Key?** → Hausschild (bin ich richtig?) vs. Haustürschlüssel (darf ich rein?).
+- **Warum darf die `.pub` überall hin, die `id_ed25519` nie?** → Das Schloss verrät nichts über den Schlüssel; wer den privaten Schlüssel hat, kommt überall rein, wo das Schloss eingebaut ist.
+- **Welche Option verhindert Hängen bei ausgeschaltetem Knoten?** → `ConnectTimeout`.
+- **„Server accepts key“, aber trotzdem Permission denied — warum?** → Privater Schlüssel kann nicht entsperrt werden (Passphrase + BatchMode).
+- **Warum scheitert `sudo ./cluster-check.sh`?** → root hat eigene `known_hosts` und keinen Schlüssel.
+
+---
+
 ## Anhang — Metaphern-Spickzettel (für Gespräch und Wiederholung)
 
 Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Gespräch sagt.** Gesammelt aus dem Lab, damit sich die Zusammenhänge ohne Unterlagen rekonstruieren lassen.
@@ -4982,3 +5099,17 @@ Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Ge
 | Replication Slot | **reservierter Stapel Durchschläge mit Namensschild** | „Der Slot rettet die Replica — und füllt dafür die Platte des Leaders.“ |
 | `wal_sender_timeout` | **noch eine Minute ins tote Telefon reden** | „Der Leader merkt den Replica-Ausfall erst nach dem Timeout.“ |
 | Generalprobe unter Last | **Feueralarm-Übung zur Hauptsprechzeit** | „Nicht nur ob er übernimmt, sondern was es ihn kostet.“ |
+
+### Shell und SSH
+
+| Fachbegriff | Bild | Satz fürs Gespräch |
+|---|---|---|
+| `for`-Schleife über Knoten-Array | **Hausmeister-Rundgang** mit Türliste | „Ein Skript stellt dieselbe Frage an alle Knoten — immer gleich, wiederholbar.“ |
+| `ConnectTimeout` vs. `BatchMode` | **Klingeln, bis man Rente bekommt** vs. **niemand da, der das Passwort eintippt** | „Timeout gegen Stille, BatchMode gegen Fragen.“ |
+| Host-Key vs. User-Key | **Hausschild** vs. **Haustürschlüssel** | „known_hosts prüft den Server, authorized_keys lässt mich rein.“ |
+| `.pub` / privater Schlüssel | **Schloss** / **Schlüssel** | „Schlösser darf man verteilen, Schlüssel nie.“ |
+| Dateigröße als Vergleich | **Schlüssel mit dem Maßband vergleichen** | „Schlüssel vergleicht man am Fingerabdruck.“ |
+| Passphrase + BatchMode | **Schlüssel im Tresor**, Hausmeister kennt die Kombination nicht | „Server accepts key heißt nur: Schloss passt — entsperrt ist der Schlüssel damit noch nicht.“ |
+| Serverlog `journalctl -u ssh` | **Türsteher fragen** statt raten | „Der Client sagt nein, der Server sagt warum.“ |
+| `ssh-keygen -y` mehrfach | **Fieber zweimal messen** — Thermometer heilt nicht | „Testbefehl und Reparaturbefehl auseinanderhalten.“ |
+
