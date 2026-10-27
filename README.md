@@ -188,6 +188,8 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 ### 🔜 Als Nächstes
 
+- [ ] 🔴 **TLS Etappe 1 — Datenbankverbindungen verschlüsseln:** eigene CA, Server-Zertifikate für alle drei Knoten, `ssl = on` per `patronictl edit-config`, `hostssl` in `pg_hba.conf`, `postgres_exporter` von `sslmode=disable` auf verschlüsselte Verbindung umstellen. Rollierend, ohne Leader-Wechsel am Ende
+- [ ] 🔴 **TLS Etappe 2 — Cluster-Kommunikation verschlüsseln:** etcd Peer- und Client-Verkehr sowie Patroni-REST-API auf HTTPS, HAProxy-Health-Check auf HTTPS umstellen. Knoten für Knoten, mit Quorum-Prüfung nach jedem Schritt (`etcdctl endpoint health`), weil ein Fehler bei etcd die Leader-Wahl kosten kann
 - [ ] Zentrales WAL-Archiv mit Aufbewahrungsregel (pgBackRest) und `restore_command` — Befund 20.10.2026: lokales Archiv lief auf dem Leader zweimal fast voll; PITR bis dahin bewusst ausgesetzt (nur Testdaten)
 - [ ] Alerting: Plattenbelegung ≥ 80 %, Replicas streamen < 2, Slot-Retention — zusammen mit Upgrade des postgres_exporter (0.15 → aktuell, Metrik-Umbenennungen beachten)
 - [ ] **Vierter Knoten per Shell-Skript** (Idee 22.10.2026): `ph-node4` komplett ohne Menüs aufbauen — VM per `qm clone`/Cloud-Init, Pakete (`postgresql-16` ohne Standardcluster, Patroni, Exporter), Config-Dateien (`patroni.yml`, `patroni.service` mit `Wants=etcd.service`, Exporter) per Heredoc mit **IP und Hostname als Variablen**; idempotent (`set -euo pipefail`), prüft sich am Ende selbst (`patronictl list` → `streaming`). Nur Datenknoten, **kein etcd-Mitglied** (etcd bleibt bei 3). Nacharbeit: Prometheus-Targets, HAProxy-Backend, Ampel „Replicas streamen“ auf 3. Vorstufe zur Ansible-Rolle
@@ -218,7 +220,7 @@ Dieses Lab ist ein lebendes Projekt — der Cluster steht, die Grundlagen sind d
 |---|---|---|
 | 1 | **Alerting** | Alertmanager-Regeln (Leader weg, Lag zu hoch, Archivierung fehlgeschlagen) statt Dashboards beobachten |
 | 2 | **Connection Pooling** | PgBouncer vor HAProxy schalten — reduziert Verbindungs-Overhead bei vielen Clients |
-| 3 | **Sicherheitshärtung** | 🔧 begonnen (Dateirechte `patroni.yml`, Exporter-Config) — offen: `keepalived.conf`, SSL/TLS, `pg_hba.conf` Restriktionen, BSI IT-Grundschutz |
+| 3 | **Sicherheitshärtung** | 🔧 begonnen (Dateirechte `patroni.yml`, Exporter-Config) — offen: 🔴 **TLS in zwei Etappen (siehe „Als Nächstes“)**, `keepalived.conf`, `pg_hba.conf` Restriktionen, BSI IT-Grundschutz |
 | 4 | **Automatisierung mit Ansible** | Cluster-Aufbau als Ansible-Rolle — reproduzierbar statt Schritt-für-Schritt von Hand |
 | 5 | **Read-only Load Balancing** | Replicas über separaten HAProxy-Port (z.B. `5433`) für Leseabfragen nutzen |
 | 6 | ~~**Switchover vs. Failover**~~ ✅ | erledigt 19./20.10.2026: Failover unter Last ≈ 35 s ohne Leader, Switchover wenige Sekunden; alter Leader nach Switchover sofort `streaming`, nach Stromausfall Crash-Recovery + `pg_rewind` ([Teil 17.13](./PostgreSQL_und_Patroni_Tutorial.md)) |
