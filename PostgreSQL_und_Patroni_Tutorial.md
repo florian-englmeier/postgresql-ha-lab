@@ -2,7 +2,17 @@
 
 Persönliches Tutorial/Lernprotokoll, entstanden aus einem interaktiven Tutoring-Track. Ziel: PostgreSQL und Patroni (High Availability) strukturiert verstehen — erst PostgreSQL als eigenständiges System, danach HA/Patroni als zusätzliche Schicht.
 
-Stand: 01.10.2026
+Stand: 27.10.2026
+
+## Wegweiser: Was steht wo — und was ist eigene Arbeit?
+
+| Teil | Inhalt | Herkunft |
+|---|---|---|
+| **0–6** | Grundlagen auf einer Test-VM: Architektur, Rollen, `pg_hba.conf`, Streaming-Replikation von Hand, manueller Failover, Konsens mit etcd/Raft, Aufgaben von Patroni | Eigener Lernweg |
+| **7–11** | Aufbau des 3-Knoten-Clusters: etcd, Patroni, HAProxy, keepalived | Architektur nach [Techno Tim](https://technotim.com/posts/postgresql-high-availability/); eigene Umsetzung auf Proxmox (Template klonen, Unicast-VRRP, DNS-Name über Pi-hole). TLS-Zertifikate aus seiner Anleitung stehen hier noch auf der Roadmap |
+| **12–18** | Betrieb: Failover-Tests (auch unter Last), Backup und PITR, Performance-Analyse, Query-Analyse, Monitoring mit eigenem HA-Dashboard, rollierendes Patchen, Incidents, Shell-Scripting | Eigene Erweiterung, geht über die Vorlage hinaus |
+
+Alle Probleme aus Aufbau und Betrieb mit Ursache und Lösung in einer Übersicht: [Stolpersteine](./docs/stolpersteine.md).
 
 ---
 
@@ -332,11 +342,11 @@ Was Patroni automatisiert — direkt gespiegelt an den manuellen Schritten aus T
 
 Patroni weiß intern, wer Primary ist — aber die Anwendung selbst nicht automatisch. Genau das übernimmt **HAProxy**: Es sitzt als stabiler Eintrittspunkt vor allen Knoten, fragt laufend über Patronis REST-API ab, wer gerade Primary ist, und leitet Verbindungen ausschließlich dorthin. Die Anwendung verbindet sich immer mit derselben HAProxy-Adresse und merkt vom Failover im Hintergrund nichts.
 
-## Offene nächste Schritte
+## Nächste Schritte (Stand nach Teil 6)
 
 - HAProxy (Health-Checks, Routing zum Primary)
 - keepalived / Virtual IP (VRRP)
-- Referenz-Gesamtarchitektur: [technotim.live PostgreSQL-HA-Anleitung](https://technotim.live/posts/postgresql-high-availability/) (3-Knoten-Cluster: PostgreSQL + etcd + Patroni + HAProxy + keepalived)
+- Referenz-Gesamtarchitektur: [Techno Tim — PostgreSQL High Availability](https://technotim.com/posts/postgresql-high-availability/) (3-Knoten-Cluster: PostgreSQL + etcd + Patroni + HAProxy + keepalived)
 
 ---
 

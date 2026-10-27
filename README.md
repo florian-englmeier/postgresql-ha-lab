@@ -13,6 +13,17 @@ Ein selbst gebautes, hochverfügbares PostgreSQL-Cluster-Lab auf Proxmox — von
 
 Entstanden als strukturiertes Lernprojekt, vollständig dokumentiert als Portfolio-Nachweis.
 
+### Ausgangspunkt und Eigenleistung
+
+Der Grundaufbau (etcd, Patroni, HAProxy, keepalived) folgt der Architektur von [Techno Tim](https://technotim.com/posts/postgresql-high-availability/). Seine Anleitung endet mit der Installation und einer Funktionsprüfung. Darauf aufbauend habe ich den Cluster auf Proxmox umgesetzt, im Betrieb getestet und erweitert:
+
+- Failover- und Crash-Tests, auch unter Last (≈ 35 s ohne Leader, kein bestätigter Commit verloren)
+- Backup mit `pg_dump` und `pg_basebackup`, WAL-Archivierung und Point-in-Time-Recovery mit Restore-Beweis
+- Performance-Analyse mit `pgbench` und Query-Analyse mit `EXPLAIN ANALYZE`
+- Monitoring mit Prometheus und Grafana, inklusive eigenem HA-Dashboard
+- Rollierendes Patchen, Tuning, Incidents und Härtung im laufenden Betrieb
+- Alle Probleme aus Aufbau und Betrieb mit Ursache und Lösung: **[Stolpersteine](./docs/stolpersteine.md)**
+
 ![Grafana-Dashboard des Clusters: PostgreSQL-Kennzahlen live aus Prometheus](./images/grafana-postgresql-dashboard.png)
 
 *Live-Monitoring des Leaders mit Prometheus und Grafana. Die Kachelreihe „Settings“ zeigt den ersten Befund: `shared_buffers` steht noch auf der Werkseinstellung von 128 MiB.*
@@ -223,7 +234,7 @@ Der vollständige Lernweg inkl. aller Konzepte, Befehle und Entscheidungen steht
 
 Jede Änderung am laufenden Cluster steht mit Grund und Ergebnis im [Betriebslog](./Betriebslog.md).
 
-Architektur inspiriert von [technotim.live — PostgreSQL High Availability](https://technotim.live/posts/postgresql-high-availability/), eigenständig auf Proxmox umgesetzt und dokumentiert.
+Alle Probleme aus Aufbau und Betrieb mit Ursache und Lösung stehen kompakt in den [Stolpersteinen](./docs/stolpersteine.md).
 
 ---
 
@@ -232,7 +243,7 @@ Architektur inspiriert von [technotim.live — PostgreSQL High Availability](htt
 Erstellt von **Florian Englmeier** als praktisches Portfolio-Projekt im Rahmen der Weiterqualifizierung zum PostgreSQL-Datenbankadministrator.
 
 [![LinkedIn](https://img.shields.io/badge/LinkedIn-Florian_Englmeier-0077B5?logo=linkedin&logoColor=white)](https://linkedin.com/in/florian-englmeier-620949102)
-[![GitHub](https://img.shields.io/badge/GitHub-bavarian--dataforge-181717?logo=github&logoColor=white)](https://github.com/florian-englmeier)
+[![GitHub](https://img.shields.io/badge/GitHub-florian--englmeier-181717?logo=github&logoColor=white)](https://github.com/florian-englmeier)
 
 ---
 
