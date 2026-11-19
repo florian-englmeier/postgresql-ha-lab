@@ -841,7 +841,7 @@ Was macht die Replikation? Sie ist schnell und zuverlässig — und repliziert d
 
 Der zweite Fall ist die **physische Trennung**: Rechenzentrum brennt, Blitzschlag, oder Ransomware verschlüsselt alle drei VMs gleichzeitig. Dann sind alle Knoten gleichzeitig tot — und nur ein Backup an einem *anderen* Ort rettet die Daten.
 
-> **Merksatz fürs Gespräch:** Replikation ≠ Backup. Replikation schützt vor *Ausfall*, Backup schützt vor *Fehlern und Katastrophen*.
+> **Merksatz:** Replikation ≠ Backup. Replikation schützt vor *Ausfall*, Backup schützt vor *Fehlern und Katastrophen*.
 
 ### Die Landkarte: zwei unabhängige Achsen
 
@@ -3320,7 +3320,7 @@ Die Anzeige ist nur so frisch wie das langsamere Zahnrad. Für ein Operator-Dash
 
 > **Merksatz:** Messen schlägt Vermuten — aber nur, wenn man weiß, was die Metrik zählt. Für das vollständige Bild `pg_stat_activity` nach `backend_type` gruppieren.
 
-Formulierung fürs Gespräch: „`numbackends` zählt nur an eine Datenbank gebundene Sessions. Die WAL-Sender der physischen Replikation hängen an keiner Datenbank, deshalb sieht der Leader dort nicht mehr Verbindungen als die Replicas.“
+Kurz gesagt: „`numbackends` zählt nur an eine Datenbank gebundene Sessions. Die WAL-Sender der physischen Replikation hängen an keiner Datenbank, deshalb sieht der Leader dort nicht mehr Verbindungen als die Replicas.“
 
 #### Panel 5: Transaktionen pro Sekunde (TPS) — Sensor für den Lasttest
 
@@ -5031,13 +5031,13 @@ ssh florian@192.168.178.201 "echo 'Schlüssel $KEY liegt auf' \$HOSTNAME"
 
 ---
 
-## Anhang — Metaphern-Spickzettel (für Gespräch und Wiederholung)
+## Anhang — Metaphern zum Wiederholen
 
-Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Gespräch sagt.** Gesammelt aus dem Lab, damit sich die Zusammenhänge ohne Unterlagen rekonstruieren lassen.
+Jede Metapher in einer Zeile: **Fachbegriff → Metapher → kurze Erklärung.** Gesammelt aus dem Lab, damit sich die Zusammenhänge ohne Unterlagen rekonstruieren lassen.
 
 ### HA, Wahl und Failover
 
-| Fachbegriff | Bild | Satz fürs Gespräch |
+| Fachbegriff | Metapher | Kurz erklärt |
 |---|---|---|
 | etcd (3 Mitglieder, Raft) | **Gemeinderat** — stimmberechtigt, ungerade Zahl | „etcd ist der Rat, der per Mehrheit festhält, wer Leader ist.“ |
 | Patroni-Knoten | **Bürger**, die Bürgermeister werden können | „Datenknoten wählen nicht mit, sie bewerben sich.“ |
@@ -5050,7 +5050,7 @@ Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Ge
 
 ### Crash, Recovery und Wiedereinstieg
 
-| Fachbegriff | Bild | Satz fürs Gespräch |
+| Fachbegriff | Metapher | Kurz erklärt |
 |---|---|---|
 | WAL / LSN | **Tonband** mit Zählwerk in Bytes | „Die LSN ist die Position auf dem Band; Lag ist der Abstand zweier Positionen.“ |
 | Checkpoint | **Lesezeichen im Tagebuch**: bis hier ist alles in den Datendateien | „Nach einem Crash wird ab dem letzten Lesezeichen nachgespielt.“ |
@@ -5065,7 +5065,7 @@ Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Ge
 
 ### Performance
 
-| Fachbegriff | Bild | Satz fürs Gespräch |
+| Fachbegriff | Metapher | Kurz erklärt |
 |---|---|---|
 | `shared_buffers` / Cache-Hit-Ratio | **Werkbank** (Treffer) vs. **Keller** (Lesen) | „Von 100 Griffen, wie viele lagen schon auf der Bank?“ |
 | `blks_read` aus dem OS-Cache | eher **Nebenzimmer** als Keller | „Nicht jeder Miss ist ein Plattenzugriff.“ |
@@ -5077,7 +5077,7 @@ Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Ge
 
 ### Monitoring und Grafana
 
-| Fachbegriff | Bild | Satz fürs Gespräch |
+| Fachbegriff | Metapher | Kurz erklärt |
 |---|---|---|
 | Lag als Differenz zweier Scrapes | **Zwei Fotografen, zwei Autos** — die Fotos sind nicht gleichzeitig | „Eine Differenz ist nur so gut wie die Gleichzeitigkeit ihrer Werte.“ |
 | `pg_stat_replication_pg_wal_lsn_diff` | **Ein Foto mit beiden Autos** | „Lag dort messen, wo beide Positionen im selben Moment bekannt sind.“ |
@@ -5145,7 +5145,7 @@ Jede Metapher in einer Zeile: **Fachbegriff → Bild → der Satz, den man im Ge
 
 ### Shell und SSH
 
-| Fachbegriff | Bild | Satz fürs Gespräch |
+| Fachbegriff | Metapher | Kurz erklärt |
 |---|---|---|
 | `for`-Schleife über Knoten-Array | **Hausmeister-Rundgang** mit Türliste | „Ein Skript stellt dieselbe Frage an alle Knoten — immer gleich, wiederholbar.“ |
 | `ConnectTimeout` vs. `BatchMode` | **Klingeln, bis man Rente bekommt** vs. **niemand da, der das Passwort eintippt** | „Timeout gegen Stille, BatchMode gegen Fragen.“ |
