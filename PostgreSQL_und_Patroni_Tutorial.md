@@ -5787,6 +5787,109 @@ ph-node3                   : ok=2    changed=0    unreachable=0    failed=0    s
 - **Warum erscheint ph-monitor nicht?** → `hosts: patroni`.
 - **Warum nicht `service: state=started`?** → würde einen bewusst angehaltenen Knoten starten; Prüfen und Ändern trennen.
 
+### 19.13 Das Rot-Experiment: Wie verhält sich Ansible bei einem Fehler? (Verifiziert 24.11.2026)
+
+**Warum:** Bisher nur Grün gesehen. Im Betrieb ist entscheidend, **was Ansible nach einem Fehler tut** — spielt es weiter oder hört es auf? Gefahrlos getestet mit einem Dienst, den es nicht gibt; Patroni bleibt unberührt.
+
+**Bild:** Ein Musiker verspielt sich im ersten Takt — spielt er den zweiten trotzdem, oder schickt ihn der Dirigent von der Bühne?
+
+```bash
+cp playbooks/check-dienste.yml playbooks/experiment-rot.yml   # Kopie; das Original bleibt unverändert
+code playbooks/experiment-rot.yml                              # öffnen, ohne in den Ordner zu wechseln
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `cp` (*copy*) | Datei kopieren |
+| 1. Argument | Quelle (bleibt unverändert) |
+| 2. Argument | Ziel — existiert es schon, wird es **ohne Nachfrage überschrieben** |
+
+```yaml
+---
+- name: Experiment - wie sieht ein Fehler aus?
+  hosts: patroni
+
+  tasks:
+    - name: Takt 1 - Dienst, den es nicht gibt
+      ansible.builtin.command: systemctl is-active gibtsnicht
+      changed_when: false
+
+    - name: Takt 2 - wird der noch gespielt?
+      ansible.builtin.command: echo "Takt 2 erreicht"
+      changed_when: false
+```
+
+Takt 1 liefert einen Exit-Code ≠ 0 → für Ansible „fehlgeschlagen“. Takt 2 ist ein harmloser `echo` als Testfrage: Kommt Ansible bis hierhin?
+
+```bash
+ansible-playbook playbooks/experiment-rot.yml
+```
+
+![Rot-Experiment: Takt 1 schlägt auf allen drei Knoten fehl, Takt 2 wird nicht mehr gespielt, PLAY RECAP failed=1](./images/ansible-experiment-rot.png)
+
+Echte Ausgabe (Auszug, ein Knoten):
+
+```
+TASK [Takt 1 - Dienst, den es nicht gibt] **************************************
+[ERROR]: Task failed: Module failed: The command exited with a non-zero return code.
+Origin: /Users/florianenglmeier/nextcloud/Documents/Programming/GitHub/postgresql-ha-lab/ansible/playbooks/experiment-rot.yml:6:7
+
+4
+5   tasks:
+6     - name: Takt 1 - Dienst, den es nicht gibt
+        ^ column 7
+
+fatal: [ph-node1]: FAILED! => {"changed": false, "changed_when_result": false, "cmd": ["systemctl", "is-active", "gibtsnicht"], "delta": "0:00:00.003571", "end": "2026-11-24 18:01:51.836497", "msg": "The command exited with a non-zero return code.", "rc": 4, "start": "2026-11-24 18:01:51.832926", "stderr": "", "stderr_lines": [], "stdout": "inactive", "stdout_lines": ["inactive"]}
+
+PLAY RECAP *********************************************************************
+ph-node1                   : ok=1    changed=0    unreachable=0    failed=1    skipped=0    rescued=0    ignored=0
+ph-node2                   : ok=1    changed=0    unreachable=0    failed=1    skipped=0    rescued=0    ignored=0
+ph-node3                   : ok=1    changed=0    unreachable=0    failed=1    skipped=0    rescued=0    ignored=0
+```
+
+**Interpretation — die Antworten auf die zwei Fragen:**
+
+1. **Takt 1 ist rot** (`fatal … FAILED!`) auf allen drei Knoten.
+2. **Takt 2 wird nicht gespielt** — er taucht in der Ausgabe gar nicht auf, nicht einmal als `skipped`. **Regel:** Schlägt ein Task auf einem Host fehl, scheidet **dieser Host** für den Rest des Plays aus. Die anderen Hosts spielen weiter. Hier sind alle drei ausgeschieden → das Play endet nach Takt 1.
+
+**Die Fehlermeldung lesen:**
+
+| Teil | Bedeutung |
+|---|---|
+| `[ERROR]: … non-zero return code` | Grund in einem Satz: Exit-Code ≠ 0 |
+| `Origin: …/experiment-rot.yml:6:7` | **wo** im Playbook: Datei, Zeile 6, Spalte 7 — darunter der Ausschnitt mit `^ column 7`. Bei langen Playbooks Gold wert |
+| `fatal: [ph-node1]: FAILED!` | betroffener Host; `fatal` = dieser Host spielt nicht weiter |
+| `"cmd": [...]` | der tatsächlich ausgeführte Befehl, in Wörter zerlegt (`command` nutzt keine Shell) |
+| `"rc": 4` | **Return Code** = Exit-Code. `systemctl is-active` liefert 4 für eine **unbekannte** Unit (zum Vergleich: 3 = Unit bekannt, aber nicht aktiv) |
+| `"stdout": "inactive"` | was der Befehl auf den Bildschirm geschrieben hätte — die Antwort des Knotens. Bei Erfolg zeigt Ansible sie standardmäßig nicht, bei Fehler schon |
+| `"stderr": ""` | Fehlerkanal — hier leer |
+| `"stdout_lines"` / `"stderr_lines"` | dasselbe als Liste, eine Zeile pro Eintrag (praktisch zum Weiterverarbeiten) |
+| `"start"` / `"end"` / `"delta"` | Zeitpunkte auf dem Knoten und Laufzeit (hier ~4 ms) |
+| `"changed": false` / `"changed_when_result": false` | nichts verändert — dank `changed_when: false` |
+| RECAP `ok=1` | nur Gathering Facts war erfolgreich |
+| RECAP `failed=1` | ein Task fehlgeschlagen; Takt 2 wird gar nicht gezählt |
+
+> **Merksatz:** **Ein Fehler stoppt den Host, nicht das Orchester.** Der fehlerhafte Host scheidet für den Rest des Plays aus; die anderen spielen weiter. Genau das will man beim Patchen: Ein Knoten, bei dem Schritt 1 schiefgeht, darf Schritt 2 nicht mehr ausführen.
+
+> **Merke:** `rc` ist der Exit-Code, `stdout` die Antwort des Knotens. Bei Erfolg zeigt Ansible `stdout` nicht an — bei Fehlern steht alles im JSON.
+
+**Wie man das Verhalten bewusst ändert (kommt später, nur zur Einordnung):**
+
+| Schlüsselwort | Wirkung |
+|---|---|
+| `ignore_errors: true` | Fehler wird gemeldet, der Host spielt trotzdem weiter (im RECAP unter `ignored`) |
+| `failed_when: <bedingung>` | selbst festlegen, wann ein Task als fehlgeschlagen gilt (z. B. erst bei bestimmtem Text) |
+| `block` / `rescue` | Fehler auffangen und eine Ersatzhandlung ausführen (im RECAP unter `rescued`) |
+
+Aufräumen: Die Übungsdatei `playbooks/experiment-rot.yml` wurde nach dem Experiment gelöscht — ins Repo kommt nur die Erkenntnis.
+
+**Kontrollfragen zu 19.13**
+- **Was passiert mit den restlichen Tasks, wenn ein Task auf einem Host fehlschlägt?** → Der Host scheidet für den Rest des Plays aus; andere Hosts spielen weiter.
+- **Wo steht in der Fehlermeldung, was der Knoten geantwortet hat?** → `stdout` (und `stderr`).
+- **Was bedeutet `rc: 4` bei `systemctl is-active`?** → Unit unbekannt (3 wäre: bekannt, aber nicht aktiv).
+- **Wie findet man die fehlerhafte Stelle im Playbook?** → `Origin: datei:zeile:spalte` mit Ausschnitt.
+- **Warum ist das Standardverhalten beim Patchen gut?** → Ein Knoten mit Fehler macht nicht blind mit dem nächsten Schritt weiter.
+
 ---
 
 ## Anhang — Metaphern zum Wiederholen
@@ -5941,4 +6044,5 @@ Jede Metapher in einer Zeile: **Fachbegriff → Metapher → kurze Erklärung.**
 | Play / Task | **Satz der Sinfonie** / **einzelner Takt** | „Ein Play: wer spielt was. Ein Task: genau ein Modul.“ |
 | Gathering Facts | **vor der Probe jeden Musiker fragen: Instrument, Stimmung, Platz?** | „Ansible sammelt automatisch Host-Infos, bevor das Play beginnt.“ |
 | `playbooks/`-Ordner betreten | **Partitur im Notenschrank suchen, während man im Notenschrank steht** | „Immer im Ordner `ansible/` bleiben.“ |
+| fehlgeschlagener Task | **Musiker verspielt sich und wird von der Bühne geschickt, das Orchester spielt weiter** | „Ein Fehler stoppt den Host, nicht das Orchester.“ |
 | Idempotenz (pipx/Ansible) | **Lichtschalter auf „aus“, wenn das Licht schon aus ist** | „Zweimal ausführen ändert nichts — `changed: false`.“ |
