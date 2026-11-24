@@ -5749,6 +5749,10 @@ ph-node2                   : ok=2    changed=0    unreachable=0    failed=0    s
 ph-node3                   : ok=2    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
 ```
 
+![Ansible-Playbook check-dienste.yml im Terminal: grün = ok, PLAY RECAP mit changed=0](./images/ansible-check-dienste.png)
+
+**Farben:** grün = `ok` (erfolgreich, nichts verändert) · gelb = `changed` (etwas verändert) · rot = `failed`/`unreachable` · blau/türkis = `skipping`. Im RECAP werden nur Spalten eingefärbt, die etwas enthalten — kein Gelb, kein Rot = alles in Ordnung.
+
 **Interpretation:**
 
 - **`PLAY [...]` / `TASK [...]`**: die `name`-Titel aus der Datei — deshalb lohnt es sich, sie sprechend zu wählen.

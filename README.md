@@ -87,6 +87,12 @@ Neben den Community-Dashboards (Dutzende Panels zum Stöbern) ein selbst gebaute
 
 ---
 
+### Live-Nachweis: Cluster per Ansible-Playbook geprüft
+
+![Ansible-Playbook check-dienste.yml: Patroni auf allen drei Datenknoten aktiv, PLAY RECAP mit changed=0](./images/ansible-check-dienste.png)
+
+Statt dreimal einloggen ein Befehl vom Mac als Steuerknoten: `ansible-playbook playbooks/check-dienste.yml` prüft auf der Inventory-Gruppe `patroni`, ob der Dienst `patroni` läuft. Erst Syntaxprüfung (`--syntax-check`), dann der Lauf; `changed=0` im PLAY RECAP belegt, dass das Prüf-Playbook nichts verändert hat (`changed_when: false`). Aufbau von Inventory, `ansible.cfg`, SSH-Schlüsseln und Playbook sowie vier Stolpersteine in [Teil 19](./PostgreSQL_und_Patroni_Tutorial.md#teil-19--ansible-der-dirigent-für-den-cluster).
+
 ## Tech-Stack
 
 | Komponente | Version / Rolle |
