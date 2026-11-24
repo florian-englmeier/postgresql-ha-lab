@@ -5492,7 +5492,129 @@ Host *
 
 **Interpretation:** Rechte `-rw-------` wie gewollt, vier Zeilen wörtlich angekommen — `~` steht unverändert drin, weil die Endmarke in Anführungszeichen stand.
 
-*Stand 24.11.2026: Als Nächstes den öffentlichen Schlüssel mit `ssh-copy-id` auf die vier VMs verteilen, dann erneut `ansible all -m ping`.*
+#### Schritt 5: öffentlichen Schlüssel auf ph-node1 hinterlegen (Verifiziert 24.11.2026)
+
+Das Foto (`id_ed25519.pub`) muss auf dem Knoten in `/home/florian/.ssh/authorized_keys` — die **Liste der Gesichter, die der Musiker reinlässt**.
+
+```bash
+ssh-copy-id -i ~/.ssh/id_ed25519.pub florian@192.168.178.201
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `ssh-copy-id` | meldet sich per SSH an und hängt den öffentlichen Schlüssel an `~/.ssh/authorized_keys` an; legt Ordner/Datei bei Bedarf mit richtigen Rechten an |
+| `-i <datei>` (*identity*) | welcher Schlüssel kopiert wird — immer die **`.pub`** (Foto verteilen, nie das Gesicht) |
+| `florian@192.168.178.201` | als Benutzer florian auf ph-node1 |
+
+**Henne-Ei:** Damit ph-node1 das Foto annimmt, muss ich mich **ein letztes Mal per Passwort** ausweisen. Zwei Abfragen nicht verwechseln:
+
+| Abfrage | gehört zu | wo |
+|---|---|---|
+| `florian@192.168.178.201's password: <VM-Passwort>` | Benutzerkonto auf der VM | ph-node1 |
+| `Enter passphrase for …id_ed25519:` | Schloss am eigenen Album | Mac (übernimmt jetzt der Schlüsselbund) |
+
+Echte Ausgabe (Auszug):
+
+```
+/usr/bin/ssh-copy-id: INFO: Source of key(s) to be installed: "/Users/florianenglmeier/.ssh/id_ed25519.pub"
+/usr/bin/ssh-copy-id: INFO: attempting to log in with the new key(s), to filter out any that are already installed
+/usr/bin/ssh-copy-id: INFO: 1 key(s) remain to be installed -- if you are prompted now it is to install the new keys
+florian@192.168.178.201's password:
+
+Number of key(s) added:        1
+
+Now try logging into the machine, with: "ssh -i /Users/florianenglmeier/.ssh/id_ed25519 'florian@192.168.178.201'"
+and check to make sure that only the key(s) you wanted were added.
+```
+
+| Zeile | Bedeutung |
+|---|---|
+| `Source of key(s)…` | welches Foto verteilt wird — die `.pub` ✅ |
+| `attempting to log in with the new key(s)…` | erst Testanruf mit dem Schlüssel: klappt er, ist das Foto schon da und wird nicht doppelt eingetragen (**idempotent**; zweiter Aufruf → „All keys were skipped because they already exist“) |
+| `1 key(s) remain to be installed…` | Testanruf ging nicht → die folgende Passwortabfrage dient dem Eintragen |
+| `Number of key(s) added: 1` | genau ein Schlüssel angehängt |
+| `check to make sure that only the key(s) you wanted were added` | Sicherheitshinweis: bei mehreren Schlüsseln auf dem Mac könnten versehentlich falsche verteilt werden → nachsehen |
+
+Prüfen — geht es ohne Passwort?
+
+```bash
+ssh florian@192.168.178.201 hostname
+# → ph-node1   (ohne Passwort- und ohne Passphrase-Abfrage)
+```
+
+`hostname` läuft **auf ph-node1** und gibt dessen Namen aus; danach ist die Verbindung sofort wieder zu.
+
+Nachsehen, was in der Liste steht:
+
+```bash
+ssh florian@192.168.178.201 'cat ~/.ssh/authorized_keys'
+```
+
+Einfache Anführungszeichen (Formular-Metapher, 18.5): Der Text reist wörtlich, erst ph-node1 macht `~` zu `/home/florian`. Ohne sie würde der Mac `~` zu `/Users/florianenglmeier` machen — den Pfad gibt es auf dem Knoten nicht.
+
+Echte Ausgabe:
+
+```
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGt96mvUcXdArY89Pvrdp+/JwiJNChDc8DZEBXQsjvjO florian@ph-monitor
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPemX5ZogRUC1O74Zuhht98ijET41zQD8EqaAEPFhin3 florian@macbook ansible
+```
+
+| Zeile | Kommentar | Woher | Wozu |
+|---|---|---|---|
+| 1 | `florian@ph-monitor` | Shell-Track Teil 18 (25.10.2026) | Hausmeister-Rundgang `cluster-check.sh` |
+| 2 | `florian@macbook ansible` | `ssh-copy-id` heute | Ansible vom Mac |
+
+**Interpretation:** keine fremde Zeile. Format je Zeile: Typ – Schlüssel – Kommentar. Der Kommentar aus `ssh-keygen -C` macht die Zeilen zuordenbar (ph-monitor bekam automatisch `benutzer@rechnername`). `AAAAC3NzaC1lZDI1NTE5` am Anfang ist bei **allen** Ed25519-Schlüsseln gleich (kodierte Typangabe) — der Unterschied steckt hinten. Öffentliche Schlüssel sind nicht geheim.
+
+#### Schritt 6: die anderen drei Knoten per Schleife (Verifiziert 24.11.2026)
+
+```bash
+for ip in 192.168.178.202 192.168.178.203 192.168.178.204; do
+  ssh-copy-id -i ~/.ssh/id_ed25519.pub "florian@$ip"
+done
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `for ip in A B C; do … done` | `ip` nimmt nacheinander jeden Wert an; der Teil zwischen `do` und `done` läuft je einmal |
+| `"florian@$ip"` | **doppelte** Anführungszeichen: der Mac füllt `$ip` selbst aus; mit einfachen käme wörtlich `$ip` an |
+
+ph-node1 steht nicht in der Liste — schon in Schritt 5 erledigt (stünde er drin, würde `ssh-copy-id` ihn überspringen).
+
+Ergebnis: dreimal Passwortabfrage des jeweiligen Knotens, dreimal `Number of key(s) added: 1`. Kein Host-Key-Problem bei ph-monitor (war vom Mac aus schon bekannt). Sonst wäre `Are you sure you want to continue connecting (yes/no)?` gekommen → Angabe prüfen, `yes`.
+
+#### Ergebnis: der erste grüne Ping (Verifiziert 24.11.2026)
+
+```bash
+ansible all -m ping
+```
+
+```
+ph-node2 | SUCCESS => {
+    "changed": false,
+    "ping": "pong"
+}
+ph-monitor | SUCCESS => {
+    "changed": false,
+    "ping": "pong"
+}
+ph-node3 | SUCCESS => {
+    "changed": false,
+    "ping": "pong"
+}
+ph-node1 | SUCCESS => {
+    "changed": false,
+    "ping": "pong"
+}
+```
+
+**Interpretation:**
+
+- Viermal `SUCCESS` + `pong`: Jeder Knoten ist erreichbar, erkennt mich am Schlüssel und hat ein lauffähiges Python. Der Dirigent hat zum ersten Mal das ganze Orchester erreicht.
+- `"changed": false`: Auf keinem Knoten wurde etwas verändert — ein Ping beobachtet nur.
+- **Reihenfolge zufällig** (node2, monitor, node3, node1): Wegen `forks = 4` laufen die vier Anrufe **gleichzeitig**; wer zuerst antwortet, steht oben. Bei der nächsten Ausführung kann die Reihenfolge anders sein.
+
+> **Merksatz:** Ein grünes `ansible all -m ping` ist die Eintrittskarte für alles Weitere: **Netz, SSH-Schlüssel und Python** sind auf allen Knoten nachgewiesen.
 
 ### 19.10 Stolpersteine (live 24.11.2026)
 
@@ -5530,7 +5652,7 @@ ph-node1 | UNREACHABLE! => {
 - **Was die Meldung trotzdem beweist:** Alle vier VMs sind **erreichbar** (sonst `Connection timed out`), SSH läuft, die Host-Keys sind bekannt (sonst `Host key verification failed`). Nur die **Anmeldung** scheitert. Bild: Das Telefon klingelt, der Musiker geht ran, lässt den Anrufer aber nicht rein.
 - **`(publickey,password)`** = die Anmeldearten, die der Server anbietet. Ansible probiert einen Schlüssel — der Server kennt keinen von mir — und ein Passwort kann Ansible ohne weitere Angaben nicht tippen.
 - **Ursache:** Auf dem Mac gab es **gar kein Schlüsselpaar** (19.9, Schritt 1); bisher lief die Anmeldung per Passwort.
-- **Fix:** Schlüsselpaar erzeugen, in den Agent laden, `~/.ssh/config`, dann `.pub` per `ssh-copy-id` verteilen (19.9).
+- **Fix:** Schlüsselpaar erzeugen, in den Agent laden, `~/.ssh/config`, dann `.pub` per `ssh-copy-id` verteilen (19.9) — danach viermal `pong` (Verifiziert 24.11.2026).
 
 > **Merke:** Rote Meldungen genau lesen: **„Permission denied“** ist ein *guter* Fehler — Netzwerk und SSH funktionieren, nur der Schlüssel fehlt.
 
@@ -5698,4 +5820,6 @@ Jede Metapher in einer Zeile: **Fachbegriff → Metapher → kurze Erklärung.**
 | öffentlicher / privater Schlüssel | **Foto** / **Gesicht** (in Teil 18: Schloss / Schlüssel) | „Das Foto darf überallhin, das Gesicht hat nur einer.“ |
 | ssh-agent | **Assistent, der das aufgesperrte Album bereithält** | „Einmal entsperrt, solange der Mac läuft.“ |
 | Passphrase + Schlüsselbund | **Schloss am Album**, **Tresor**, den macOS beim Anmelden öffnet | „Sicher und trotzdem bequem.“ |
+| `authorized_keys` | **Liste der Gesichter, die der Musiker reinlässt** | „`ssh-copy-id` hängt mein Foto an — beim ersten Mal noch mit Passwort (Henne-Ei).“ |
+| Reihenfolge der Ping-Antworten | **wer zuerst ans Telefon geht, steht oben** | „`forks` = parallel, die Reihenfolge ist zufällig.“ |
 | Idempotenz (pipx/Ansible) | **Lichtschalter auf „aus“, wenn das Licht schon aus ist** | „Zweimal ausführen ändert nichts — `changed: false`.“ |
