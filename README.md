@@ -191,7 +191,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 ### 🔜 Als Nächstes
 
-- [ ] **Ansible Stufe 1 — Cluster per Playbook verwalten:** ein Playbook für Grundpakete und Updates, Benutzer und SSH-Schlüssel, Verteilen von Backup-Skripten und Cronjobs sowie eine Prüfung, ob PostgreSQL und Patroni laufen. Updates rollierend: Replicas zuerst, Leader erst nach `patronictl switchover`. Bewusst **kein** Neuaufbau von Patroni mit Ansible
+- [ ] **Ansible Stufe 1 — Cluster per Playbook verwalten:** ✅ erstes Prüf-Playbook `check-dienste.yml` (24.11.2026, Patroni aktiv auf allen drei Datenknoten, `changed=0`); als Nächstes ein Playbook für Grundpakete und Updates, Benutzer und SSH-Schlüssel, Verteilen von Backup-Skripten und Cronjobs sowie eine Prüfung, ob PostgreSQL und Patroni laufen. Updates rollierend: Replicas zuerst, Leader erst nach `patronictl switchover`. Bewusst **kein** Neuaufbau von Patroni mit Ansible
 - [ ] 🔴 **TLS Etappe 1 — Datenbankverbindungen verschlüsseln:** eigene CA, Server-Zertifikate für alle drei Knoten, `ssl = on` per `patronictl edit-config`, `hostssl` in `pg_hba.conf`, `postgres_exporter` von `sslmode=disable` auf verschlüsselte Verbindung umstellen. Rollierend, ohne Leader-Wechsel am Ende
 - [ ] 🔴 **TLS Etappe 2 — Cluster-Kommunikation verschlüsseln:** etcd Peer- und Client-Verkehr sowie Patroni-REST-API auf HTTPS, HAProxy-Health-Check auf HTTPS umstellen. Knoten für Knoten, mit Quorum-Prüfung nach jedem Schritt (`etcdctl endpoint health`), weil ein Fehler bei etcd die Leader-Wahl kosten kann
 - [ ] Zentrales WAL-Archiv mit Aufbewahrungsregel (pgBackRest) und `restore_command` — Befund 20.10.2026: lokales Archiv lief auf dem Leader zweimal fast voll; PITR bis dahin bewusst ausgesetzt (nur Testdaten)

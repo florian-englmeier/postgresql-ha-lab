@@ -1,0 +1,8 @@
+---
+- name: Prüfen, ob Patroni auf den Datenknoten läuft
+  hosts: patroni
+
+  tasks:
+    - name: Ist der Dienst patroni aktiv?
+      ansible.builtin.command: systemctl is-active patroni
+      changed_when: false

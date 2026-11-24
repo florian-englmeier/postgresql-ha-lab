@@ -5671,6 +5671,118 @@ ph-node1 | UNREACHABLE! => {
 - **Was macht `<<'EOF'` und wozu die Anführungszeichen?** → Heredoc: mehrzeilige Eingabe bis zur Zeile `EOF`; die Anführungszeichen verhindern, dass die Shell `~` oder `$…` ersetzt.
 - **Was bedeutet `chmod 600`?** → Besitzer lesen + schreiben (4+2), Gruppe und andere nichts → `-rw-------`.
 
+### 19.12 Das erste Playbook: `playbooks/check-dienste.yml` (Verifiziert 24.11.2026)
+
+**Ad hoc vs. Playbook:** `ansible all -m ping` ruft **eine** Anweisung in den Raum — nach dem Enter vergessen. Ein **Playbook** ist die **Partitur**: eine Datei im Repo, die festhält, **wer** spielt, **was** gespielt wird und in **welcher Reihenfolge** — nachlesbar und jedes Mal gleich.
+
+| Ebene | Im Orchester | Bedeutung |
+|---|---|---|
+| Playbook | die ganze Partitur | die Datei |
+| Play | ein Satz der Sinfonie, für bestimmte Musiker | „diese Hosts machen diese Aufgaben“ |
+| Task | ein einzelner Takt | eine Aufgabe, ruft genau **ein Modul** auf |
+
+Erstes Playbook bewusst klein: **ein Play, ein Task**, nur **prüfen**, nichts verändern — der Hausmeister-Rundgang aus Teil 18, diesmal mit Ansible.
+
+```bash
+mkdir -p playbooks     # im Ordner ansible/; -p = kein Fehler, falls schon vorhanden
+```
+
+```yaml
+---
+- name: Prüfen, ob Patroni auf den Datenknoten läuft
+  hosts: patroni
+
+  tasks:
+    - name: Ist der Dienst patroni aktiv?
+      ansible.builtin.command: systemctl is-active patroni
+      changed_when: false
+```
+
+| Zeile | Bedeutung |
+|---|---|
+| `---` | Anfang eines YAML-Dokuments (nicht zwingend, aber üblich; Linter wollen es sehen) |
+| `- name: Prüfen, …` | `-` = **Listeneintrag**: Ein Playbook ist eine Liste von Plays, das ist Play Nr. 1. `name` = frei wählbarer Titel für die Ausgabe |
+| `hosts: patroni` | **wer** spielt: Gruppe `patroni` aus dem Inventory — ph-monitor bewusst nicht, dort läuft kein Patroni |
+| `tasks:` | ab hier die Liste der Aufgaben dieses Plays |
+| `- name: Ist der Dienst …` | Task Nr. 1, wieder mit Titel |
+| `ansible.builtin.command:` | Modul `command` mit vollem Namen: `ansible.builtin` = fest mitgelieferte Sammlung. Führt einen Befehl **ohne Shell** aus — keine Pipes (`\|`), keine Umleitungen (`>`) |
+| `systemctl is-active patroni` | Befehl auf dem Knoten: `active` + Exit-Code 0, wenn der Dienst läuft; sonst z. B. `inactive`/`failed` + Exit-Code ≠ 0. **Ansible wertet den Exit-Code aus:** ≠ 0 → Task rot (failed) |
+| `changed_when: false` | Ansible weiß nicht, was ein beliebiger Befehl tut, und meldet bei `command` vorsichtshalber immer **changed** (gelb). So wird festgelegt: dieser Befehl verändert nie etwas → grünes **ok** |
+
+**Einrückung:** `hosts` und `tasks` stehen genau unter dem `n` von `name` → gehören zum selben Play. Der Task steht zwei Leerzeichen weiter rechts unter `tasks`. Nur Leerzeichen, keine Tabs.
+
+**Warum nicht „Patroni starten“?** Das Modul `service` mit `state: started` würde Patroni **starten**, falls es nicht läuft — ein bewusst angehaltener Knoten liefe plötzlich wieder. Deshalb erst prüfen; verändert wird erst, wenn klar ist, was passiert.
+
+> **Merke:** `command` meldet ohne `changed_when: false` **immer** „changed“ — auch bei reinen Prüfbefehlen. Ein Prüf-Playbook, das gelb meldet, lügt.
+
+Erst trocken prüfen, dann ausführen:
+
+```bash
+ansible-playbook playbooks/check-dienste.yml --syntax-check
+ansible-playbook playbooks/check-dienste.yml
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `ansible-playbook` | Playbooks abspielen (im Gegensatz zu `ansible` für Ad-hoc-Aufgaben) |
+| `playbooks/check-dienste.yml` | welche Partitur — relativ zum Ordner `ansible/` |
+| `--syntax-check` | nur lesen und auf Fehler prüfen (z. B. Einrückung), **nichts** ausführen — wie `bash -n` aus Teil 18. Erfolgsausgabe nur: `playbook: playbooks/check-dienste.yml` |
+
+Echte Ausgabe:
+
+```
+PLAY [Prüfen, ob Patroni auf den Datenknoten läuft] ****************************
+
+TASK [Gathering Facts] *********************************************************
+ok: [ph-node2]
+ok: [ph-node3]
+ok: [ph-node1]
+
+TASK [Ist der Dienst patroni aktiv?] *******************************************
+ok: [ph-node1]
+ok: [ph-node3]
+ok: [ph-node2]
+
+PLAY RECAP *********************************************************************
+ph-node1                   : ok=2    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+ph-node2                   : ok=2    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+ph-node3                   : ok=2    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+```
+
+**Interpretation:**
+
+- **`PLAY [...]` / `TASK [...]`**: die `name`-Titel aus der Datei — deshalb lohnt es sich, sie sprechend zu wählen.
+- **`TASK [Gathering Facts]`** — nicht selbst geschrieben: Vor jedem Play sammelt Ansible automatisch **Fakten** über jeden Host (Betriebssystem, IP-Adressen, Speicher, CPU, Python-Version …) mit dem Modul `setup`. Bild: **Der Dirigent fragt vor der Probe jeden Musiker kurz: Welches Instrument, wie gestimmt, wie viel Platz?** Später kann man die Fakten als Variablen nutzen (z. B. `ansible_distribution` = `Ubuntu`). Kostet etwas Zeit; abschaltbar mit `gather_facts: false` im Play, wenn man sie nicht braucht.
+- **Nur ph-node1–3**, kein ph-monitor: `hosts: patroni` wirkt.
+- **Reihenfolge wechselt** zwischen den Tasks: parallel (`forks`), wer zuerst fertig ist, steht oben. Ansible wartet aber, bis **alle** Hosts einen Task beendet haben, bevor der nächste Task beginnt.
+- **`active` taucht nicht auf**: Ansible zeigt die Ausgabe eines Befehls standardmäßig nicht an — nur ok/changed/failed. Dass Patroni läuft, beweist hier der **Exit-Code 0** (sonst wäre der Task rot).
+
+**PLAY RECAP — die Abrechnung pro Host:**
+
+| Spalte | Bedeutung | hier |
+|---|---|---|
+| `ok` | Tasks, die erfolgreich waren und nichts verändert haben | 2 (Facts + Prüfung) |
+| `changed` | Tasks, die etwas verändert haben | 0 — reines Prüf-Playbook ✅ |
+| `unreachable` | Host per SSH nicht erreichbar | 0 |
+| `failed` | Task fehlgeschlagen (z. B. Exit-Code ≠ 0) | 0 |
+| `skipped` | Task wegen Bedingung (`when:`) übersprungen | 0 |
+| `rescued` | Fehler, der in einem `rescue`-Block aufgefangen wurde | 0 |
+| `ignored` | Fehler, die mit `ignore_errors: true` bewusst ignoriert wurden | 0 |
+
+> **Merksatz:** **`changed=0` bei einem Prüf-Playbook ist der Beweis, dass es nur geschaut hat.** Läuft ein Änderungs-Playbook ein zweites Mal und meldet `changed=0`, ist es idempotent.
+
+**Stolperstein 4 — falscher Ordner, dritte Auflage:** `[ERROR]: the playbook: playbooks/check-dienste.yml could not be found` — Prompt endete auf `playbooks %`. Ansible suchte `playbooks/playbooks/check-dienste.yml`. Fix: `cd ..` (`..` = übergeordneter Ordner, `.` = aktueller), dann `pwd`. Bild: Der Dirigent sucht die Partitur im Notenschrank, steht aber schon **im** Notenschrank.
+
+> **Merksatz:** Ich stehe **immer** im Ordner `ansible/`. Dateien öffne ich von dort aus (`code playbooks/check-dienste.yml`), ich gehe nicht hinein.
+
+**Kontrollfragen zu 19.12**
+- **Unterschied Playbook – Play – Task?** → Datei – Hosts + Aufgabenliste – eine Aufgabe mit genau einem Modul.
+- **Warum `changed_when: false`?** → `command` meldet sonst immer „changed“, obwohl `systemctl is-active` nichts verändert.
+- **Woran erkennt Ansible, ob `systemctl is-active` erfolgreich war?** → am Exit-Code (0 = ok, sonst failed).
+- **Was ist „Gathering Facts“?** → automatisches Einsammeln von Host-Informationen per Modul `setup` vor jedem Play; abschaltbar mit `gather_facts: false`.
+- **Warum erscheint ph-monitor nicht?** → `hosts: patroni`.
+- **Warum nicht `service: state=started`?** → würde einen bewusst angehaltenen Knoten starten; Prüfen und Ändern trennen.
+
 ---
 
 ## Anhang — Metaphern zum Wiederholen
@@ -5822,4 +5934,7 @@ Jede Metapher in einer Zeile: **Fachbegriff → Metapher → kurze Erklärung.**
 | Passphrase + Schlüsselbund | **Schloss am Album**, **Tresor**, den macOS beim Anmelden öffnet | „Sicher und trotzdem bequem.“ |
 | `authorized_keys` | **Liste der Gesichter, die der Musiker reinlässt** | „`ssh-copy-id` hängt mein Foto an — beim ersten Mal noch mit Passwort (Henne-Ei).“ |
 | Reihenfolge der Ping-Antworten | **wer zuerst ans Telefon geht, steht oben** | „`forks` = parallel, die Reihenfolge ist zufällig.“ |
+| Play / Task | **Satz der Sinfonie** / **einzelner Takt** | „Ein Play: wer spielt was. Ein Task: genau ein Modul.“ |
+| Gathering Facts | **vor der Probe jeden Musiker fragen: Instrument, Stimmung, Platz?** | „Ansible sammelt automatisch Host-Infos, bevor das Play beginnt.“ |
+| `playbooks/`-Ordner betreten | **Partitur im Notenschrank suchen, während man im Notenschrank steht** | „Immer im Ordner `ansible/` bleiben.“ |
 | Idempotenz (pipx/Ansible) | **Lichtschalter auf „aus“, wenn das Licht schon aus ist** | „Zweimal ausführen ändert nichts — `changed: false`.“ |
