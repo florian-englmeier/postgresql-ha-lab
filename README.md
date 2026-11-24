@@ -102,6 +102,7 @@ Neben den Community-Dashboards (Dutzende Panels zum Stöbern) ein selbst gebaute
 | **Pi-hole** | Lokaler DNS: `pg-vip.home.arpa` → VIP |
 | **Proxmox VE** | Virtualisierungsplattform für die 3 Cluster-Knoten |
 | **Ubuntu Server** | 24.04 LTS, je Knoten |
+| **Ansible** | `ansible-core` 2.22 (Paket 15.0.0, per pipx) auf dem Mac als Steuerknoten; Inventory und Konfiguration unter [`ansible/`](./ansible/) — im Aufbau |
 
 ---
 
@@ -186,8 +187,11 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 - [x] Shell-Track Stufe 1 (25.10.2026): `scripts/cluster-check.sh` — Plattenplatz aller Knoten per Rundgang von ph-monitor, SSH-Schlüssel ohne Passwortabfrage (zwei Stolpersteine dokumentiert: altes Schloss, Passphrase)
 
+- [x] Ansible Stufe 0 (23./24.11.2026): Mac als Steuerknoten (`pipx install --include-deps ansible`), Inventory mit Gruppen `patroni` / `monitoring`, `ansible.cfg`, `group_vars/all.yml`; SSH-Schlüssel mit Passphrase über ssh-agent und macOS-Schlüsselbund — drei Stolpersteine dokumentiert: falscher Arbeitsordner (`config file = None`), leere Dateien, `Permission denied (publickey,password)` ([Teil 19](./PostgreSQL_und_Patroni_Tutorial.md#teil-19--ansible-der-dirigent-für-den-cluster))
+
 ### 🔜 Als Nächstes
 
+- [ ] **Ansible Stufe 1 — Cluster per Playbook verwalten:** öffentlichen Schlüssel mit `ssh-copy-id` verteilen, `ansible all -m ping` grün; danach ein Playbook für Grundpakete und Updates, Benutzer und SSH-Schlüssel, Verteilen von Backup-Skripten und Cronjobs sowie eine Prüfung, ob PostgreSQL und Patroni laufen. Updates rollierend: Replicas zuerst, Leader erst nach `patronictl switchover`. Bewusst **kein** Neuaufbau von Patroni mit Ansible
 - [ ] 🔴 **TLS Etappe 1 — Datenbankverbindungen verschlüsseln:** eigene CA, Server-Zertifikate für alle drei Knoten, `ssl = on` per `patronictl edit-config`, `hostssl` in `pg_hba.conf`, `postgres_exporter` von `sslmode=disable` auf verschlüsselte Verbindung umstellen. Rollierend, ohne Leader-Wechsel am Ende
 - [ ] 🔴 **TLS Etappe 2 — Cluster-Kommunikation verschlüsseln:** etcd Peer- und Client-Verkehr sowie Patroni-REST-API auf HTTPS, HAProxy-Health-Check auf HTTPS umstellen. Knoten für Knoten, mit Quorum-Prüfung nach jedem Schritt (`etcdctl endpoint health`), weil ein Fehler bei etcd die Leader-Wahl kosten kann
 - [ ] Zentrales WAL-Archiv mit Aufbewahrungsregel (pgBackRest) und `restore_command` — Befund 20.10.2026: lokales Archiv lief auf dem Leader zweimal fast voll; PITR bis dahin bewusst ausgesetzt (nur Testdaten)
@@ -221,7 +225,7 @@ Dieses Lab ist ein lebendes Projekt — der Cluster steht, die Grundlagen sind d
 | 1 | **Alerting** | Alertmanager-Regeln (Leader weg, Lag zu hoch, Archivierung fehlgeschlagen) statt Dashboards beobachten |
 | 2 | **Connection Pooling** | PgBouncer vor HAProxy schalten — reduziert Verbindungs-Overhead bei vielen Clients |
 | 3 | **Sicherheitshärtung** | 🔧 begonnen (Dateirechte `patroni.yml`, Exporter-Config) — offen: 🔴 **TLS in zwei Etappen (siehe „Als Nächstes“)**, `keepalived.conf`, `pg_hba.conf` Restriktionen, BSI IT-Grundschutz |
-| 4 | **Automatisierung mit Ansible** | Cluster-Aufbau als Ansible-Rolle — reproduzierbar statt Schritt-für-Schritt von Hand |
+| 4 | **Automatisierung mit Ansible** | 🔧 begonnen 24.11.2026 ([Teil 19](./PostgreSQL_und_Patroni_Tutorial.md#teil-19--ansible-der-dirigent-für-den-cluster)): zuerst Betrieb per Playbook (Pakete, Benutzer, Skripte, Dienst-Prüfung); später Cluster-Aufbau als Ansible-Rolle — reproduzierbar statt Schritt-für-Schritt von Hand |
 | 5 | **Read-only Load Balancing** | Replicas über separaten HAProxy-Port (z.B. `5433`) für Leseabfragen nutzen |
 | 6 | ~~**Switchover vs. Failover**~~ ✅ | erledigt 19./20.10.2026: Failover unter Last ≈ 35 s ohne Leader, Switchover wenige Sekunden; alter Leader nach Switchover sofort `streaming`, nach Stromausfall Crash-Recovery + `pg_rewind` ([Teil 17.13](./PostgreSQL_und_Patroni_Tutorial.md)) |
 | 7 | **pg_upgrade** | Versionswechsel (z.B. PostgreSQL 16 → 17) im laufenden Cluster dokumentieren |
