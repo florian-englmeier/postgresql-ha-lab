@@ -5031,6 +5031,526 @@ ssh florian@192.168.178.201 "echo 'Schlüssel $KEY liegt auf' \$HOSTNAME"
 
 ---
 
+## Teil 19 — Ansible: der Dirigent für den Cluster
+
+> Ziel: den Cluster (ph-node1–3, ph-monitor) per **Playbook** verwalten — Grundpakete und Updates, Benutzer und SSH-Schlüssel, Backup-Skripte und Cronjobs verteilen, prüfen, ob PostgreSQL und Patroni laufen. **Bewusst klein:** kein Neuaufbau von Patroni mit Ansible. Anlass: Ausschreibungen verlangen Linux-Automatisierung mit Shell, Python **und Ansible** (z. B. PTB, Linux-Systemadministration HPC, Bewerbung 23.11.2026).
+
+### 19.1 Warum Ansible, wenn es Shell-Skripte gibt?
+
+Der Hausmeister-Rundgang aus Teil 18 **schaut nach**. Sobald etwas **verändert** werden soll (Paket installieren, Datei verteilen, Dienst neu starten), wird ein Shell-Skript schnell unübersichtlich: Ist das Paket schon da? Ist die Datei schon aktuell? Was, wenn das Skript zweimal läuft? Ansible beschreibt stattdessen den **Zielzustand** („Paket X ist installiert“) und prüft selbst, ob dafür etwas zu tun ist (Idempotenz, siehe 19.2).
+
+**Metapher — der Dirigent:** Ansible ist ein Dirigent, der **nicht im Orchestergraben sitzt**. Er ruft jeden Musiker per Telefon (**SSH**) an und gibt ihm Anweisungen. Die Musiker brauchen kein eigenes Ansible — sie müssen nur ans Telefon gehen (SSH-Zugang) und Noten lesen können (**Python**). Das nennt man **agentless**.
+
+| Begriff | Im Orchester | Bei mir |
+|---|---|---|
+| Steuerknoten (Control Node) | der Dirigent | mein Mac |
+| verwaltete Knoten (Managed Nodes) | die Musiker | ph-node1–3, ph-monitor |
+| SSH | das Telefon | Benutzer `florian`, Schlüssel `~/.ssh/id_ed25519` |
+| Python auf dem Knoten | Noten lesen können | `/usr/bin/python3` (bringt Ubuntu 24.04 mit) |
+| Inventory (`hosts.yml`) | die Besetzungsliste: wer, unter welcher Nummer, in welcher Gruppe | 4 Hosts, Gruppen `patroni` und `monitoring` |
+| `group_vars` | Aushang am schwarzen Brett für eine Gruppe | „alle melden sich als florian“ |
+| `ansible.cfg` | Notizbuch des Dirigenten | wo die Liste liegt, wie telefoniert wird |
+| Playbook | die Partitur | folgt in 19.9 |
+| pipx-venv | eigener Proberaum des Dirigenten | Ansible stört keine anderen Python-Projekte |
+
+> **Merksatz:** Ansible ist **agentless**: Auf den Knoten braucht es nur **SSH + Python**, kein eigenes Programm. Ein Windows-Rechner kann kein Steuerknoten sein, ein Mac oder Linux-Rechner schon.
+
+### 19.2 Steuerknoten einrichten: Ansible auf dem Mac (Verifiziert 23.11.2026)
+
+```bash
+brew install pipx
+pipx ensurepath
+pipx install --include-deps ansible
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `brew install pipx` | Homebrew installiert **pipx** — ein Werkzeug, das Python-Programme jeweils in ein **eigenes venv** installiert |
+| `pipx ensurepath` | trägt `~/.local/bin` (dort legt pipx die Programme ab) in den `PATH` ein; danach Terminal neu öffnen |
+| `pipx install ansible` | legt ein venv an und installiert das Paket `ansible` = `ansible-core` (die Engine) + Sammlung der Standardmodule (Collections) |
+| `--include-deps` | macht auch die Programme der **Abhängigkeiten** aufrufbar — ohne den Schalter fehlen `ansible-playbook`, `ansible-inventory` usw., weil sie technisch zu `ansible-core` gehören |
+
+**Alternative:** `brew install ansible` — einfacher, aber weniger Kontrolle über die Version. pipx ist die bessere Geschichte fürs Gespräch: *isolierte Toolchain*.
+
+**Was brew dabei mitinstalliert hat (Ausgabe vom 23.11.2026):**
+
+| Paket | Warum |
+|---|---|
+| `pipx 1.18.19` | das eigentliche Werkzeug |
+| `python@3.15` (neu) | pipx ist selbst ein Python-Programm und bekommt von brew ein eigenes Python; Ansible läuft im venv auf genau diesem |
+| `openssl@4` (neu) | Krypto-Bibliothek für dieses Python (HTTPS, z. B. pip-Downloads) |
+| `ca-certificates`, `sqlite`, `lz4` (Upgrade) | Liste vertrauenswürdiger Zertifizierungsstellen bzw. kleine Bibliotheken, die Python mitbenutzt |
+
+**Zwei Nebenwirkungen, die man kennen sollte:**
+
+- **`/opt/homebrew/bin/python3` zeigt jetzt auf 3.15** („These files were overwritten during the brew link step“, Sicherung in `~/Library/Caches/Homebrew/Backup`). Bei mir praktisch folgenlos: Conda `(base)` steht im `PATH` weiter vorn, und bestehende venvs merken sich ihren eigenen Interpreter. Prüfen mit `which -a python3` (`which` = welche Datei wird bei diesem Befehl ausgeführt, `-a` = **alle** Treffer im `PATH` in Reihenfolge; der erste gewinnt).
+- **`openssl@3` wurde abgeklinkt** („Unlinking … 6570 symlinks removed“). Von brew installierte Programme finden ihre OpenSSL über feste Pfade — betroffen wäre nur, was man selbst gegen `/opt/homebrew/lib/libssl…` kompiliert.
+
+**Warnung am Rande** („The following taps are not trusted: jeffreywildman/virt-manager“): hat mit pipx nichts zu tun. Ein **Tap** ist eine Paketquelle von Dritten; neuere brew-Versionen verlangen, dass man ihr ausdrücklich vertraut (`brew trust <besitzer>/<repo>`) oder sie austrägt (`brew untap <besitzer>/<repo>`). pipx kommt aus dem offiziellen `homebrew/core`.
+
+**Falls Ansible mit Python 3.15 einmal klemmt** (sehr neue Version):
+
+```bash
+pipx reinstall --python python3.14 ansible
+```
+
+`reinstall` baut das venv komplett neu, `--python` bestimmt den Interpreter (muss installiert sein).
+
+**Idempotenz, live gesehen (24.11.2026):** Dieselben drei Befehle ein zweites Mal ausgeführt — Ergebnis: „pipx 1.18.19 is already installed“, „already in PATH“, „'ansible' (15.0.0) is already installed. Not modifying existing installation“. Kein Fehler, sondern Absicht: Ist der Zielzustand schon erreicht, ändert das Werkzeug nichts.
+
+> **Merksatz:** **Idempotent** = beliebig oft ausführbar, das Ergebnis bleibt gleich. Wie der **Lichtschalter auf „aus“, wenn das Licht schon aus ist**. Das ist das Herzstück von Ansible.
+
+### 19.3 `ansible --version` lesen (Verifiziert 24.11.2026)
+
+```
+ansible [core 2.22.0]
+  config file = None
+  configured module search path = ['/Users/florianenglmeier/.ansible/plugins/modules', '/usr/share/ansible/plugins/modules']
+  ansible python module location = /Users/florianenglmeier/Library/Application Support/pipx/venvs/ansible/lib/python3.15/site-packages/ansible
+  ansible collection location = /Users/florianenglmeier/.ansible/collections:/usr/share/ansible/collections
+  executable location = /Users/florianenglmeier/.local/bin/ansible
+  python version = 3.15.2 (main, Oct 25 2026, 16:57:51) [Clang 21.0.0 (clang-2100.3.34.2)] (/Users/florianenglmeier/Library/Application Support/pipx/venvs/ansible/bin/python)
+  jinja version = 3.1.6
+  pyyaml version = 6.0.4 (with libyaml v0.2.6)
+```
+
+| Zeile | Bedeutung |
+|---|---|
+| `ansible [core 2.22.0]` | Version der **Engine** `ansible-core`. „15.0.0“ (bei pipx) ist die Version des **Gesamtpakets** = Engine + Collections |
+| `config file = None` | keine `ansible.cfg` gefunden — richtig, solange man nicht im Projektordner steht (siehe 19.6) |
+| `configured module search path` | wo Ansible selbst geschriebene Module suchen würde — für uns uninteressant |
+| `ansible python module location` | der Ansible-Code liegt im pipx-venv ✅ |
+| `ansible collection location` | dort landen Collections, die man später mit `ansible-galaxy` installiert (z. B. `community.postgresql`) |
+| `executable location = ~/.local/bin/ansible` | der Befehl `ansible` ist die pipx-Version (nicht Conda, nicht brew) ✅ |
+| `python version = 3.15.2 (…/venvs/ansible/bin/python)` | Python des **Steuerknotens** (Mac) |
+| `jinja version` | **Jinja** = Template-Sprache für Variablen wie `{{ ansible_host }}` in Dateien |
+| `pyyaml version … (with libyaml)` | **PyYAML** liest die YAML-Dateien; „with libyaml“ = schneller C-Parser aktiv |
+
+> **Merke:** **Zwei Pythons.** Das auf dem Mac betreibt Ansible selbst. Das auf jedem Knoten (`/usr/bin/python3`) führt dort die Module aus. Ansible schickt die Module per SSH hin, ausgeführt werden sie mit dem Python des Knotens.
+
+### 19.4 Ordnerstruktur im Repo
+
+```
+postgresql-ha-lab/
+└── ansible/
+    ├── ansible.cfg
+    ├── inventory/
+    │   ├── hosts.yml
+    │   └── group_vars/
+    │       └── all.yml
+    └── playbooks/        ← folgt
+```
+
+```bash
+cd ~/nextcloud/Documents/Programming/GitHub/postgresql-ha-lab
+mkdir -p ansible/inventory/group_vars ansible/playbooks
+cd ansible
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `cd <pfad>` | ins **Repo** wechseln (der Ordner mit `.git`, nicht der alte Arbeitsordner) |
+| `mkdir` | Verzeichnisse anlegen |
+| `-p` (*parents*) | fehlende Zwischenordner gleich mit anlegen; existiert ein Ordner schon, **kein Fehler** (auch idempotent) |
+| zwei Argumente | zwei Pfade in einem Befehl |
+| `cd ansible` | ab hier **immer** aus diesem Ordner arbeiten — Ansible liest die `ansible.cfg` im aktuellen Verzeichnis |
+
+### 19.5 Das Inventory: `inventory/hosts.yml` (Verifiziert 24.11.2026)
+
+```yaml
+all:
+  children:
+    patroni:
+      hosts:
+        ph-node1:
+          ansible_host: 192.168.178.201
+        ph-node2:
+          ansible_host: 192.168.178.202
+        ph-node3:
+          ansible_host: 192.168.178.203
+    monitoring:
+      hosts:
+        ph-monitor:
+          ansible_host: 192.168.178.204
+```
+
+| Zeile | Bedeutung | Im Orchester |
+|---|---|---|
+| `all:` | oberste Ebene; jeder Host gehört automatisch zu `all` | das ganze Orchester |
+| `children:` | unter `all` gibt es Untergruppen | |
+| `patroni:` | Gruppe, Name frei gewählt | die Streicher |
+| `hosts:` | Liste der Mitglieder dieser Gruppe | |
+| `ph-node1:` | Name, unter dem Ansible den Rechner kennt — erscheint in allen Ausgaben | Name des Musikers |
+| `ansible_host: 192.168.178.201` | Adresse, unter der Ansible ihn per SSH erreicht | seine Telefonnummer |
+| `monitoring:` | zweite Gruppe mit ph-monitor | das Tonstudio, das zuhört |
+
+**Warum Gruppen?** Später gezielt: „Prüfe Patroni **nur** auf `patroni`“ — auf ph-monitor läuft kein Patroni.
+
+**Warum die VIP 192.168.178.200 nicht im Inventory steht:** Sie wandert zwischen den Knoten. Je nach Zustand landet man auf einem anderen Rechner — und dieselbe Maschine würde womöglich doppelt bearbeitet.
+
+> **Merke:** In YAML entscheidet die **Einrückung**, was wozu gehört — immer **zwei Leerzeichen pro Ebene, keine Tabs**. Steht `ph-node1` ein Leerzeichen zu weit links, gehört er zu einer anderen Ebene.
+
+Prüfen, ob Ansible die Liste lesen kann (verbindet sich mit **niemandem**):
+
+```bash
+ansible-inventory -i inventory/hosts.yml --graph
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `ansible-inventory` | liest das Inventory nur ein und zeigt es an |
+| `-i <pfad>` (*inventory*) | Pfad zur Besetzungsliste, relativ zum aktuellen Ordner |
+| `--graph` | Gruppen als Baum anzeigen |
+
+Echte Ausgabe:
+
+```
+@all:
+  |--@ungrouped:
+  |--@patroni:
+  |  |--ph-node1
+  |  |--ph-node2
+  |  |--ph-node3
+  |--@monitoring:
+  |  |--ph-monitor
+```
+
+**Interpretation:** `@` = Gruppe, ohne `@` = Host. `ungrouped` ist eine eingebaute Gruppe für Hosts ohne eigene Gruppe — bei mir leer, und das ist richtig.
+
+### 19.6 Das Notizbuch: `ansible.cfg` (Verifiziert 24.11.2026)
+
+Ohne cfg muss bei jedem Befehl `-i inventory/hosts.yml` dazu. Die cfg ist das **Notizbuch des Dirigenten**: einmal notiert, wo die Liste liegt und wie telefoniert wird.
+
+```ini
+[defaults]
+inventory = inventory/hosts.yml
+forks = 4
+
+[ssh_connection]
+pipelining = True
+```
+
+Format: **INI**, nicht YAML — Abschnitte in `[eckigen Klammern]`, darunter `schlüssel = wert`; Einrückung egal.
+
+| Zeile | Bedeutung | Bild |
+|---|---|---|
+| `[defaults]` | Abschnitt für allgemeine Grundeinstellungen | |
+| `inventory = inventory/hosts.yml` | Pfad zur Besetzungsliste — ersetzt `-i …` | |
+| `forks = 4` | höchstens 4 Hosts gleichzeitig (Standard 5; bei 200 Servern wichtig) | der Dirigent telefoniert auf 4 Leitungen parallel |
+| `[ssh_connection]` | Abschnitt für alles rund um SSH | |
+| `pipelining = True` | Module direkt durch die offene SSH-Leitung schicken, statt sie erst als Datei hinzukopieren, auszuführen und zu löschen — spürbar schneller | Noten am Telefon diktieren statt per Post schicken |
+
+`host_key_checking` bleibt bewusst auf dem Standardwert (**an**): Abschalten ist ein beliebter Tutorial-Trick, im Gespräch bei einer Behörde aber ein Minuspunkt.
+
+Prüfen:
+
+```bash
+cat ansible.cfg
+ansible --version | grep "config file"
+ansible-inventory --graph
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `cat <datei>` | Inhalt ausgeben — zeigt, ob die Datei wirklich gespeichert ist |
+| `\|` (Pipe) | Ausgabe des ersten Befehls an den zweiten weiterleiten statt anzeigen |
+| `grep "config file"` | nur Zeilen zeigen, die diesen Text enthalten |
+| `ansible-inventory --graph` | wie vorher — diesmal **ohne `-i`** |
+
+Echte Ausgabe (Auszug): `config file = /Users/florianenglmeier/nextcloud/Documents/Programming/GitHub/postgresql-ha-lab/ansible/ansible.cfg` und derselbe Baum wie in 19.5 — der Pfad zur Liste kommt jetzt aus der cfg.
+
+> **Merke:** Die `ansible.cfg` wirkt **nur, wenn man im Ordner `ansible/` steht**. Ansible sucht sie im aktuellen Verzeichnis, nicht in übergeordneten Ordnern.
+
+### 19.7 Der Aushang: `inventory/group_vars/all.yml` (Verifiziert 24.11.2026)
+
+Ansible weiß jetzt, **wen** es anruft — aber nicht, **als wer** es sich meldet. Ohne Angabe nimmt es den Mac-Benutzernamen `florianenglmeier`, den es auf den VMs nicht gibt.
+
+```yaml
+ansible_user: florian
+ansible_python_interpreter: /usr/bin/python3
+```
+
+| Zeile | Bedeutung |
+|---|---|
+| `ansible_user: florian` | Benutzername für die SSH-Anmeldung — intern dasselbe wie `ssh florian@192.168.178.201` |
+| `ansible_python_interpreter: /usr/bin/python3` | welches Python die Module **auf dem Knoten** verwenden (Ubuntu-Python, nicht das 3.15 vom Mac); ohne die Zeile sucht Ansible selbst und gibt eine Warnung aus |
+
+**Namenskonvention:** Ansible schaut automatisch in `group_vars/` **neben** der `hosts.yml`. Eine Datei `all.yml` gilt für die Gruppe `all`; eine `patroni.yml` würde nur für die Gruppe `patroni` gelten. Der Dateiname muss **genau dem Gruppennamen** entsprechen.
+
+Prüfen, welche Variablen für einen Host gelten (keine Verbindung):
+
+```bash
+ansible-inventory --host ph-node1
+```
+
+Echte Ausgabe:
+
+```json
+{
+    "ansible_host": "192.168.178.201",
+    "ansible_python_interpreter": "/usr/bin/python3",
+    "ansible_user": "florian"
+}
+```
+
+**Interpretation:** drei Variablen aus **zwei Dateien** — `ansible_host` aus `hosts.yml` (Telefonnummer), die anderen beiden aus `group_vars/all.yml` (Aushang). Ansible führt sie pro Host zu einem Paket zusammen. Die Ausgabe ist JSON: intern wandelt Ansible alles in diese Struktur um, egal ob die Quelle YAML oder INI war.
+
+### 19.8 Der erste Anruf: `ansible all -m ping`
+
+```bash
+ansible all -m ping
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `ansible` | Befehl für **einzelne Ad-hoc-Aufgaben** ohne Playbook — eine kurze Anweisung in den Raum statt einer ganzen Partitur |
+| `all` | Ziel: alle Hosts. Alternativ `patroni`, `monitoring` oder ein einzelner Name wie `ph-node1` |
+| `-m ping` (*module*) | das Modul `ping` |
+
+**Verwechslungsgefahr:** Das ist **nicht** der Shell-`ping`. Der schickt nur ein Netzwerkpaket (ICMP). Das Ansible-`ping` meldet sich (1) per **SSH** als `florian` an, startet (2) `/usr/bin/python3` und lässt (3) ein winziges Python-Programm mit `pong` antworten. Ein grünes `pong` beweist also auf einmal: erreichbar, Anmeldung klappt, Python läuft — der Musiker geht ans Telefon, erkennt den Anrufer und kann Noten lesen.
+
+Erwartete Erfolgsausgabe je Host:
+
+```
+ph-node1 | SUCCESS => {
+    "changed": false,
+    "ping": "pong"
+}
+```
+
+`"changed": false` = auf dem Knoten wurde nichts verändert. Diese Zeile steht später bei jeder Aufgabe — sie ist die sichtbare Seite der Idempotenz.
+
+**Typische Fehler und was sie bedeuten:**
+
+| Meldung | Ursache |
+|---|---|
+| `UNREACHABLE … Permission denied (publickey,password)` | Knoten erreichbar, aber kein passender SSH-Schlüssel — Ansible kann kein Passwort tippen |
+| `UNREACHABLE … Connection timed out` | VM aus oder nicht erreichbar |
+| `Host key verification failed` | mit diesem Knoten noch nie per SSH verbunden (Host-Key fehlt in `known_hosts`) |
+
+### 19.9 SSH-Schlüssel für den Mac
+
+Beim ersten Ping kam auf allen vier Knoten `Permission denied (publickey,password)` (siehe Stolperstein 3). Bisher lief die Anmeldung vom Mac per **Passwort** — für mich am Terminal kein Problem, aber Ansible soll ohne Rückfragen arbeiten.
+
+**Metapher:** Bisher habe ich am Telefon jedes Mal das Kennwort gesagt. Jetzt hinterlege ich bei jedem Musiker einmalig mein **Foto** (öffentlicher Schlüssel) — dann erkennt er mich am **Gesicht** (privater Schlüssel), das nur ich habe. In Teil 18 hieß dasselbe Prinzip **Schloss** (`.pub`, darf man verteilen) und **Schlüssel** (privat, nie weitergeben).
+
+#### Schritt 1: Gibt es schon einen Schlüssel? (24.11.2026)
+
+```bash
+ls -l ~/.ssh/
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `ls` | Inhalt eines Ordners auflisten |
+| `-l` (*long*) | ausführlich: Rechte, Besitzer, Größe, Datum |
+| `~/.ssh/` | versteckter SSH-Ordner im Home-Verzeichnis (der Punkt macht ihn im Finder unsichtbar) |
+
+Echte Ausgabe:
+
+```
+drwx------  3 florianenglmeier  staff    96 23 Nov. 09:20 agent
+-rw-------  1 florianenglmeier  staff  7865  1 Nov. 09:44 known_hosts
+-rw-------  1 florianenglmeier  staff  8609  1 Nov. 00:04 known_hosts.old
+```
+
+**Interpretation:** **kein Schlüsselpaar** → Ansible hatte nichts, was es vorzeigen konnte. `known_hosts` = Server, die **ich** kenne (die Gegenrichtung). `agent` ist ein Ordner eines anderen Programms, kein Schlüssel.
+
+**Die Rechte-Spalte lesen** (10 Zeichen):
+
+| Position | Bedeutung | Beispiel `-rw-------` |
+|---|---|---|
+| 1 | Typ: `d` = Ordner, `-` = Datei | `-` |
+| 2–4 | Rechte **Besitzer** (r = lesen, w = schreiben, x = ausführen bzw. bei Ordnern hineinwechseln) | `rw-` |
+| 5–7 | Rechte **Gruppe** | `---` |
+| 8–10 | Rechte **alle anderen** | `---` |
+
+> **Merke:** SSH ist streng: Sind private Schlüssel oder die config für andere lesbar bzw. beschreibbar, verweigert SSH die Arbeit oder ignoriert die Datei.
+
+#### Schritt 2: Schlüsselpaar erzeugen (Verifiziert 24.11.2026)
+
+```bash
+ssh-keygen -t ed25519 -C "florian@macbook ansible"
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `ssh-keygen` | erzeugt Schlüsselpaare |
+| `-t ed25519` (*type*) | Verfahren: modern, sicher, kurze Schlüssel (ältere Anleitungen: RSA — geht, ist größer und langsamer) |
+| `-C "…"` (*comment*) | Kommentar am Ende des öffentlichen Schlüssels, **ohne** technische Wirkung — hilft, in `authorized_keys` zu erkennen, wessen Schlüssel das ist |
+
+Zwei Rückfragen:
+
+1. **Speicherort** (`Enter file in which to save the key`): Enter = Standard `~/.ssh/id_ed25519`, dort sucht SSH automatisch.
+2. **Passphrase:** entschieden für **Option A — Passphrase setzen**. Der private Schlüssel liegt verschlüsselt auf der Platte; ein gestohlener Mac nützt niemandem. Die Passphrase wandert in den macOS-Schlüsselbund (Schritt 3), damit sie nicht ständig getippt werden muss. Option B (leer) wäre im Heimlabor vertretbar, im Gespräch bei einer Behörde ein Minuspunkt. Beim Tippen erscheinen **keine Zeichen, auch keine Sternchen** — normal. Das Zeichenbild am Ende (*randomart*) ist nur eine optische Darstellung, ignorierbar.
+
+Ergebnis:
+
+```
+-rw-------  1 florianenglmeier  staff   464 24 Nov. 17:07 id_ed25519
+-rw-r--r--  1 florianenglmeier  staff   105 24 Nov. 17:07 id_ed25519.pub
+```
+
+| Datei | Rechte | Bedeutung |
+|---|---|---|
+| `id_ed25519` | `-rw-------` | **privat** — verlässt nie den Mac (Gesicht / Schlüssel) |
+| `id_ed25519.pub` | `-rw-r--r--` | **öffentlich** — darf überallhin (Foto / Schloss) |
+
+**Nebenbei:** Die Größe verrät die Passphrase. **464 Bytes** ist typisch für einen *verschlüsselten* Ed25519-Schlüssel, unverschlüsselt sind es etwa 410. Sicher prüfen: `ssh-keygen -y -f ~/.ssh/id_ed25519` (`-y` = aus dem privaten den öffentlichen Schlüssel ausgeben, dafür muss SSH ihn öffnen; `-f` = welche Datei). Fragt der Befehl nach der Passphrase → verschlüsselt. Harmloser Test, ändert nichts.
+
+#### Schritt 3: Passphrase in den Schlüsselbund (Verifiziert 24.11.2026)
+
+Ohne diesen Schritt fragt Ansible bei jeder Verbindung nach der Passphrase — bei vier VMs viermal.
+
+```bash
+ssh-add --apple-use-keychain ~/.ssh/id_ed25519
+ssh-add -l
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `ssh-add` | übergibt einen Schlüssel an den **ssh-agent**: ein Hintergrundprogramm, das den entsperrten Schlüssel im Arbeitsspeicher hält |
+| `--apple-use-keychain` | **nur macOS:** Passphrase zusätzlich im Schlüsselbund speichern (auf Linux gibt es den Schalter nicht) |
+| `~/.ssh/id_ed25519` | der Schlüssel, der übergeben wird |
+| `ssh-add -l` (*list*) | zeigt, welche Schlüssel der Agent gerade bereithält |
+
+**Metapher:** Der ssh-agent ist der **Assistent des Dirigenten**, der das aufgesperrte Fotoalbum bereithält, solange der Mac läuft. Die Passphrase ist das **Schloss am Album**, der Schlüsselbund der **Tresor**, aus dem macOS das Schloss aufsperrt, sobald ich am Mac angemeldet bin.
+
+Echte Ausgabe:
+
+```
+Enter passphrase for /Users/florianenglmeier/.ssh/id_ed25519:
+Identity added: /Users/florianenglmeier/.ssh/id_ed25519 (florian@macbook ansible)
+256 SHA256:hDjae4esrlySOXNFAEfgjL2s5C+yZVUvLsHBFefeS/w florian@macbook ansible (ED25519)
+```
+
+| Teil der letzten Zeile | Bedeutung |
+|---|---|
+| `256` | Schlüssellänge in Bit (Ed25519 immer 256) |
+| `SHA256:…` | **Fingerabdruck**: kurze Prüfsumme des Schlüssels — damit lässt sich auf einer VM vergleichen, ob dort wirklich mein Schlüssel liegt. Nicht geheim; geheim ist nur die Datei `id_ed25519` |
+| `(… ED25519)` | Kommentar und Typ |
+
+#### Schritt 4: Merken über Neustarts hinweg — `~/.ssh/config`
+
+Der Agent lebt nur im Arbeitsspeicher; nach einem Neustart ist das Album wieder zu. Die Passphrase liegt zwar im Schlüsselbund, aber SSH holt sie dort nur, wenn man es ihm sagt.
+
+```bash
+cat > ~/.ssh/config <<'EOF2'
+Host *
+  AddKeysToAgent yes
+  UseKeychain yes
+  IdentityFile ~/.ssh/id_ed25519
+EOF2
+chmod 600 ~/.ssh/config
+```
+
+*(Im Terminal heißt die Endmarke einfach `EOF` — hier im Tutorial `EOF2`, damit sie sich nicht mit dem Tutorial-Quelltext beißt. Der Name ist frei wählbar.)*
+
+**Das Heredoc** (*here document*) — praktisch für mehrzeilige Dateien direkt im Terminal, beim Shell-Scripting ständig im Einsatz:
+
+| Teil | Bedeutung |
+|---|---|
+| `cat` | gibt aus, was es bekommt |
+| `>` | Ausgabe in eine Datei umleiten — **überschreibt** die Datei (zum Anhängen: `>>`) |
+| `<<'EOF'` | alles ab der nächsten Zeile ist Eingabe, bis eine Zeile kommt, die **nur** `EOF` enthält; `EOF` (*end of file*) ist eine frei gewählte Markierung |
+| `'…'` um die Endmarke | die Shell ersetzt im Text **nichts** — `~` und `$…` landen wörtlich in der Datei |
+
+**`chmod 600`:**
+
+| Teil | Bedeutung |
+|---|---|
+| `chmod` (*change mode*) | Rechte ändern |
+| `600` | Zahlenform, eine Ziffer pro Gruppe (Besitzer, Gruppe, andere); lesen = 4, schreiben = 2, ausführen = 1, addiert. `6` = 4+2 = lesen + schreiben für mich, `0` = nichts für Gruppe, `0` = nichts für andere → `-rw-------` |
+
+**Inhalt der config:**
+
+| Zeile | Bedeutung |
+|---|---|
+| `Host *` | gilt für **alle** Ziele (`*` = Platzhalter); `Host ph-*` gälte nur für die Cluster-Knoten |
+| `AddKeysToAgent yes` | einmal entsperrt → automatisch an den Agent übergeben, kein `ssh-add` von Hand mehr |
+| `UseKeychain yes` | **nur macOS:** Passphrase aus dem Schlüsselbund holen, ohne zu tippen |
+| `IdentityFile ~/.ssh/id_ed25519` | welcher Schlüssel verwendet wird (wäre ohnehin Standard, steht aber ausdrücklich da) |
+
+Die Einrückung dient nur der Lesbarkeit — SSH ist sie egal (anders als YAML).
+
+Prüfen (Verifiziert 24.11.2026):
+
+```bash
+ls -l ~/.ssh/config
+cat ~/.ssh/config
+```
+
+Echte Ausgabe:
+
+```
+-rw-------  1 florianenglmeier  staff  79 24 Nov. 17:14 /Users/florianenglmeier/.ssh/config
+Host *
+  AddKeysToAgent yes
+  UseKeychain yes
+  IdentityFile ~/.ssh/id_ed25519
+```
+
+**Interpretation:** Rechte `-rw-------` wie gewollt, vier Zeilen wörtlich angekommen — `~` steht unverändert drin, weil die Endmarke in Anführungszeichen stand.
+
+*Stand 24.11.2026: Als Nächstes den öffentlichen Schlüssel mit `ssh-copy-id` auf die vier VMs verteilen, dann erneut `ansible all -m ping`.*
+
+### 19.10 Stolpersteine (live 24.11.2026)
+
+**Stolperstein 1 — falscher Ordner (zweimal passiert)**
+
+```
+config file = None
+[WARNING]: No inventory was parsed, only implicit localhost is available
+[WARNING]: Could not match supplied host pattern, ignoring: ph-node1
+cat: inventory/group_vars/all.yml: No such file or directory
+```
+
+- **Ursache:** Ich stand zum Bearbeiten in `ansible/inventory/group_vars` (Prompt endete auf `group_vars %`). Ansible sucht die `ansible.cfg` nur im **aktuellen** Ordner → keine cfg → keine Besetzungsliste → kennt nur `localhost` und keinen ph-node1. Relative Pfade wie `inventory/…` werden ebenfalls vom aktuellen Ordner aus gesucht.
+- **Bild:** Das Notizbuch liegt auf dem Pult, der Dirigent steht im Nebenraum.
+- **Fix:** `pwd` (*print working directory* — wo stehe ich?), dann mit **absolutem** Pfad zurück: `cd ~/nextcloud/Documents/Programming/GitHub/postgresql-ha-lab/ansible` (beginnt mit `~`, funktioniert deshalb von überall).
+- **Vorbeugung:** Dateien vom Ordner `ansible/` aus öffnen, ohne hineinzuwechseln: `open -e inventory/group_vars/all.yml` (`open` = macOS-Öffnen, `-e` = mit TextEdit) oder `code inventory/group_vars/all.yml` (VS Code).
+
+> **Merksatz:** Sagt Ansible plötzlich **„No inventory“**, zuerst mit `pwd` prüfen, wo ich stehe.
+
+**Stolperstein 2 — Dateien angelegt, aber leer**
+
+- **Ursache:** Die drei Dateien existierten, waren aber noch nicht gespeichert bzw. befüllt.
+- **Fix/Vorbeugung:** Nach jedem Anlegen `cat <datei>` — kommt nichts, ist die Datei leer.
+
+**Stolperstein 3 — `Permission denied (publickey,password)` auf allen vier Knoten**
+
+```
+ph-node1 | UNREACHABLE! => {
+    "changed": false,
+    "msg": "Task failed: Data could not be sent to remote host \"192.168.178.201\". Make sure this host can be reached over ssh: florian@192.168.178.201: Permission denied (publickey,password).",
+    "unreachable": true
+}
+```
+
+- **Was die Meldung trotzdem beweist:** Alle vier VMs sind **erreichbar** (sonst `Connection timed out`), SSH läuft, die Host-Keys sind bekannt (sonst `Host key verification failed`). Nur die **Anmeldung** scheitert. Bild: Das Telefon klingelt, der Musiker geht ran, lässt den Anrufer aber nicht rein.
+- **`(publickey,password)`** = die Anmeldearten, die der Server anbietet. Ansible probiert einen Schlüssel — der Server kennt keinen von mir — und ein Passwort kann Ansible ohne weitere Angaben nicht tippen.
+- **Ursache:** Auf dem Mac gab es **gar kein Schlüsselpaar** (19.9, Schritt 1); bisher lief die Anmeldung per Passwort.
+- **Fix:** Schlüsselpaar erzeugen, in den Agent laden, `~/.ssh/config`, dann `.pub` per `ssh-copy-id` verteilen (19.9).
+
+> **Merke:** Rote Meldungen genau lesen: **„Permission denied“** ist ein *guter* Fehler — Netzwerk und SSH funktionieren, nur der Schlüssel fehlt.
+
+### 19.11 Kontrollfragen
+
+- **Warum muss Ansible auf ph-node1–3 nicht installiert werden — und was muss dort trotzdem vorhanden sein?** → Ansible ist agentless; nötig sind nur SSH-Zugang und Python (`/usr/bin/python3`).
+- **Was ist der Unterschied zwischen Shell-`ping` und `ansible -m ping`?** → Shell-`ping` prüft nur ICMP-Erreichbarkeit; Ansible-`ping` prüft SSH-Anmeldung + Python auf dem Knoten und antwortet mit `pong`.
+- **Warum steht die VIP 192.168.178.200 nicht im Inventory?** → Sie wandert zwischen den Knoten; man würde je nach Zustand einen anderen Rechner treffen bzw. einen doppelt bearbeiten.
+- **Woher kommen die drei Variablen bei `ansible-inventory --host ph-node1`?** → `ansible_host` aus `hosts.yml`, `ansible_user` und `ansible_python_interpreter` aus `group_vars/all.yml`.
+- **Warum muss die Datei `group_vars/all.yml` genau so heißen?** → Der Dateiname entspricht dem Gruppennamen (`all`); `patroni.yml` gälte nur für die Gruppe `patroni`.
+- **`config file = None` — was prüfe ich zuerst?** → Mit `pwd`, ob ich im Ordner `ansible/` stehe.
+- **Was bedeutet `"changed": false`?** → Auf dem Knoten wurde nichts verändert — sichtbare Seite der Idempotenz.
+- **Was ist ansible 15.0.0, was ist core 2.22.0?** → Gesamtpaket (Engine + Collections) vs. Engine `ansible-core`.
+- **Welche zwei Pythons sind beteiligt?** → Mac (betreibt Ansible, hier 3.15 im pipx-venv) und Knoten (`/usr/bin/python3`, führt die Module aus).
+- **Warum Passphrase + Schlüsselbund statt leerer Passphrase?** → Gestohlener Schlüssel ist ohne Passphrase nutzlos; der Schlüsselbund macht es trotzdem bequem.
+- **Was macht `<<'EOF'` und wozu die Anführungszeichen?** → Heredoc: mehrzeilige Eingabe bis zur Zeile `EOF`; die Anführungszeichen verhindern, dass die Shell `~` oder `$…` ersetzt.
+- **Was bedeutet `chmod 600`?** → Besitzer lesen + schreiben (4+2), Gruppe und andere nichts → `-rw-------`.
+
+---
+
 ## Anhang — Metaphern zum Wiederholen
 
 Jede Metapher in einer Zeile: **Fachbegriff → Metapher → kurze Erklärung.** Gesammelt aus dem Lab, damit sich die Zusammenhänge ohne Unterlagen rekonstruieren lassen.
@@ -5157,3 +5677,25 @@ Jede Metapher in einer Zeile: **Fachbegriff → Metapher → kurze Erklärung.**
 | `ssh-keygen -y` mehrfach | **Fieber zweimal messen** — Thermometer heilt nicht | „Testbefehl und Reparaturbefehl auseinanderhalten.“ |
 | `"…"` vs. `'…'` bei `ssh` | **Formular selbst ausfüllen vs. leer abschicken** — der Empfänger trägt seine Werte ein | „Die äußeren Anführungszeichen entscheiden, wer ausfüllt.“ |
 | unbekannte Variable = leer | **leeres Formularfeld, und keiner beschwert sich** | „Bash meckert bei unbekannten Variablen nicht — außer mit `set -u`.“ |
+
+### Ansible
+
+| Fachbegriff | Metapher | Kurz erklärt |
+|---|---|---|
+| Ansible (agentless) | **Dirigent, der nicht im Orchestergraben sitzt** und die Musiker anruft | „Auf den Knoten braucht es nur SSH und Python, kein eigenes Programm.“ |
+| SSH / Python auf dem Knoten | **Telefon** / **Noten lesen können** | „Geht der Musiker ran und kann er Noten lesen, kann er mitspielen.“ |
+| Inventory (`hosts.yml`) | **Besetzungsliste**: Name, Telefonnummer, Gruppe | „`ph-node1` ist der Name, `ansible_host` die Telefonnummer.“ |
+| Gruppen `patroni` / `monitoring` | **Streicher** / **Tonstudio, das zuhört** | „Gruppen erlauben gezielte Anweisungen an einen Teil des Orchesters.“ |
+| `group_vars/all.yml` | **Aushang am schwarzen Brett** | „Gilt für alle: wer anruft, meldet sich als florian.“ |
+| `ansible.cfg` | **Notizbuch auf dem Pult** des Dirigenten | „Wirkt nur, wenn man am Pult steht — also im Ordner `ansible/`.“ |
+| falscher Ordner → `config file = None` | **Dirigent im Nebenraum**, das Notizbuch liegt auf dem Pult | „No inventory? Erst `pwd`.“ |
+| `forks` | **auf mehreren Leitungen parallel telefonieren** | „Wie viele Hosts gleichzeitig bearbeitet werden.“ |
+| `pipelining` | **Noten am Telefon diktieren statt per Post schicken** | „Module direkt durch die SSH-Leitung, keine Zwischendatei.“ |
+| Playbook | **Partitur** | „Beschreibt, was gespielt wird — den Zielzustand.“ |
+| `ansible -m ping` | **Anruf: geht ran, erkennt mich, kann Noten lesen** | „Prüft SSH + Anmeldung + Python, nicht nur das Netz.“ |
+| `Permission denied (publickey,password)` | **Telefon klingelt, Musiker geht ran, lässt mich aber nicht rein** | „Guter Fehler: Netz und SSH gehen, nur der Schlüssel fehlt.“ |
+| pipx-venv | **eigener Proberaum des Dirigenten** | „Ansible stört keine anderen Python-Projekte.“ |
+| öffentlicher / privater Schlüssel | **Foto** / **Gesicht** (in Teil 18: Schloss / Schlüssel) | „Das Foto darf überallhin, das Gesicht hat nur einer.“ |
+| ssh-agent | **Assistent, der das aufgesperrte Album bereithält** | „Einmal entsperrt, solange der Mac läuft.“ |
+| Passphrase + Schlüsselbund | **Schloss am Album**, **Tresor**, den macOS beim Anmelden öffnet | „Sicher und trotzdem bequem.“ |
+| Idempotenz (pipx/Ansible) | **Lichtschalter auf „aus“, wenn das Licht schon aus ist** | „Zweimal ausführen ändert nichts — `changed: false`.“ |
