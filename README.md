@@ -85,13 +85,13 @@ Rollierendes Patchen aller drei Knoten: Der Leader wird per `patronictl switchov
 
 Neben den Community-Dashboards (Dutzende Panels zum Stöbern) ein selbst gebautes Dashboard, das eine Frage beantwortet: **Ist der Cluster gesund — und wenn nicht, wo klemmt es?** Oben links die Ampel für den Bereitschaftsdienst (`sum(patroni_primary)`: `OK` / `KEIN LEADER` / `SPLIT-BRAIN` / `KEINE DATEN`), daneben die Detailkurven für den DBA: Byte-Lag je Replica mit Warnlinie bei einem WAL-Segment (16 MiB), Cache-Hit-Ratio je Knoten mit Schwellen bei 95 / 99 %, Connections mit Warnlinie bei 80 % von `max_connections`. Dazu zwei Sensoren für Lasttest und Failover: Transaktionen pro Sekunde je Knoten und der Name des aktuellen Leaders, der beim Failover sichtbar wechselt. Aufbau, PromQL und Stolpersteine (Standard-Thresholds als „Immer-grün-Ampel“, Lag in Sekunden vs. Bytes, Rohwert vs. Anzeige) in [Teil 17.12](./PostgreSQL_und_Patroni_Tutorial.md#1712-eigenes-ha-dashboard).
 
----
-
 ### Live-Nachweis: Cluster per Ansible-Playbook geprüft
 
 ![Ansible-Playbook check-dienste.yml: Patroni auf allen drei Datenknoten aktiv, PLAY RECAP mit changed=0](./images/ansible-check-dienste.png)
 
 Statt dreimal einloggen ein Befehl vom Mac als Steuerknoten: `ansible-playbook playbooks/check-dienste.yml` prüft auf der Inventory-Gruppe `patroni`, ob der Dienst `patroni` läuft. Erst Syntaxprüfung (`--syntax-check`), dann der Lauf; `changed=0` im PLAY RECAP belegt, dass das Prüf-Playbook nichts verändert hat (`changed_when: false`). Aufbau von Inventory, `ansible.cfg`, SSH-Schlüsseln und Playbook sowie vier Stolpersteine in [Teil 19](./PostgreSQL_und_Patroni_Tutorial.md#teil-19--ansible-der-dirigent-für-den-cluster).
+
+---
 
 ## Tech-Stack
 
