@@ -5922,6 +5922,8 @@ Aufräumen: Die Übungsdatei `playbooks/experiment-rot.yml` wurde nach dem Exper
 | `inventory_hostname` | **eingebaute** Variable: Name des Hosts aus dem Inventory (`ph-node1` …) |
 | `patroni_status.stdout` | aus dem Zettel nur das Feld `stdout`; der **Punkt** greift auf ein Feld zu — in Python-Sprache: `patroni_status["stdout"]` (beide Schreibweisen erlaubt) |
 
+![check-dienste.yml mit register und debug: jeder Knoten meldet „patroni ist active“, PLAY RECAP ok=3, changed=0](./images/ansible-check-dienste-register-debug.png)
+
 Echte Ausgabe (Auszug):
 
 ```
