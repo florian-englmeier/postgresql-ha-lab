@@ -6109,6 +6109,150 @@ Echte Ausgabe:
 - **Warum REST-API statt `patronictl` im Playbook?** → keine Root-Rechte/Passwort nötig, dieselbe Quelle wie HAProxy.
 - **Woran sieht man in `patronictl list`, dass die Replicas aktuell sind?** → `streaming`, gleiche Timeline, Receive-/Replay-LSN gleich, Lag 0.
 
+### 19.16 Das erste verändernde Playbook: `become`, `--check` und Idempotenz (Verifiziert 25.11.2026)
+
+**Warum:** Zum ersten Mal **verändert** Ansible etwas auf den Knoten. Deshalb zuerst die zwei Sicherheitsgurte: Rechte bewusst holen (`become`) und erst probehalber laufen lassen (`--check`).
+
+**`become` — Root-Rechte:** Pakete installieren darf nur root; angemeldet wird als `florian`. Auf der Shell: `sudo` davor. In Ansible: `become: true` („werde root“). Das sudo-Passwort gibt man beim Start mit **`-K`** (`--ask-become-pass`) ein — einmal, für alle Knoten (setzt voraus, dass `florian` überall dasselbe Passwort hat). **Bild:** Der Musiker darf nicht einfach das Bühnenbild umbauen — dafür braucht er den **Schlüssel zum Requisitenraum**.
+
+**`--check` — Probelauf:** Ansible geht das Playbook durch, **ohne etwas zu ändern**, und meldet, **was es ändern würde**. **Bild:** die **Stellprobe** — alle gehen ihre Wege ab, niemand spielt einen Ton.
+
+> **Faustregel:** **Erst `--check`, dann echt.** (Typische Interviewfrage: „Wie testen Sie ein Playbook, bevor es auf Produktion läuft?“)
+
+`playbooks/pakete.yml` — Übungspaket `tree` (zeigt Ordner als Baum; berührt weder PostgreSQL noch Patroni):
+
+```yaml
+---
+- name: Grundpakete auf allen Knoten
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: tree ist installiert
+      ansible.builtin.apt:
+        name: tree
+        state: present
+```
+
+| Zeile | Bedeutung |
+|---|---|
+| `hosts: all` | alle vier Knoten, ph-monitor eingeschlossen |
+| `become: true` | alle Tasks dieses Plays laufen als root (wie `sudo`) |
+| `ansible.builtin.apt:` | Paketverwaltung unter Debian/Ubuntu (dasselbe Werkzeug wie `apt install`) |
+| `name: tree` | welches Paket |
+| `state: present` | **Zielzustand**: Paket soll vorhanden sein. Nicht „installiere“, sondern „es soll da sein“ — ist es schon da, tut Ansible nichts. Gegenstück: `state: absent` |
+
+**Task-Name als Zustand:** „tree ist installiert“, nicht „tree installieren“ — ein Playbook liest sich wie eine **Soll-Liste**.
+
+**Warum ungefährlich für den Cluster:** nur ein einzelnes Paket, **kein** `apt upgrade` — der `needrestart`-Mechanismus (startet nach Upgrades `patroni.service` neu, Teil 17.10) wird nicht ausgelöst.
+
+#### Lauf 1: Probelauf
+
+```bash
+ansible-playbook playbooks/pakete.yml --check -K
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `--check` | nichts ändern, nur melden |
+| `-K` | fragt einmal `BECOME password: <sudo-Passwort>` — sudo-Passwort von `florian` **auf den VMs** (nicht die SSH-Passphrase) |
+
+```
+TASK [tree ist installiert] ****************************************************
+changed: [ph-node1]
+changed: [ph-node2]
+changed: [ph-node3]
+changed: [ph-monitor]
+
+PLAY RECAP *********************************************************************
+ph-monitor                 : ok=1    changed=1    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+...
+```
+
+**Interpretation:** `changed` (gelb) heißt im Probelauf: **„würde ändern“** — `tree` fehlt überall. Kein `failed` → das sudo-Passwort passte auf allen vier Knoten.
+
+**Gegenprobe — hat der Probelauf wirklich nichts installiert?**
+
+```bash
+ansible all -a "which tree"
+```
+
+`-a` ohne `-m` = Modul `command`; `which tree` sucht das Programm im `PATH` des Knotens (gefunden → Pfad + Exit-Code 0; nicht gefunden → keine Ausgabe + Exit-Code 1).
+
+![Gegenprobe nach dem Probelauf: which tree liefert auf allen vier Knoten rc=1 — tree ist nicht installiert](./images/ansible-check-which-tree-rot.png)
+
+```
+ph-node1 | FAILED | rc=1 >>
+The command exited with a non-zero return code.
+...
+```
+
+**Interpretation:** überall `rc=1` → `tree` nicht vorhanden → **`--check` hat nichts verändert**. Ad-hoc-Format: eine kompakte Zeile pro Host; `Origin: <adhoc 'command' task>` statt Datei/Zeile.
+
+> **Merke:** Rot ist nicht immer schlecht — hier bestätigt `rc=1` den Probelauf.
+
+#### Lauf 2: echt
+
+```bash
+ansible-playbook playbooks/pakete.yml -K
+```
+
+Ergebnis: wieder überall `changed` — diesmal **wirklich installiert**.
+
+| Lauf | Anzeige | Bedeutung |
+|---|---|---|
+| mit `--check` | `changed` | „würde installieren“ — nichts passiert |
+| ohne `--check` | `changed` | „habe installiert“ |
+
+Gleiche Farbe — den Unterschied macht nur der Schalter. Immer wissen, ob man gerade im Probelauf ist.
+
+#### Lauf 3: noch einmal — Idempotenz
+
+```bash
+ansible-playbook playbooks/pakete.yml -K
+ansible all -a "which tree"
+```
+
+![Zweiter echter Lauf: überall ok und changed=0 (idempotent); which tree findet /usr/bin/tree mit rc=0, Ad-hoc-command meldet dennoch CHANGED](./images/ansible-pakete-idempotenz.png)
+
+```
+TASK [tree ist installiert] ****************************************************
+ok: [ph-node3]
+ok: [ph-node2]
+ok: [ph-node1]
+ok: [ph-monitor]
+
+PLAY RECAP *********************************************************************
+ph-monitor                 : ok=1    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+...
+
+ph-monitor | CHANGED | rc=0 >>
+/usr/bin/tree
+...
+```
+
+**Interpretation:**
+
+- **Playbook jetzt grün, `changed=0`:** Ansible prüft den Zielzustand, sieht „`tree` ist da“ und tut **nichts**. Das ist **Idempotenz** — beliebig oft ausführbar, das Ergebnis bleibt gleich. **Bild:** Lichtschalter auf „aus“, wenn das Licht schon aus ist.
+- **`which tree`:** `rc=0`, Pfad `/usr/bin/tree` auf allen vier Knoten → wirklich installiert.
+- **Aber Ad-hoc meldet `CHANGED` (gelb)!** Obwohl `which` nichts verändert. Das ist derselbe Effekt wie in 19.12: Das Modul `command` weiß nicht, was ein Befehl tut, und meldet vorsichtshalber **immer** „changed“. Im Playbook verhindert man das mit `changed_when: false`; beim Ad-hoc-Befehl gibt es diese Zeile nicht.
+
+**Der Unterschied in einem Satz:** Das Modul `apt` **kennt** den Zustand (installiert oder nicht) und meldet ehrlich `ok` oder `changed`. Das Modul `command` **kennt ihn nicht** — es führt nur aus.
+
+> **Merksatz:** **Zustandsmodule (`apt`, `service`, `copy` …) statt `command`, wo immer möglich.** Nur sie können ehrlich sagen, ob sich etwas geändert hat — und nur mit ihnen ist ein Playbook von selbst idempotent.
+
+> **Merksatz:** **Erster Lauf gelb, zweiter Lauf grün** — das ist der Beweis für ein idempotentes Playbook.
+
+**Kontrollfragen zu 19.16**
+- **Was macht `become: true`, und wie gibt man das sudo-Passwort an?** → Tasks laufen als root; `-K` fragt einmal `BECOME password: <sudo-Passwort>`.
+- **Was bedeutet `changed` im `--check`-Lauf?** → „würde ändern“ — es wurde nichts geändert.
+- **Wie beweist man, dass `--check` nichts verändert hat?** → Gegenprobe, z. B. `ansible all -a "which tree"` → `rc=1`.
+- **Warum heißt der Task „tree ist installiert“?** → Ansible beschreibt Zielzustände, keine Handlungen.
+- **Was zeigt der zweite echte Lauf?** → `ok`/`changed=0` = idempotent.
+- **Warum meldet `ansible all -a "which tree"` `CHANGED`, obwohl nichts geändert wurde?** → `command` kennt den Zustand nicht und meldet immer „changed“.
+- **Warum ist das Installieren von `tree` für den Patroni-Cluster ungefährlich, ein `apt upgrade` aber nicht?** → Kein Upgrade → kein `needrestart` → kein Neustart von `patroni.service` (auf dem Leader = Failover).
+
 ---
 
 ## Anhang — Metaphern zum Wiederholen
@@ -6268,4 +6412,7 @@ Jede Metapher in einer Zeile: **Fachbegriff → Metapher → kurze Erklärung.**
 | `No route to host` | **das eigene Telefon hat kein Netz** | „unreachable = gar nicht hingekommen, failed = angekommen, aber schiefgegangen.“ |
 | `uri` auf `/primary` + `when` | **„Wer hat die erste Geige?“ — nur einer hebt die Hand** | „200 = Leader, 503 = Replica; `when` lässt nur den Leader antworten.“ |
 | `skipping` | **Kopfschütteln** statt Handheben | „Übersprungen ist kein Fehler.“ |
+| `become` / `-K` | **Schlüssel zum Requisitenraum** | „Umbauen darf nur root — das sudo-Passwort gibt es einmal mit `-K`.“ |
+| `--check` | **Stellprobe**: alle gehen ihre Wege, niemand spielt einen Ton | „Erst `--check`, dann echt.“ |
+| `state: present` | **Soll-Liste** statt To-do-Liste | „Nicht ‚installiere‘, sondern ‚soll da sein‘.“ |
 | Idempotenz (pipx/Ansible) | **Lichtschalter auf „aus“, wenn das Licht schon aus ist** | „Zweimal ausführen ändert nichts — `changed: false`.“ |

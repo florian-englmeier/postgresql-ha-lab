@@ -1,0 +1,11 @@
+---
+- name: Grundpakete auf allen Knoten
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: tree ist installiert
+      ansible.builtin.apt:
+        name: tree
+        state: present
