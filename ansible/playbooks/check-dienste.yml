@@ -6,3 +6,8 @@
     - name: Ist der Dienst patroni aktiv?
       ansible.builtin.command: systemctl is-active patroni
       changed_when: false
+      register: patroni_status
+
+    - name: Antwort des Knotens anzeigen
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: patroni ist {{ patroni_status.stdout }}"

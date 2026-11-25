@@ -5890,6 +5890,101 @@ Aufräumen: Die Übungsdatei `playbooks/experiment-rot.yml` wurde nach dem Exper
 - **Wie findet man die fehlerhafte Stelle im Playbook?** → `Origin: datei:zeile:spalte` mit Ausschnitt.
 - **Warum ist das Standardverhalten beim Patchen gut?** → Ein Knoten mit Fehler macht nicht blind mit dem nächsten Schritt weiter.
 
+### 19.14 `register` und `debug`: die Antwort des Knotens sichtbar machen (Verifiziert 25.11.2026)
+
+**Problem:** `check-dienste.yml` meldet „ok“, aber das Wort `active` erscheint nie — Ansible zeigt die Ausgabe eines Befehls bei Erfolg nicht an (nur im Fehlerfall steht alles im JSON, siehe 19.13).
+
+**Bild:** Der Musiker antwortet am Telefon, der Dirigent nickt — schreibt aber nichts auf. Jetzt lernt er zwei Dinge: **`register`** = die Antwort **auf einem Zettel mit Namen notieren**; **`debug`** = **den Zettel laut vorlesen**.
+
+```yaml
+---
+- name: Prüfen, ob Patroni auf den Datenknoten läuft
+  hosts: patroni
+
+  tasks:
+    - name: Ist der Dienst patroni aktiv?
+      ansible.builtin.command: systemctl is-active patroni
+      changed_when: false
+      register: patroni_status
+
+    - name: Antwort des Knotens anzeigen
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: patroni ist {{ patroni_status.stdout }}"
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `register: patroni_status` | speichert die **komplette Antwort** des Tasks in der Variablen `patroni_status` (Name frei wählbar) — **pro Host eine eigene**. Inhalt = genau das JSON aus dem Rot-Experiment: `cmd`, `rc`, `stdout`, `stderr`, `start`, `end` … |
+| `ansible.builtin.debug:` | Modul, das nur etwas ausgibt — verbindet sich mit nichts, verändert nichts (kein `changed_when` nötig) |
+| `msg:` | der auszugebende Text; steht **eine Ebene tiefer** als `debug`, weil es ein Parameter des Moduls ist |
+| `"…"` | **Pflicht**, weil der Text `{{` und `:` enthält — ohne Anführungszeichen versteht YAML ihn falsch |
+| `{{ … }}` | **Jinja**: wird durch den Wert ersetzt — dasselbe Prinzip wie das Formular aus Teil 18, nur heißt der Platzhalter `{{ name }}` statt `$name` |
+| `inventory_hostname` | **eingebaute** Variable: Name des Hosts aus dem Inventory (`ph-node1` …) |
+| `patroni_status.stdout` | aus dem Zettel nur das Feld `stdout`; der **Punkt** greift auf ein Feld zu — in Python-Sprache: `patroni_status["stdout"]` (beide Schreibweisen erlaubt) |
+
+Echte Ausgabe (Auszug):
+
+```
+TASK [Antwort des Knotens anzeigen] ********************************************
+ok: [ph-node1] => {
+    "msg": "ph-node1: patroni ist active"
+}
+ok: [ph-node2] => {
+    "msg": "ph-node2: patroni ist active"
+}
+ok: [ph-node3] => {
+    "msg": "ph-node3: patroni ist active"
+}
+
+PLAY RECAP *********************************************************************
+ph-node1                   : ok=3    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+ph-node2                   : ok=3    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+ph-node3                   : ok=3    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+```
+
+**Interpretation:**
+
+- **`ok=3`** = Gathering Facts + Prüfung + Anzeige. Auch ein `debug`-Task zählt als erfolgreicher Task.
+- Jeder Knoten zeigt **seinen eigenen** Zettel: `register` speichert pro Host.
+- Die drei `debug`-Zeilen stehen in **Inventory-Reihenfolge** (node1, 2, 3), die Prüf-Zeilen davor nicht: `debug` läuft lokal auf dem Mac und ist sofort fertig, `command` muss erst per SSH zum Knoten — wer zuerst antwortet, steht oben.
+
+> **Merksatz:** **`register` notiert, `debug` liest vor.** Was im Rot-Experiment als Fehler-JSON zu sehen war, ist genau der Inhalt der registrierten Variablen.
+
+**Stolperstein 5 — `No route to host` (25.11.2026, morgens)**
+
+```
+fatal: [ph-node1]: UNREACHABLE! => {"changed": false, "msg": "Task failed: Data could not be sent to remote host \"192.168.178.201\". Make sure this host can be reached over ssh: ssh: connect to host 192.168.178.201 port 22: No route to host", "unreachable": true}
+```
+
+PLAY RECAP: `ok=0`, `unreachable=1` — schon **Gathering Facts** scheiterte; das neue Playbook war noch gar nicht gelaufen.
+
+| Meldung | Wo es hakt | Bild |
+|---|---|---|
+| `Permission denied (publickey,password)` | Anmeldung | Musiker geht ran, lässt mich nicht rein |
+| `Connection timed out` | Ziel antwortet nicht | es klingelt, niemand geht ran |
+| **`No route to host`** | **Netzwerkweg** | **mein Telefon hat kein Netz** |
+
+Eingrenzung:
+
+```bash
+ipconfig getifaddr en0       # eigene IP auf der WLAN-Schnittstelle en0; leer = WLAN ohne Adresse (z. B. per Kabel/Adapter verbunden)
+ping -c 3 192.168.178.201    # echter Netzwerk-Ping (ICMP), -c 3 = nur 3 Pakete (ohne -c läuft er auf dem Mac endlos, Abbruch mit Ctrl+C)
+```
+
+Ergebnis eine Minute später: `ipconfig` leer (Mac hing nicht über WLAN am Netz), `ping` 3/3 Pakete, 0 % Verlust, ~1–3 ms, `ttl=64` (typisch Linux, kein Router dazwischen) → Weg vorhanden. Danach `ansible all -m ping` wieder viermal `pong`.
+
+**Ursache (wahrscheinlich):** VMs/Proxmox noch beim Hochfahren oder die Netzverbindung des Mac noch nicht vollständig aufgebaut (Aufwachen aus dem Ruhezustand, Wechsel WLAN/Kabel). Zu beachten seit macOS 15: Eine **neue Terminal-App** braucht die Erlaubnis **„Lokales Netzwerk“** (Systemeinstellungen → Datenschutz & Sicherheit → Lokales Netzwerk); ohne sie meldet macOS bei Heimnetz-Adressen ebenfalls `No route to host`. Hier ausgeschlossen, weil dasselbe Terminal eine Minute später durchkam.
+
+> **Merke:** `unreachable` ≠ `failed`. **unreachable** = Ansible kam gar nicht zum Knoten (Netz, SSH). **failed** = Ansible kam an, aber der Task ging schief. Bei `unreachable` zuerst mit `ping` den Netzwerkweg prüfen.
+
+**Kontrollfragen zu 19.14**
+- **Was speichert `register`?** → die komplette Antwort des Tasks (rc, stdout, stderr, …) als Variable, pro Host.
+- **Wie greift man auf die Ausgabe zu?** → `{{ variable.stdout }}`.
+- **Warum Anführungszeichen um `msg`?** → `{{` und `:` würden YAML sonst verwirren.
+- **Warum `ok=3`?** → Facts + Prüfung + debug.
+- **Unterschied `unreachable` und `failed`?** → Netz/SSH vs. Task-Fehler auf dem erreichten Knoten.
+- **Was heißt `No route to host`?** → kein Netzwerkweg zum Ziel — mit `ping` prüfen.
+
 ---
 
 ## Anhang — Metaphern zum Wiederholen
@@ -6045,4 +6140,6 @@ Jede Metapher in einer Zeile: **Fachbegriff → Metapher → kurze Erklärung.**
 | Gathering Facts | **vor der Probe jeden Musiker fragen: Instrument, Stimmung, Platz?** | „Ansible sammelt automatisch Host-Infos, bevor das Play beginnt.“ |
 | `playbooks/`-Ordner betreten | **Partitur im Notenschrank suchen, während man im Notenschrank steht** | „Immer im Ordner `ansible/` bleiben.“ |
 | fehlgeschlagener Task | **Musiker verspielt sich und wird von der Bühne geschickt, das Orchester spielt weiter** | „Ein Fehler stoppt den Host, nicht das Orchester.“ |
+| `register` / `debug` | **Antwort auf einem Zettel mit Namen notieren** / **Zettel laut vorlesen** | „register notiert, debug liest vor.“ |
+| `No route to host` | **das eigene Telefon hat kein Netz** | „unreachable = gar nicht hingekommen, failed = angekommen, aber schiefgegangen.“ |
 | Idempotenz (pipx/Ansible) | **Lichtschalter auf „aus“, wenn das Licht schon aus ist** | „Zweimal ausführen ändert nichts — `changed: false`.“ |
