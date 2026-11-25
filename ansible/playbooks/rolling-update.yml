@@ -1,0 +1,24 @@
+---
+# Rollierendes Update des Patroni-Clusters
+# Reihenfolge: Replicas einzeln -> Switchover -> ehemaliger Leader
+#
+# Phase 0: Rollen zur Laufzeit ermitteln (der Leader wandert, darum
+#          keine feste Gruppe im Inventory, sondern Frage an Patroni)
+- name: Phase 0 - Rollen ermitteln
+  hosts: patroni
+  gather_facts: false
+
+  tasks:
+    - name: Patroni-REST-API fragen - bin ich der Leader?
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:8008/primary"
+        status_code: [200, 503]
+      register: leader_check
+
+    - name: In dynamische Gruppe einsortieren (leader / replicas)
+      ansible.builtin.group_by:
+        key: "{{ 'leader' if leader_check.status == 200 else 'replicas' }}"
+
+    - name: Ergebnis anzeigen
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} -> {{ group_names }}"

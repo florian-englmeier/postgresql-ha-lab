@@ -6253,6 +6253,116 @@ ph-monitor | CHANGED | rc=0 >>
 - **Warum meldet `ansible all -a "which tree"` `CHANGED`, obwohl nichts geändert wurde?** → `command` kennt den Zustand nicht und meldet immer „changed“.
 - **Warum ist das Installieren von `tree` für den Patroni-Cluster ungefährlich, ein `apt upgrade` aber nicht?** → Kein Upgrade → kein `needrestart` → kein Neustart von `patroni.service` (auf dem Leader = Failover).
 
+### 19.17 Rollierendes Update, Phase 0: Rollen zur Laufzeit ermitteln mit `group_by` (Verifiziert 25.11.2026)
+
+**Warum:** Jetzt kommt das Glanzstück von Stufe 1, ein **rollierendes Update per Playbook**. Die Regel aus dem Betrieb lautet: Replicas zuerst, eine nach der anderen, dann Switchover, der ehemalige Leader zuletzt. Grund: Nach einem Update muss Patroni neu gestartet werden (neue Bibliotheken) oder der Knoten neu booten (neuer Kernel). Auf dem Leader führt beides ohne vorherigen Switchover zu einem **ungeplanten Failover**.
+
+> **Wichtig, Stand der Knoten:** Ursprünglich hat `needrestart` diesen Neustart nach `apt upgrade` *automatisch* ausgelöst. Seit 16.10.2026 steht es auf den Knoten im **List-Modus** (`/etc/needrestart/conf.d/50-ha-cluster.conf`, `$nrconf{restart} = 'l';`, siehe Betriebslog). Es meldet nur noch und startet nichts mehr neu. Das Upgrade allein ist deshalb heute nicht mehr gefährlich, aber ohne Neustart läuft Patroni weiter mit dem alten Code. Das Playbook muss den Neustart bzw. Reboot also **selbst und bewusst** auslösen, und genau dieser Schritt braucht auf dem Leader den Switchover vorher.
+
+**Bild (Orchester):** Neue Saiten mitten im Konzert. Man holt nie alle Geiger gleichzeitig von der Bühne, sondern tauscht einen nach dem anderen aus, die hinteren Pulte (Replicas) zuerst. Der **Dirigent** wird nicht während des Dirigierens umgebaut. Erst übergibt er den Taktstock geordnet (**Switchover**), dann geht er selbst in die Werkstatt.
+
+**Der Plan: vier Plays in einer Datei `playbooks/rolling-update.yml`**
+
+| Phase | Wer | Was |
+|---|---|---|
+| 0 | alle Patroni-Knoten | Rolle erfragen (Leader oder Replica) und in Laufzeit-Gruppen einsortieren |
+| 1 | `replicas`, mit `serial: 1` einzeln | `apt upgrade`, ggf. Reboot, warten bis wieder `streaming` |
+| 2 | `leader` | `patronictl switchover` auf eine frisch gepatchte Replica |
+| 3 | ehemaliger Leader | `apt upgrade`, ggf. Reboot, warten |
+
+**`serial`:** Normalerweise arbeitet Ansible einen Task auf allen Hosts parallel ab (`forks`). Mit `serial: 1` läuft der **ganze Play** erst auf Host A komplett durch, dann auf Host B. Aus der Kolonne wird eine Einzelabfertigung.
+
+**Die Falle des naiven Ansatzes:** `hosts: patroni` + `serial: 1` + `apt upgrade` arbeitet in **Inventory-Reihenfolge** (node1, node2, node3) und kennt keine Rollen. Ist zufällig ph-node1 Leader, wird er **zuerst** gepatcht, und es kommt zum ungeplanten Failover. Auch wenn der Leader zufällig als Letzter dran ist, fehlt der geordnete Switchover.
+
+> **Merksatz:** **Die Reihenfolge muss von der Rolle abhängen, nicht von der Position im Inventory.** Der Leader wandert, deshalb gibt es keine feste Gruppe `leader` in `hosts.yml`, sondern eine Frage an Patroni zur Laufzeit.
+
+**`group_by`: aus Antworten werden Gruppen.** Die Abfrage aus 19.15 (`uri` auf `:8008/primary`, 200 = Leader, 503 = Replica) liefert pro Knoten eine Antwort. `hosts:` braucht aber **Gruppen**. Das Modul `ansible.builtin.group_by` steckt jeden Host zur Laufzeit in eine Gruppe, deren Name aus einem Ausdruck berechnet wird.
+
+**Bild:** Der Inspizient geht vor dem Konzert durch den Saal, fragt jeden „Dirigierst du heute?“ und klebt ein **Namensschild** an: „Leader“ oder „Replica“. Die Schilder gelten nur für diesen Abend, im Personalordner (`hosts.yml`) steht davon nichts.
+
+`playbooks/rolling-update.yml`, Stand Phase 0:
+
+```yaml
+---
+# Rollierendes Update des Patroni-Clusters
+# Reihenfolge: Replicas einzeln -> Switchover -> ehemaliger Leader
+#
+# Phase 0: Rollen zur Laufzeit ermitteln (der Leader wandert, darum
+#          keine feste Gruppe im Inventory, sondern Frage an Patroni)
+- name: Phase 0 - Rollen ermitteln
+  hosts: patroni
+  gather_facts: false
+
+  tasks:
+    - name: Patroni-REST-API fragen - bin ich der Leader?
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:8008/primary"
+        status_code: [200, 503]
+      register: leader_check
+
+    - name: In dynamische Gruppe einsortieren (leader / replicas)
+      ansible.builtin.group_by:
+        key: "{{ 'leader' if leader_check.status == 200 else 'replicas' }}"
+
+    - name: Ergebnis anzeigen
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} -> {{ group_names }}"
+```
+
+**Zeile für Zeile (neu):**
+
+- **`ansible.builtin.group_by`**: verändert nichts auf dem Knoten, sondern nur Ansibles **In-Memory-Inventory** für diesen einen Lauf.
+- **`key:`**: Name der Gruppe, in die der Host kommt. Existiert sie nicht, wird sie angelegt.
+- **`{{ 'leader' if ... else 'replicas' }}`**: Jinja2-Ausdruck, derselbe Ternary-Operator wie in Python.
+- **`leader_check.status`**: der HTTP-Statuscode aus dem `register` des vorigen Tasks.
+- **`parents:`** (optional, hier nicht genutzt): macht die neue Gruppe zum Kind einer anderen Gruppe.
+- **`group_names`**: eingebaute Variable, die Liste der Gruppen, in denen *dieser* Host steckt (Sicht des Hosts). Das Gegenstück **`groups['leader']`** ist die Liste der Hosts in einer Gruppe (Sicht der Gruppe).
+
+**Ausführen** (aus `ansible/`, ohne `-K`, denn Phase 0 liest nur):
+
+```bash
+ansible-playbook playbooks/rolling-update.yml
+```
+
+**Vorhersage (Flo):** ph-node1 und ph-node2 kommen in `replicas`, ph-node3 kommt in `leader` (aktueller Leader, TL 25). Die Gruppen stehen danach **nicht** in `hosts.yml`. **Beides richtig.**
+
+**Echte Ausgabe:**
+
+![Phase 0 von rolling-update.yml: uri ok auf allen drei Knoten, group_by changed, ph-node1 und ph-node2 in replicas, ph-node3 in leader](./images/ansible-rolling-phase0-group-by.png)
+
+```text
+TASK [In dynamische Gruppe einsortieren (leader / replicas)] ****
+changed: [ph-node1]
+changed: [ph-node2]
+changed: [ph-node3]
+
+TASK [Ergebnis anzeigen] ****
+ok: [ph-node1] => { "msg": "ph-node1 -> ['patroni', 'replicas']" }
+ok: [ph-node2] => { "msg": "ph-node2 -> ['patroni', 'replicas']" }
+ok: [ph-node3] => { "msg": "ph-node3 -> ['leader', 'patroni']" }
+
+PLAY RECAP ****
+ph-node1 : ok=3  changed=1  unreachable=0  failed=0
+ph-node2 : ok=3  changed=1  unreachable=0  failed=0
+ph-node3 : ok=3  changed=1  unreachable=0  failed=0
+```
+
+**Interpretation:**
+
+- **`group_names` enthält auch die statische Gruppe `patroni`.** Die Laufzeit-Gruppe kommt *dazu*, sie ersetzt nichts. Die Liste ist alphabetisch sortiert, deshalb steht bei ph-node3 `leader` vor `patroni`.
+- **`group_by` meldet `changed` (gelb).** Das ist **keine Änderung am Knoten**. Geändert hat sich nur Ansibles Inventory im Speicher: der Host wurde einer Gruppe hinzugefügt. (Korrektur im Tutoring: Zuerst war behauptet worden, `group_by` melde nie „changed“. Die echte Ausgabe hat das widerlegt.)
+- **Nach dem Lauf sind die Gruppen weg.** Ansible schreibt nie in `hosts.yml` zurück. Beim nächsten Lauf wird neu gefragt, und genau das ist gewollt, weil der Leader wandert.
+
+> **Merksatz:** **`group_by` klebt Namensschilder für einen Abend.** Gruppen aus Laufzeit-Wissen, nicht aus der Besetzungsliste.
+
+**Kontrollfragen zu 19.17**
+- **Warum gibt es keine feste Gruppe `leader` in `hosts.yml`?** → Der Leader wandert (Failover/Switchover). Eine feste Gruppe wäre nach dem nächsten Wechsel falsch.
+- **Was macht `serial: 1`?** → Der ganze Play läuft erst auf einem Host vollständig durch, bevor der nächste drankommt.
+- **Was ginge beim naiven `hosts: patroni` + `serial: 1` + `apt upgrade` schief?** → Abarbeitung in Inventory-Reihenfolge, ohne Rollen: Der Leader wird irgendwann gepatcht und neu gestartet bzw. rebootet (früher automatisch durch `needrestart`, heute bewusst im Playbook), und es kommt zum ungeplanten Failover, ohne Switchover.
+- **Was macht `group_by`, und wo landen die Gruppen?** → Sortiert Hosts zur Laufzeit in Gruppen, nur im Speicher dieses Laufs, nicht in `hosts.yml`.
+- **Unterschied `group_names` vs. `groups`?** → `group_names`: in welchen Gruppen bin ich? `groups['x']`: wer ist in Gruppe x?
+- **Warum zeigt `group_by` `changed`, obwohl auf den Knoten nichts passiert ist?** → Es meldet die Änderung am In-Memory-Inventory.
+
 ---
 
 ## Anhang — Metaphern zum Wiederholen
@@ -6416,3 +6526,6 @@ Jede Metapher in einer Zeile: **Fachbegriff → Metapher → kurze Erklärung.**
 | `--check` | **Stellprobe**: alle gehen ihre Wege, niemand spielt einen Ton | „Erst `--check`, dann echt.“ |
 | `state: present` | **Soll-Liste** statt To-do-Liste | „Nicht ‚installiere‘, sondern ‚soll da sein‘.“ |
 | Idempotenz (pipx/Ansible) | **Lichtschalter auf „aus“, wenn das Licht schon aus ist** | „Zweimal ausführen ändert nichts — `changed: false`.“ |
+| rollierendes Update | **Saiten mitten im Konzert tauschen**: hintere Pulte zuerst, Dirigent zuletzt nach Übergabe des Taktstocks | „Replicas einzeln, Switchover, ehemaliger Leader zuletzt.“ |
+| `serial: 1` | **Einzelabfertigung statt Kolonne** | „Der ganze Play läuft erst auf einem Host durch, dann auf dem nächsten.“ |
+| `group_by` | **Inspizient klebt Namensschilder für einen Abend** | „Laufzeit-Gruppen aus Patroni-Antwort, nie in `hosts.yml`.“ |
