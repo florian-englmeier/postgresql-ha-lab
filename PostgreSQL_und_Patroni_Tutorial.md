@@ -5987,6 +5987,128 @@ Ergebnis eine Minute später: `ipconfig` leer (Mac hing nicht über WLAN am Netz
 - **Unterschied `unreachable` und `failed`?** → Netz/SSH vs. Task-Fehler auf dem erreichten Knoten.
 - **Was heißt `No route to host`?** → kein Netzwerkweg zum Ziel — mit `ping` prüfen.
 
+### 19.15 Wer ist gerade Leader? `uri` + `when` (Verifiziert 25.11.2026)
+
+**Warum:** Für alles Weitere (Updates, Neustarts, Patchen) gilt die eiserne Regel: **Replicas zuerst, Leader erst nach `patronictl switchover`.** Dafür muss das Playbook selbst wissen, wer gerade Leader ist — der Leader wandert.
+
+**Woher:** von Patroni selbst, über die **REST-API auf Port 8008** (dieselbe, die HAProxy für sein Routing fragt). Der Endpunkt `/primary` antwortet mit einem HTTP-Statuscode:
+
+| Knoten | Antwort auf `/primary` |
+|---|---|
+| Leader | **200** (OK — ich bin's) |
+| Replica | **503** (nicht verfügbar — ich bin's nicht) |
+
+**Bild:** Der Dirigent fragt in die Runde: „Wer hat die erste Geige?“ Nur einer hebt die Hand.
+
+`playbooks/wer-ist-leader.yml`:
+
+```yaml
+---
+- name: Aktuellen Patroni-Leader ermitteln
+  hosts: patroni
+  gather_facts: false
+
+  tasks:
+    - name: Patroni-REST-API fragen - bin ich der Leader?
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:8008/primary"
+        status_code: [200, 503]
+      register: leader_check
+
+    - name: Leader melden
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} ist der Leader"
+      when: leader_check.status == 200
+```
+
+| Zeile | Bedeutung |
+|---|---|
+| `gather_facts: false` | keine Fakten sammeln — wir brauchen nur eine Antwort, das spart Zeit |
+| `ansible.builtin.uri:` | Modul für **HTTP-Anfragen** (wie `curl`); läuft **auf dem Knoten** — jeder Knoten fragt sich selbst |
+| `url: "http://{{ ansible_host }}:8008/primary"` | `{{ ansible_host }}` = IP aus dem Inventory, bei ph-node1 also `http://192.168.178.201:8008/primary`. Nicht `localhost`, weil Patroni auf der **Knoten-IP** lauscht |
+| `status_code: [200, 503]` | **Wichtig:** Standardmäßig gilt bei `uri` nur 200 als Erfolg. Ohne die Zeile wären die Replicas **rot** und schieden aus (19.13). So gilt 503 als **Information**, nicht als Fehler. `[…]` = Liste in YAML |
+| `register: leader_check` | Antwort auf den Zettel `leader_check`; das Feld `status` enthält den HTTP-Code |
+| `when: leader_check.status == 200` | **Bedingung:** Der Task läuft nur, wenn sie wahr ist. `==` = „ist gleich“, wie in Python |
+
+> **Merke:** Bei `when` stehen **keine** `{{ }}` — `when` erwartet immer schon einen Ausdruck. Mit Klammern gibt Ansible eine Warnung aus.
+
+Echte Ausgabe:
+
+```
+PLAY [Aktuellen Patroni-Leader ermitteln] **************************************
+
+TASK [Patroni-REST-API fragen - bin ich der Leader?] ***************************
+ok: [ph-node2]
+ok: [ph-node1]
+ok: [ph-node3]
+
+TASK [Leader melden] ***********************************************************
+skipping: [ph-node1]
+skipping: [ph-node2]
+ok: [ph-node3] => {
+    "msg": "ph-node3 ist der Leader"
+}
+
+PLAY RECAP *********************************************************************
+ph-node1                   : ok=1    changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0
+ph-node2                   : ok=1    changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0
+ph-node3                   : ok=2    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+```
+
+**Interpretation:**
+
+- **Kein `Gathering Facts`** — `gather_facts: false` wirkt.
+- **Erster Task dreimal grün**, auch die zwei Replicas mit 503 — dank `status_code: [200, 503]`.
+- **Zweiter Task:**
+
+| Knoten | Anzeige | Farbe | Warum |
+|---|---|---|---|
+| ph-node1 | `skipping` | türkis/blau | Status 503 → Bedingung falsch → übersprungen |
+| ph-node2 | `skipping` | türkis/blau | ebenso |
+| ph-node3 | `ok` + Meldung | grün | Status 200 → Bedingung wahr |
+
+- **RECAP:** erstmals ist **`skipped`** belegt. `skipped` ist **kein Fehler**, nur: Bedingung traf nicht zu.
+
+> **Merksatz:** **`when` entscheidet pro Host.** Ist die Bedingung falsch, wird der Task übersprungen (`skipping`), nicht abgebrochen.
+
+**Gegenprobe mit Patroni selbst:**
+
+```bash
+ssh -t florian@192.168.178.201 'sudo patronictl -c /etc/patroni.yml list'
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `ssh -t` | (*tty*) ein Terminal auf dem Knoten anfordern — nötig, damit `sudo` dort nach dem Passwort fragen kann |
+| `sudo` | `/etc/patroni.yml` ist gehärtet (nur für root/postgres lesbar, siehe Sicherheitshärtung), deshalb Root-Rechte |
+| `patronictl -c /etc/patroni.yml list` | Steuerprogramm von Patroni; `-c` = Konfigurationsdatei (wo etcd und der Cluster liegen); `list` = alle Mitglieder mit Rolle, Zustand, Timeline, Lag |
+
+Echte Ausgabe:
+
+```
++ Cluster: postgres-ha (7686474206101860353) ------+----+-------------+-----+------------+-----+
+| Member   | Host            | Role    | State     | TL | Receive LSN | Lag | Replay LSN | Lag |
++----------+-----------------+---------+-----------+----+-------------+-----+------------+-----+
+| ph-node1 | 192.168.178.201 | Replica | streaming | 25 |  6/6F0001B8 |   0 | 6/6F0001B8 |   0 |
+| ph-node2 | 192.168.178.202 | Replica | streaming | 25 |  6/6F0001B8 |   0 | 6/6F0001B8 |   0 |
+| ph-node3 | 192.168.178.203 | Leader  | running   | 25 |             |     |            |     |
++----------+-----------------+---------+-----------+----+-------------+-----+------------+-----+
+```
+
+**Interpretation:** **ph-node3 = Leader** — stimmt mit dem Playbook überein. Beide Replicas `streaming`, Timeline 25, Receive- und Replay-LSN identisch (`6/6F0001B8`), Lag 0 → voll synchron, gesunder Cluster.
+
+**Warum die REST-API die bessere Quelle für Automatisierung ist:** `patronictl` braucht `sudo` (Passwort, gehärtete Config), die REST-API nicht — sie ist ein schlichter HTTP-Aufruf ohne Rechte, genau wie HAProxy ihn macht. Das Playbook läuft damit ohne `-K` und ohne Passworteingabe.
+
+> **Merksatz:** **Ein Playbook ist erst glaubwürdig, wenn es mit der Wirklichkeit übereinstimmt** — Gegenprobe mit `patronictl list`.
+
+**Kontrollfragen zu 19.15**
+- **Was antwortet `/primary` auf Leader und Replica?** → 200 bzw. 503.
+- **Wozu `status_code: [200, 503]`?** → Sonst gälte 503 als Fehler und die Replicas schieden aus.
+- **Was bedeutet `skipping`, und ist das ein Fehler?** → Bedingung bei `when` falsch → übersprungen; kein Fehler.
+- **Warum keine `{{ }}` bei `when`?** → `when` ist bereits ein Ausdruck; Klammern erzeugen eine Warnung.
+- **Warum REST-API statt `patronictl` im Playbook?** → keine Root-Rechte/Passwort nötig, dieselbe Quelle wie HAProxy.
+- **Woran sieht man in `patronictl list`, dass die Replicas aktuell sind?** → `streaming`, gleiche Timeline, Receive-/Replay-LSN gleich, Lag 0.
+
 ---
 
 ## Anhang — Metaphern zum Wiederholen
@@ -6144,4 +6266,6 @@ Jede Metapher in einer Zeile: **Fachbegriff → Metapher → kurze Erklärung.**
 | fehlgeschlagener Task | **Musiker verspielt sich und wird von der Bühne geschickt, das Orchester spielt weiter** | „Ein Fehler stoppt den Host, nicht das Orchester.“ |
 | `register` / `debug` | **Antwort auf einem Zettel mit Namen notieren** / **Zettel laut vorlesen** | „register notiert, debug liest vor.“ |
 | `No route to host` | **das eigene Telefon hat kein Netz** | „unreachable = gar nicht hingekommen, failed = angekommen, aber schiefgegangen.“ |
+| `uri` auf `/primary` + `when` | **„Wer hat die erste Geige?“ — nur einer hebt die Hand** | „200 = Leader, 503 = Replica; `when` lässt nur den Leader antworten.“ |
+| `skipping` | **Kopfschütteln** statt Handheben | „Übersprungen ist kein Fehler.“ |
 | Idempotenz (pipx/Ansible) | **Lichtschalter auf „aus“, wenn das Licht schon aus ist** | „Zweimal ausführen ändert nichts — `changed: false`.“ |

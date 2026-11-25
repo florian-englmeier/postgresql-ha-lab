@@ -1,0 +1,16 @@
+---
+- name: Aktuellen Patroni-Leader ermitteln
+  hosts: patroni
+  gather_facts: false
+
+  tasks:
+    - name: Patroni-REST-API fragen - bin ich der Leader?
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}:8008/primary"
+        status_code: [200, 503]
+      register: leader_check
+
+    - name: Leader melden
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} ist der Leader"
+      when: leader_check.status == 200
