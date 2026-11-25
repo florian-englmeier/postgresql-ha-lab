@@ -89,7 +89,7 @@ Neben den Community-Dashboards (Dutzende Panels zum Stöbern) ein selbst gebaute
 
 ![Ansible-Playbook check-dienste.yml: jeder Datenknoten meldet „patroni ist active“, PLAY RECAP ok=3, changed=0](./images/ansible-check-dienste-register-debug.png)
 
-Statt dreimal einloggen ein Befehl vom Mac als Steuerknoten: `ansible-playbook playbooks/check-dienste.yml` prüft auf der Inventory-Gruppe `patroni`, ob der Dienst `patroni` läuft, speichert die Antwort jedes Knotens per `register` und gibt sie mit `debug` aus. Erst Syntaxprüfung (`--syntax-check`), dann der Lauf; `changed=0` im PLAY RECAP belegt, dass das Prüf-Playbook nichts verändert hat (`changed_when: false`). Aufbau von Inventory, `ansible.cfg`, SSH-Schlüsseln und Playbook sowie vier Stolpersteine in [Teil 19](./PostgreSQL_und_Patroni_Tutorial.md#teil-19--ansible-der-dirigent-für-den-cluster).
+Statt dreimal einloggen ein Befehl vom Mac als Steuerknoten: `ansible-playbook playbooks/check-dienste.yml` prüft auf der Inventory-Gruppe `patroni`, ob der Dienst `patroni` läuft, speichert die Antwort jedes Knotens per `register` und gibt sie mit `debug` aus. Erst Syntaxprüfung (`--syntax-check`), dann der Lauf; `changed=0` im PLAY RECAP belegt, dass das Prüf-Playbook nichts verändert hat (`changed_when: false`). Ein bewusst provozierter Fehler (Rot-Experiment) zeigte das Standardverhalten: Der fehlerhafte Host scheidet für den Rest des Plays aus, die anderen spielen weiter. Aufbau von Inventory, `ansible.cfg`, SSH-Schlüsseln und Playbook sowie fünf Stolpersteine in [Teil 19](./PostgreSQL_und_Patroni_Tutorial.md#teil-19--ansible-der-dirigent-für-den-cluster).
 
 ---
 
@@ -197,7 +197,12 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 
 ### 🔜 Als Nächstes
 
-- [ ] **Ansible Stufe 1 — Cluster per Playbook verwalten:** ✅ erstes Prüf-Playbook `check-dienste.yml` (24.11.2026, Patroni aktiv auf allen drei Datenknoten, `changed=0`); als Nächstes ein Playbook für Grundpakete und Updates, Benutzer und SSH-Schlüssel, Verteilen von Backup-Skripten und Cronjobs sowie eine Prüfung, ob PostgreSQL und Patroni laufen. Updates rollierend: Replicas zuerst, Leader erst nach `patronictl switchover`. Bewusst **kein** Neuaufbau von Patroni mit Ansible
+- [ ] **Ansible Stufe 1 — Cluster per Playbook verwalten:**
+  - ✅ Prüf-Playbook `check-dienste.yml` (24.11.2026): Patroni aktiv auf allen drei Datenknoten, `changed=0` dank `changed_when: false`
+  - ✅ Rot-Experiment (24.11.2026): Fehlerverhalten gelesen (`rc`, `stdout`, `Origin`) — ein Fehler stoppt den Host, nicht das Play
+  - ✅ `register` + `debug` (25.11.2026): Antwort jedes Knotens sichtbar („patroni ist active“); Stolperstein `No route to host` (`unreachable` vs. `failed`)
+  - ⏭️ als Nächstes: aktuellen Leader über die Patroni-REST-API erkennen (`uri`-Modul auf `:8008/primary`, Bedingungen mit `when`)
+  - danach: Playbook für Grundpakete und Updates, Benutzer und SSH-Schlüssel, Verteilen von Backup-Skripten und Cronjobs, Prüfung der PostgreSQL-Erreichbarkeit. Updates rollierend: Replicas zuerst, Leader erst nach `patronictl switchover`. Bewusst **kein** Neuaufbau von Patroni mit Ansible
 - [ ] 🔴 **TLS Etappe 1 — Datenbankverbindungen verschlüsseln:** eigene CA, Server-Zertifikate für alle drei Knoten, `ssl = on` per `patronictl edit-config`, `hostssl` in `pg_hba.conf`, `postgres_exporter` von `sslmode=disable` auf verschlüsselte Verbindung umstellen. Rollierend, ohne Leader-Wechsel am Ende
 - [ ] 🔴 **TLS Etappe 2 — Cluster-Kommunikation verschlüsseln:** etcd Peer- und Client-Verkehr sowie Patroni-REST-API auf HTTPS, HAProxy-Health-Check auf HTTPS umstellen. Knoten für Knoten, mit Quorum-Prüfung nach jedem Schritt (`etcdctl endpoint health`), weil ein Fehler bei etcd die Leader-Wahl kosten kann
 - [ ] Zentrales WAL-Archiv mit Aufbewahrungsregel (pgBackRest) und `restore_command` — Befund 20.10.2026: lokales Archiv lief auf dem Leader zweimal fast voll; PITR bis dahin bewusst ausgesetzt (nur Testdaten)
@@ -218,6 +223,7 @@ Jeder etcd-Knoten braucht zwei getrennte Adressen:
 - **Tuning trifft nur, wenn es den Engpass trifft.** `shared_buffers` hob die Cache-Hit-Ratio von 94 auf 99 %, der Durchsatz blieb gleich: Die Fehlgriffe kamen aus dem RAM des Betriebssystems, und die CPU war am Anschlag. Vorher-Messung, Aufwärm-Lauf und nur eine geänderte Variable machen den Vergleich erst aussagekräftig.
 - **Ein offener Punkt im Betriebslog ist eine Zeitbombe.** „Archiv ohne Aufbewahrungsregel“ war notiert — einen Tag später stand der Leader mit voller Platte da, und etcd auf demselben Datenträger fiel mit.
 - **Ein Monitoring ist erst fertig, wenn es den letzten echten Vorfall erkannt hätte.** Schon der Test der Abfrage für das neue Plattenpanel fand den Leader wieder bei 93 % — das lokale WAL-Archiv war nach dem Aufräumen am Vormittag durch zwei Lasttests erneut gewachsen. Das fertige Panel wurde per Zeitfenster auf genau diesen Moment zurückgestellt und zeigte ihn rot.
+- **Ein Prüf-Playbook muss beweisen, dass es nur geschaut hat.** Das Modul `command` meldet ohne `changed_when: false` bei jedem Lauf „changed“ — auch bei `systemctl is-active`. Erst `changed=0` im PLAY RECAP macht ein Prüf-Playbook glaubwürdig. Und ein Fehler stoppt per Standard nur den betroffenen Host: genau richtig fürs Patchen, wo ein Knoten nach einem gescheiterten Schritt nicht blind weitermachen darf.
 - **Nicht jeder Fehler muss sofort behoben werden — er muss verstanden, bewertet und dokumentiert werden.** Der Exporter-Fehler „recovery is in progress“ auf den Replicas ist bekannt, harmlos und begründet zurückgestellt; ein hastiger Fix hätte zwei Panels die Datenquelle genommen.
 
 ---
