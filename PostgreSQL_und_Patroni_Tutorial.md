@@ -6363,6 +6363,165 @@ ph-node3 : ok=3  changed=1  unreachable=0  failed=0
 - **Unterschied `group_names` vs. `groups`?** → `group_names`: in welchen Gruppen bin ich? `groups['x']`: wer ist in Gruppe x?
 - **Warum zeigt `group_by` `changed`, obwohl auf den Knoten nichts passiert ist?** → Es meldet die Änderung am In-Memory-Inventory.
 
+### 19.18 Der unsichtbare Hausmeister: `unattended-upgrades` mit Ansible untersucht (Verifiziert 25.11.2026)
+
+**Warum:** Bevor Phase 1 patcht, wird der **Ist-Zustand** geprüft: Steht auf den Knoten ein Reboot aus? Dabei kam heraus, dass Ubuntu heute früh **ohne unser Zutun** einen neuen Kernel installiert hat. Die Untersuchung lief komplett mit Ansible-Ad-hoc-Befehlen vom Mac aus und zeigt, wie man einen Befund Schritt für Schritt belegt statt rät.
+
+**Bild:** Ein **Hausmeister mit Generalschlüssel** kommt jeden Morgen um sechs, bevor das Orchester da ist, und legt neue Saiten aufs Pult. Seit dem 16.10.2026 darf er sie nicht mehr selbst aufziehen, das entscheidet der Dirigent.
+
+#### Begriffe
+
+- **`unattended-upgrades`:** auf Ubuntu Server ab Installation aktiv (eingeschaltet über `/etc/apt/apt.conf.d/20auto-upgrades`). Installiert automatisch **nur Sicherheitsupdates**. Nie eingerichtet, kam mit dem System, über das Klonen auf allen Knoten.
+- **Kein Crontab, sondern systemd-Timer:** `crontab -l` und `/etc/cron.d/` (dort nur `e2scrub_all` = ext4-Prüfung, `sysstat` = Statistiken für `sar`) enthalten nichts dazu. Zuständig sind `apt-daily.timer` (lädt die Paketlisten, der **Katalog**) und `apt-daily-upgrade.timer` (installiert, 06:00 + bis 60 min `RandomizedDelaySec`). Der Timer ist der **Wecker**, der `.service` der **Hausmeister selbst**.
+- **Installiert ≠ aktiv:** Ein Update ersetzt Dateien auf der Platte. Laufende Prozesse behalten den alten Code im RAM, bis sie neu starten. Ein neuer Kernel wird erst nach einem **Reboot** aktiv.
+- **`/var/run/reboot-required`:** Ubuntu legt diese Datei an, wenn ein Reboot fällig ist (z. B. neuer Kernel). `/var/run/reboot-required.pkgs` listet die Pakete. Beim Booten verschwindet sie. **Bild:** der **Zettel am Notenpult**.
+- **`mtime` bei Paketdateien:** das **Baudatum des Pakets**, nicht das Installationsdatum (z. B. `Apr 8 2024` bei vielen 24.04-Dateien).
+
+#### Untersuchung (alle Befehle aus `ansible/`)
+
+**1. Ist ein Reboot fällig?** Mit dem Zustandsmodul `stat` statt `command: test -f`:
+
+```bash
+ansible patroni -m stat -a "path=/var/run/reboot-required"
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `-m stat` | Modul `ansible.builtin.stat`: liest Dateiinformationen, ändert nichts (immer `ok`) |
+| `-a "path=..."` | Modulparameter, im Playbook `path:` |
+
+Ergebnis (gekürzt):
+
+```text
+ph-node2 | SUCCESS => { "changed": false, "stat": { "exists": true, "mtime": 1795582881.086272, "checksum": "9eede92...", ... } }
+ph-node3 | SUCCESS => { "changed": false, "stat": { "exists": false } }
+ph-node1 | SUCCESS => { "changed": false, "stat": { "exists": true, "mtime": 1795584093.0156617, "checksum": "9eede92...", ... } }
+```
+
+`mtime` in Ortszeit: ph-node2 **06:01:21**, ph-node1 **06:21:33** (heute). Gleiche `checksum` = gleicher Inhalt. Im Playbook wird später `reboot_flag.stat.exists` abgefragt.
+
+**2. Wann kam der Hausmeister?** (auf ph-node1)
+
+```bash
+systemctl list-timers apt-daily-upgrade.timer
+```
+
+```text
+NEXT                        LEFT LAST                         PASSED UNIT                    ACTIVATES
+Thu 2026-11-26 06:55:49 CET  10h Wed 2026-11-25 06:21:18 CET 13h ago apt-daily-upgrade.timer apt-daily-upgrade.service
+```
+
+LAST **06:21:18**, Zettel **06:21:33**: 15 Sekunden Abstand, eine geschlossene Indizienkette. NEXT morgen 06:55: täglich neu gewürfelte Zufallsverzögerung, damit nicht alle Server gleichzeitig die Ubuntu-Spiegel abfragen.
+
+**3. Was hat er gebracht?** Das Logbuch von apt:
+
+```bash
+ansible patroni -a "grep -A4 'Start-Date: 2026-11-25' /var/log/apt/history.log"
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `grep '...'` | Zeilen mit dem Muster suchen (einfache Anführungszeichen halten das Leerzeichen zusammen) |
+| `-A4` | zusätzlich 4 Zeilen danach (*after*) |
+| `/var/log/apt/history.log` | jeder apt-Lauf mit Start, Befehl, Paketen, Ende |
+
+Ergebnis (gekürzt, ph-node1):
+
+```text
+Start-Date: 2026-11-25  06:21:21
+Commandline: /usr/bin/unattended-upgrade
+Install: linux-image-6.8.0-151-generic:amd64 (6.8.0-151.151, automatic), linux-modules-6.8.0-151-generic ..., linux-headers-6.8.0-151 ...
+Upgrade: linux-generic:amd64 (6.8.0-149.149, 6.8.0-151.151), linux-image-generic:amd64 (6.8.0-149.149, 6.8.0-151.151), ...
+End-Date: 2026-11-25  06:21:33
+...
+Remove: linux-image-6.8.0-147-generic:amd64 (6.8.0-147.147)
+...
+Start-Date: 2026-11-25  16:36:07
+Commandline: /usr/bin/apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o DPkg::Lock::Timeout=60 install tree=2.1.1-2ubuntu3.24.04.2
+Requested-By: florian (1000)
+Install: tree:amd64 (2.1.1-2ubuntu3.24.04.2)
+```
+
+**Interpretation:**
+
+- **`Commandline: /usr/bin/unattended-upgrade`:** Kein Mensch hat getippt, der Hausmeister trägt sich mit seinem Programmnamen ein.
+- **Kernel 6.8.0-151 installiert, 147 entfernt, 149 behalten:** Der **laufende** Kernel bleibt immer erhalten, damit man zurückbooten kann. Ende der Kernel-Installation 06:21:33 = sekundengenau die `mtime` des Zettels. Dazu kleinere Sicherheitsupdates (`libheif`, auf ph-node2 auch `tzdata`, `libssh`, `python3-oauthlib`).
+- **Der `tree`-Eintrag 16:36 ist der eigene Fingerabdruck aus 19.16** (auf allen drei Knoten): `Requested-By: florian (1000)` = per `become`; `-y` = Rückfragen mit ja beantworten; `--force-confdef`/`--force-confold` = vorhandene Konfigurationsdateien behalten statt zu fragen; `DPkg::Lock::Timeout=60` = bis zu 60 s warten, wenn apt gerade belegt ist (z. B. durch den Hausmeister).
+- **ph-node3:** heute **nur** der `tree`-Eintrag, kein Hausmeister-Eintrag.
+
+**4. Welcher Kernel läuft wirklich?**
+
+```bash
+ansible patroni -a "uname -r"
+ansible ph-node3 -a "systemctl list-timers apt-daily-upgrade.timer"
+```
+
+`uname -r` = laufender Kernel. Statt einer Gruppe geht auch ein einzelner Host (`ph-node3`).
+
+```text
+ph-node3 | CHANGED | rc=0 >> 6.8.0-149-generic
+ph-node2 | CHANGED | rc=0 >> 6.8.0-149-generic
+ph-node1 | CHANGED | rc=0 >> 6.8.0-149-generic
+
+ph-node3: LAST Wed 2026-11-25 06:54:32 CET
+```
+
+**5. Warum hat ph-node3 nichts bekommen?** Das eigene Protokoll des Hausmeisters (nur für root lesbar, daher `-b -K`):
+
+```bash
+ansible ph-node3 -b -K -a "grep '2026-11-25' /var/log/unattended-upgrades/unattended-upgrades.log"
+```
+
+| Teil | Bedeutung |
+|---|---|
+| `-b` | *become*, Ad-hoc-Gegenstück zu `become: true` |
+| `-K` | sudo-Passwort einmal abfragen |
+
+```text
+2026-11-25 06:54:32,414 INFO Starting unattended upgrades script
+2026-11-25 06:54:32,415 INFO Allowed origins are: o=Ubuntu,a=noble, o=Ubuntu,a=noble-security, o=UbuntuESMApps,a=noble-apps-security, o=UbuntuESM,a=noble-infra-security
+2026-11-25 06:54:33,409 INFO No packages found that can be upgraded unattended and no pending auto-removals
+2026-11-25 17:46:34,685 INFO Starting unattended upgrades script
+2026-11-25 17:46:34,685 INFO Allowed origins are: ...
+```
+
+- **06:54 „No packages found“, ohne Fehler:** Der Hausmeister kam, fand im **Katalog** (Paketlisten) aber noch keinen Kernel 151. Auf ph-node1/2 hatte `apt-daily.timer` die neuen Listen offenbar schon vorher geholt. **Bild:** drei Hausmeister, drei Lieferkataloge, einer hatte noch die alte Ausgabe.
+- **`Allowed origins` = Dienstanweisung:** `noble` (Basisarchiv) und `noble-security`, dazu ESM. **`noble-updates` fehlt**, also nur Sicherheitsupdates.
+- **Offener Punkt:** Ein zweiter Lauf um **17:46:34** ist nicht durch den Timer erklärt (LAST 06:54) und hat im gefilterten Log keine Abschlusszeile. Klärung später per `journalctl` auf ph-node3 (17:45–17:48).
+
+#### Befund
+
+| Knoten | laufend | Kernel 151 | `reboot-required` | Hausmeister heute |
+|---|---|---|---|---|
+| ph-node1 | 149 | installiert 06:21 | ja | 06:21 |
+| ph-node2 | 149 | installiert 06:01 | ja | 06:01 |
+| ph-node3 (Leader) | 149 | **nein** | nein | 06:54, nichts gefunden |
+
+**Die Schutzmaßnahme vom 16.10. hat gewirkt:** installiert ja, automatisch neu gestartet nein, kein ungeplanter Leader-Wechsel.
+
+**Folge für das Playbook:** Zwei echte Fälle für Phase 1–3: „installiert, nur Reboot fehlt“ (ph-node1/2) und „erst installieren, dann Reboot“ (ph-node3). Phase 1 heißt deshalb nicht nur „upgraden“, sondern **installieren → Zettel prüfen → geordnet neu starten → warten**.
+
+#### Entscheidung 25.11.2026: Hausmeister bleibt (Option C)
+
+Erwogen wurde, `unattended-upgrades` abzuschalten (Updates nur noch per Playbook, „ich patche, wenn ich will“). Abwägung: volle Kontrolle und Change-Management gegen offene Sicherheitslücken bis zum nächsten manuellen Lauf. **Entschieden:** Sicherheitsupdates weiter automatisch auf die Platte, **aktiv werden sie nur durch einen geplanten, rollierenden Neustart**. Falls doch abgeschaltet wird: eigene Datei `/etc/apt/apt.conf.d/99-ha-cluster-no-auto-upgrade` mit `APT::Periodic::Unattended-Upgrade "0";` (apt liest alphabetisch, spätere Einträge gewinnen; `20auto-upgrades` bleibt unangetastet), per Ansible verteilt.
+
+> **Merksatz:** **„Wir haben nichts gemacht“ heißt nicht „es ist nichts passiert“.** Ubuntu Server patcht sich standardmäßig selbst.
+
+> **Merksatz:** **Installiert ≠ aktiv.** Ein Update wirkt erst nach Dienst-Neustart bzw. Reboot.
+
+> **Merksatz:** **Belegen statt raten:** Zettel (`stat`), Wecker (`list-timers`), Logbuch (`history.log`), laufender Kernel (`uname -r`), Protokoll des Hausmeisters (`unattended-upgrades.log`).
+
+**Stolperstein (live):** Zweimal im Repo-Hauptordner statt in `ansible/` gestanden. Einmal scheiterte `git add ../…` (`outside repository`, `git add` bricht dann komplett ab: alles oder nichts), einmal fand Ansible kein Inventory (`No inventory was parsed`, `Could not match supplied host pattern`). Abhilfe: Prompt lesen, Befehlsketten mit `&&` verbinden (nächster Befehl nur bei Erfolg), optional `alias hal='cd …/postgresql-ha-lab/ansible'`.
+
+**Kontrollfragen zu 19.18**
+- **Wer installiert auf Ubuntu Server automatisch Updates, und wodurch wird er ausgelöst?** → `unattended-upgrades`, gestartet von `apt-daily-upgrade.timer` (systemd, nicht cron).
+- **Was installiert er standardmäßig?** → Nur Sicherheitsupdates (`Allowed origins`: `noble-security`, ggf. ESM; nicht `noble-updates`).
+- **Warum ist ein installiertes Kernel-Update noch nicht wirksam?** → Der laufende Kernel bleibt bis zum Reboot aktiv; `uname -r` zeigt den alten.
+- **Woran erkennt man, dass ein Reboot fällig ist?** → `/var/run/reboot-required` existiert; Ansible: `stat` → `.stat.exists`.
+- **Warum `stat` statt `command: test -f`?** → Zustandsmodul, ändert nichts, meldet ehrlich `ok`, liefert strukturierte Daten.
+- **Woran erkennt man in `history.log`, ob ein Mensch oder der Hausmeister installiert hat?** → `Commandline: /usr/bin/unattended-upgrade` vs. `Requested-By: <user>`.
+- **Warum bekam ph-node3 den Kernel nicht?** → Der Hausmeister lief, fand aber im Katalog (Paketlisten) nichts: „No packages found“.
+
 ---
 
 ## Anhang — Metaphern zum Wiederholen
@@ -6529,3 +6688,8 @@ Jede Metapher in einer Zeile: **Fachbegriff → Metapher → kurze Erklärung.**
 | rollierendes Update | **Saiten mitten im Konzert tauschen**: hintere Pulte zuerst, Dirigent zuletzt nach Übergabe des Taktstocks | „Replicas einzeln, Switchover, ehemaliger Leader zuletzt.“ |
 | `serial: 1` | **Einzelabfertigung statt Kolonne** | „Der ganze Play läuft erst auf einem Host durch, dann auf dem nächsten.“ |
 | `group_by` | **Inspizient klebt Namensschilder für einen Abend** | „Laufzeit-Gruppen aus Patroni-Antwort, nie in `hosts.yml`.“ |
+| `unattended-upgrades` | **Hausmeister mit Generalschlüssel**, kommt um sechs und legt neue Saiten aufs Pult | „Ubuntu installiert Sicherheitsupdates selbst; aufziehen (Neustart) darf seit 16.10. nur der Dirigent.“ |
+| Timer / Service | **Wecker** / **Hausmeister selbst** | „`.timer` = wann, `.service` = was.“ |
+| Paketlisten (`apt-daily`) | **Lieferkatalog** | „Ohne neuen Katalog findet der Hausmeister nichts.“ |
+| `/var/run/reboot-required` | **Zettel am Notenpult** | „Neue Saiten liegen bereit, Umbau steht aus.“ |
+| installiert ≠ aktiv | **Saiten auf dem Pult vs. aufgezogen** | „Wirkt erst nach Neustart bzw. Reboot.“ |
