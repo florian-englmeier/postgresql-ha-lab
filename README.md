@@ -248,6 +248,35 @@ Dieses Lab ist ein lebendes Projekt — der Cluster steht, die Grundlagen sind d
 
 ---
 
+## Nice to have — PostgreSQL Maintenance & Monitoring
+
+Durch MVCC entstehen bei `UPDATE` und `DELETE` alte Zeilenversionen. Erst wenn kein relevanter Snapshot sie mehr benötigt, darf PostgreSQL ihren Speicherplatz wiederverwenden. Lang laufende Transaktionen können die Bereinigung verzögern.
+
+| Verfahren | Aufgabe | Normale Tabellenzugriffe |
+|---|---|---|
+| `VACUUM` | Speicherplatz intern freigeben; Datei bleibt normalerweise gleich groß | Möglich |
+| `AUTOVACUUM` | Bedarfsabhängige automatische Wartung inklusive separatem `ANALYZE` und Schutz vor XID-Wraparound | Möglich |
+| `VACUUM FULL` | Tabelle kompakt neu schreiben und Indizes neu aufbauen; zusätzlicher Plattenplatz nötig | Blockiert (`ACCESS EXCLUSIVE LOCK`) |
+
+### Wartungsstatus per SQL prüfen
+
+```sql
+SELECT
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    last_vacuum,
+    last_autovacuum
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC;
+```
+
+`n_live_tup` und `n_dead_tup` sind Schätzwerte; die Zeitstempel zeigen die letzte manuelle bzw. automatische VACUUM-Ausführung (ohne `VACUUM FULL`). Die Abfrage gilt für die aktuell verbundene Datenbank. Im Patroni-Cluster läuft VACUUM auf dem jeweiligen Primary; physische Replicas übernehmen die protokollierten Änderungen per WAL-Replay. Lokale Statistikwerte werden nicht per WAL repliziert und können nach einem Failover abweichen.
+
+**Optionale Erweiterung:** Dead Tuples und Autovacuum-Aktivität im Grafana-Dashboard beobachten. Noch nicht als implementiert oder getestet ausgewiesen. `VACUUM FULL` nur bei begründetem Bedarf in einem Wartungsfenster einplanen; AUTOVACUUM führt es niemals aus.
+
+---
+
 ## Dokumentation
 
 Der vollständige Lernweg inkl. aller Konzepte, Befehle und Entscheidungen steht im [Tutorial-Dokument](./PostgreSQL_und_Patroni_Tutorial.md).
